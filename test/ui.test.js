@@ -144,6 +144,25 @@ const G = {};
     await page.waitForSelector(`${W} .scm-history .commit-file`, { state: 'detached' });
   });
 
+  await step('source control: Ctrl+click and Shift+click select files; one click stages them all', async () => {
+    const W = '.workspace:not(.hidden)';
+    const staged = `${W} .scm-section:has(.scm-section-title:text-is("Staged changes")) .scm-item`;
+    for (const n of ['a', 'b', 'c']) fs.writeFileSync(path.join(repo, `multi-${n}.txt`), n);
+    await page.waitForSelector(`${W} .scm-item:has-text("multi-c.txt")`);
+    const tabs = await page.locator(`${W} .tab`).count();
+    await page.click(`${W} .scm-item:has-text("multi-a.txt")`, { modifiers: ['Control'] });
+    await page.click(`${W} .scm-item:has-text("multi-c.txt")`, { modifiers: ['Shift'] });
+    assert.equal(await page.locator(`${W} .scm-item.selected`).count(), 3, 'range selects all three');
+    assert.equal(await page.locator(`${W} .tab`).count(), tabs, 'Ctrl/Shift+click open no diff');
+    await page.hover(`${W} .scm-item:has-text("multi-b.txt")`);
+    await page.click(`${W} .scm-item:has-text("multi-b.txt") button[title=Stage]`);
+    await page.locator(staged).nth(2).waitFor();
+    assert.equal(await page.locator(staged).count(), 3);
+    for (const n of ['a', 'b', 'c']) assert.ok(await page.locator(staged).filter({ hasText: `multi-${n}.txt` }).count());
+    sh('git reset -q && rm multi-*.txt', repo);
+    await page.waitForSelector(`${W} .scm-item:has-text("multi-a.txt")`, { state: 'detached' });
+  });
+
   await step('panel colors: presets, live preview, saved; terminals follow', async () => {
     const bg = v => page.evaluate(n => getComputedStyle(document.documentElement).getPropertyValue(n).trim(), v);
     await page.click('.sb-item[title="Panel colors"]');
@@ -403,9 +422,11 @@ const G = {};
     await page.waitForFunction(() => document.querySelectorAll('.session-row').length === 2, null, { timeout: 10000 });
     await page.waitForSelector('.session-row >> text=api tests');
     await page.waitForSelector(`${W} .row-top .tab.active >> text=api tests`);
-    const launched = fs.readFileSync(process.env.FAKE_LOG, 'utf8').trim().split('\n').map(JSON.parse).at(-1).args;
-    assert.equal(launched[launched.indexOf('--name') + 1], 'api tests');
     const second = await page.evaluate(() => window.skiffcode.active.activeTab.sessionId);
+    const launch = () => fs.readFileSync(process.env.FAKE_LOG, 'utf8').trim().split('\n').map(JSON.parse).find(l => l.env === second);
+    for (let i = 0; i < 40 && !launch(); i++) await sleep(50); // the stand-in Claude logs as it starts
+    const launched = launch().args;
+    assert.equal(launched[launched.indexOf('--name') + 1], 'api tests');
     await page.waitForFunction(id => import('/js/store.js').then(m => m.store.sessions.find(s => s.id === id)?.state === 'idle'), second);
     await page.click(`${W} .row-top .tab.active .tab-close`);
     await page.click('.modal .btn >> text=Close session');

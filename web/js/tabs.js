@@ -352,6 +352,11 @@ export class TerminalTab extends Tab {
     });
     this.fit = new FitAddon.FitAddon();
     this.term.loadAddon(this.fit);
+    // Claude Code's TUI measures emoji as 2 cells; xterm's default Unicode 6 table says 1, which misplaces redraws.
+    if (window.Unicode11Addon) {
+      this.term.loadAddon(new Unicode11Addon.Unicode11Addon());
+      this.term.unicode.activeVersion = '11';
+    }
     // Links: click → your browser, Ctrl+click → a SkiffCode tab (the hint shows on hover)
     if (window.WebLinksAddon) {
       this.term.loadAddon(new WebLinksAddon.WebLinksAddon((e, uri) => openLink(this.ws.app, uri, e), {

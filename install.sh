@@ -77,7 +77,7 @@ mkdir -p "$APP.new"
 cp -r "$HERE/server" "$HERE/web" "$HERE/scripts" "$HERE/package.json" "$APP.new/"
 if [[ -d "$HERE/vendor/monaco" && -d "$HERE/vendor/xterm" ]]; then
   cp -r "$HERE/vendor" "$APP.new/vendor"
-elif [[ -d "$APP/vendor/monaco" && -f "$APP/vendor/VERSIONS" ]] && diff -q <(sed -n '/^MONACO=/p;/^XTERM=/p' "$HERE/scripts/fetch-vendor.sh") <(sed -n '/^MONACO=/p;/^XTERM=/p' "$APP/scripts/fetch-vendor.sh") >/dev/null 2>&1; then
+elif [[ -d "$APP/vendor/monaco" && -f "$APP/vendor/VERSIONS" ]] && diff -q <(grep -E '^[A-Z0-9]+=[0-9]' "$HERE/scripts/fetch-vendor.sh") <(grep -E '^[A-Z0-9]+=[0-9]' "$APP/scripts/fetch-vendor.sh") >/dev/null 2>&1; then
   cp -r "$APP/vendor" "$APP.new/vendor"   # same library versions as before: keep them
 else
   say "Downloading the editor and terminal libraries"

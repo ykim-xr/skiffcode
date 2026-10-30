@@ -192,7 +192,7 @@ select.input { padding: 2px 6px; }
 .row-bottom .pane-body { background: var(--bottom-bg, var(--bg)); }
 .row-top .tab.active, .row-top .tab:hover { background: var(--center-bg, var(--bg)); }
 .row-bottom .tab.active, .row-bottom .tab:hover { background: var(--bottom-bg, var(--bg)); }
-.term-host { flex: 1; min-height: 0; padding: 4px 0 0 8px; }
+.term-host { flex: 1; min-height: 0; padding: 4px 0 6px 8px; }
 .term-host .xterm { height: 100%; }
 .term-banner { flex: none; display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: var(--bg-elev); border-bottom: 1px solid var(--border); color: var(--fg-muted); }
 
@@ -267,6 +267,7 @@ select.input { padding: 2px 6px; }
 .scm-section-actions { display: flex; gap: 1px; }
 .scm-item { display: flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px 0 24px; cursor: pointer; white-space: nowrap; }
 .scm-item:hover { background: var(--bg-hover); }
+.scm-item.selected { background: var(--bg-active); }
 .scm-name { flex: none; max-width: 60%; overflow: hidden; text-overflow: ellipsis; }
 .scm-dir { flex: 1; min-width: 0; color: var(--fg-dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
 .scm-actions { display: none; gap: 1px; }

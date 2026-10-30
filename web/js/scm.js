@@ -58,6 +58,9 @@ export class ScmView {
     this.historyEl.style.height = `${this.historyFrac * 100}%`;
     this.hist = { commits: [], more: false };
     this.collapsed = new Set(JSON.parse(localStorage.getItem('skiffcode.scmCollapsed') || '[]'));
+    this.sel = { section: null, paths: new Set() }; // multi-select lives in one section
+    this.anchor = null; // last row clicked without Shift: { section, path }
+    this.sectionPaths = {}; // section id -> file paths in display order
     this.openCommits = new Set(); // commits expanded to show their files
     this.commitFiles = new Map(); // sha -> { files, parent } | 'loading' | { error }
     this.off = on('git.changed', e => { if (e.root === this.ws.root) this.refreshSoon(); });
@@ -114,6 +117,12 @@ export class ScmView {
     clear(this.header, icon('branch'), h('b', s.branch || '(detached)'), up);
 
     const changes = [...s.changes, ...s.untracked];
+    this.sectionPaths = { conflicts: s.conflicts.map(f => f.path), staged: s.staged.map(f => f.path), changes: changes.map(f => f.path) };
+    if (this.sel.section) {
+      const here = new Set(this.sectionPaths[this.sel.section]);
+      this.sel.paths = new Set([...this.sel.paths].filter(p => here.has(p)));
+      if (!this.sel.paths.size) this.sel.section = null;
+    }
     const sections = [];
     if (s.conflicts.length) sections.push(this.section('conflicts', 'Merge conflicts', s.conflicts, 'working'));
     if (s.staged.length) sections.push(this.section('staged', 'Staged changes', s.staged, 'staged', [
@@ -210,7 +219,7 @@ export class ScmView {
   section(id, title, files, kind, actions = []) {
     return h('div.scm-section',
       this.sectionHead(id, title, actions, files.length),
-      this.collapsed.has(id) ? null : h('div', files.length ? files.map(f => this.fileRow(f, kind)) : h('div.muted.pad-s', 'No changes')));
+      this.collapsed.has(id) ? null : h('div', files.length ? files.map(f => this.fileRow(f, kind, id)) : h('div.muted.pad-s', 'No changes')));
   }
 
   /** A commit: click to show/hide its files; click a file for that file's diff in the center. */
@@ -280,29 +289,61 @@ export class ScmView {
     if (this.last) this.render(...this.last);
   }
 
-  fileRow(f, kind) {
+  /** Files an action on this row applies to: the whole selection if the row is in it, else just the row. */
+  targets(sectionId, f) {
+    if (this.sel.section !== sectionId || !this.sel.paths.has(f.path)) return [f.path];
+    return this.sectionPaths[sectionId].filter(p => this.sel.paths.has(p));
+  }
+
+  clickRow(e, sectionId, f, staged) {
+    const paths = this.sectionPaths[sectionId];
+    if (e.shiftKey) {
+      const a = this.anchor && this.anchor.section === sectionId ? paths.indexOf(this.anchor.path) : -1;
+      const b = paths.indexOf(f.path);
+      const [from, to] = a < 0 ? [b, b] : [Math.min(a, b), Math.max(a, b)];
+      this.sel = { section: sectionId, paths: new Set(paths.slice(from, to + 1)) };
+      if (a < 0) this.anchor = { section: sectionId, path: f.path };
+    } else if (e.ctrlKey || e.metaKey) {
+      if (this.sel.section !== sectionId) this.sel = { section: sectionId, paths: new Set() };
+      if (!this.sel.paths.delete(f.path)) this.sel.paths.add(f.path);
+      this.anchor = { section: sectionId, path: f.path };
+    } else {
+      this.sel = { section: sectionId, paths: new Set([f.path]) };
+      this.anchor = { section: sectionId, path: f.path };
+      this.openDiff(f, staged);
+    }
+    this.rerender();
+  }
+
+  fileRow(f, kind, sectionId) {
     const letter = f.status === '?' ? 'U' : f.status;
     const staged = kind === 'staged';
-    return h(`div.scm-item.g-${letter}`, {
+    const picked = this.sel.section === sectionId && this.sel.paths.has(f.path);
+    return h(`div.scm-item.g-${letter}${picked ? '.selected' : ''}`, {
       title: `${f.path} — ${STATUS_LABEL[f.status] || f.status}${staged ? ' (staged)' : ''}`,
-      onclick: () => this.openDiff(f, staged),
-      oncontextmenu: e => contextMenu(e, [
-        { label: 'Open diff', icon: 'diff', action: () => this.openDiff(f, staged) },
-        f.status !== 'D' ? { label: 'Open file', icon: 'file', action: () => this.ws.openFile(f.path) } : null,
-        { separator: true },
-        staged ? { label: 'Unstage', action: () => this.run('git.unstage', [f.path]) } : { label: 'Stage', action: () => this.run('git.stage', [f.path]) },
-        !staged ? { label: 'Discard changes', icon: 'refresh', danger: true, action: () => this.discard([f.path]) } : null,
-      ]),
+      onmousedown: e => { if (e.shiftKey) e.preventDefault(); }, // no text selection while range-selecting
+      onclick: e => this.clickRow(e, sectionId, f, staged),
+      oncontextmenu: e => {
+        const t = this.targets(sectionId, f);
+        const many = t.length > 1 ? ` ${t.length} files` : '';
+        contextMenu(e, [
+          { label: 'Open diff', icon: 'diff', action: () => this.openDiff(f, staged) },
+          f.status !== 'D' ? { label: 'Open file', icon: 'file', action: () => this.ws.openFile(f.path) } : null,
+          { separator: true },
+          staged ? { label: `Unstage${many}`, action: () => this.run('git.unstage', t) } : { label: `Stage${many}`, action: () => this.run('git.stage', t) },
+          !staged ? { label: many ? `Discard${many}` : 'Discard changes', icon: 'refresh', danger: true, action: () => this.discard(t) } : null,
+        ]);
+      },
     },
     icon('file', 'file-type'),
     h('span.scm-name', basename(f.path)),
     h('span.scm-dir', dirname(f.path)),
     h('span.scm-actions',
       f.status !== 'D' ? h('button.icon-btn', { title: 'Open file', onclick: e => { e.stopPropagation(); this.ws.openFile(f.path); } }, icon('file')) : null,
-      !staged ? h('button.icon-btn', { title: 'Discard changes', onclick: e => { e.stopPropagation(); this.discard([f.path]); } }, icon('refresh')) : null,
+      !staged ? h('button.icon-btn', { title: 'Discard changes', onclick: e => { e.stopPropagation(); this.discard(this.targets(sectionId, f)); } }, icon('refresh')) : null,
       staged
-        ? h('button.icon-btn', { title: 'Unstage', onclick: e => { e.stopPropagation(); this.run('git.unstage', [f.path]); } }, icon('close'))
-        : h('button.icon-btn', { title: 'Stage', onclick: e => { e.stopPropagation(); this.run('git.stage', [f.path]); } }, icon('plus'))),
+        ? h('button.icon-btn', { title: 'Unstage', onclick: e => { e.stopPropagation(); this.run('git.unstage', this.targets(sectionId, f)); } }, icon('close'))
+        : h('button.icon-btn', { title: 'Stage', onclick: e => { e.stopPropagation(); this.run('git.stage', this.targets(sectionId, f)); } }, icon('plus'))),
     h('span.git-letter', STATUS_LETTER(f.status)));
   }
 

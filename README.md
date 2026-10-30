@@ -19,7 +19,7 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 - Repos, git worktrees and plain folders in groups, in your own order, with your own icon and color
 - **Instant switching**: each worktree keeps its own tabs, splits, terminals and bottom panel
 - New worktree from any base branch with your branch name, or one command: `skiffcode new`
-- Stage, discard, commit, push / pull, editable diffs, review vs base; commits expand to their files; a History pane below lists the whole branch log
+- Stage, discard, commit, push / pull (Ctrl/Shift+click selects several changed files), editable diffs, review vs base; commits expand to their files; a History pane below lists the whole branch log
 - Plain folders work too (no git); `git init` there and git features turn on
 
 **Editor and app**
