@@ -13,6 +13,7 @@ const { userStatusLine } = require('./accounts');
 
 const STALL_MS = Number(process.env.SKIFFCODE_STALL_MS) || 8000; // "working" but silent this long (and nothing running) = stopped
 const HOOK_STATES = new Set(['working', 'question', 'permission', 'idle', 'ended']);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const needsYou = s => s === 'question' || s === 'permission';
 
 class Sessions extends EventEmitter {
@@ -356,6 +357,17 @@ class Sessions extends EventEmitter {
       j = JSON.parse(fs.readFileSync(path.join(this.statusDir, `${id}.statusline`), 'utf8'));
     } catch {
       return;
+    }
+    // Claude moved to another conversation (/clear, /tui, /resume…): resume that one from now on.
+    // The id ends up on Claude's command line, so only a plain UUID counts.
+    if (s.kind === 'claude' && typeof j.session_id === 'string' && UUID_RE.test(j.session_id) && j.session_id !== s.claudeId) {
+      const tp = typeof j.transcript_path === 'string' ? j.transcript_path : '';
+      // No transcript yet (a fresh /clear): --resume would fail. The .prompted marker belongs to
+      // the old conversation, so drop it; the next prompt's hook writes it again.
+      const prompted = path.basename(tp) === `${j.session_id}.jsonl` && fs.existsSync(tp);
+      if (!prompted) fs.rmSync(path.join(this.statusDir, `${id}.prompted`), { force: true });
+      this.state.update(d => { const x = d.sessions.find(y => y.id === id); if (x) { x.claudeId = j.session_id; x.prompted = prompted; } });
+      this.emit('change');
     }
     const info = {
       contextPct: j.context_window && typeof j.context_window.used_percentage === 'number' ? Math.round(j.context_window.used_percentage) : undefined,

@@ -648,6 +648,33 @@ function startServer() {
     await assert.rejects(c.call('claude.deleteConversation', { worktreePath: wt, id: '../../x' }), /Not a conversation ID/);
   });
 
+  await step('Claude switches conversation (/tui, /clear): SkiffCode resumes the new one', async () => {
+    const { encode } = require('../server/history');
+    const proj = path.join(CLAUDE_HOME, 'projects', encode(wt));
+    fs.mkdirSync(proj, { recursive: true });
+    for (const [label, newId, saved, flag] of [
+      ['relaunched, with a transcript', 'cccccccc-1111-4222-8333-444444444444', true, '--resume'],
+      ['fresh /clear, no transcript yet', 'dddddddd-1111-4222-8333-444444444444', false, '--session-id'],
+    ]) {
+      plan('SessionStart,UserPromptSubmit,hang');
+      const s9 = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, name: 'switcher', cols: 80, rows: 24 });
+      const sess = async () => (await c.call('hello')).sessions.find(x => x.id === s9.id);
+      await until(async () => (await sess()).prompted, `${label}: prompted`);
+      const transcript = path.join(proj, `${newId}.jsonl`);
+      if (saved) fs.writeFileSync(transcript, JSON.stringify({ type: 'user', cwd: wt, message: { role: 'user', content: 'hi' } }) + '\n');
+      fs.writeFileSync(path.join(HOME, 'status', `${s9.id}.statusline`), JSON.stringify({ session_id: newId, transcript_path: transcript }));
+      await until(async () => (await sess()).claudeId === newId, `${label}: claudeId follows`);
+      await c.call('sessions.stop', { id: s9.id });
+      plan('SessionStart,hang');
+      const n = calls().length;
+      await c.call('sessions.resume', { id: s9.id });
+      await until(() => calls().length === n + 1, `${label}: relaunched`);
+      assert.equal(calls()[n].args[0], flag, label);
+      if (saved) assert.equal(calls()[n].args[1], newId, label);
+      await c.call('sessions.forget', { id: s9.id });
+    }
+  });
+
   await step('CLI: `skiffcode new` makes a worktree + named Claude session with a first prompt; `claude` and `list`', async () => {
     const cliEnv = { ...process.env, SKIFFCODE_APP: APP, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT) };
     const run = (...a) => execFileSync(path.join(APP, 'bin', 'skiffcode'), a, { env: cliEnv, encoding: 'utf8' });
