@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#181818">
+  <title>SkiffCode</title>
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+  <link rel="alternate icon" href="/icons/favicon.ico" sizes="16x16 32x32 48x48">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/vendor/xterm/xterm.css">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <div class="sash vertical" id="sidebar-sash"></div>
+    <main id="workspaces">
+      <div id="nothing" class="ws-empty hidden"></div>
+      <div id="boot"><div class="boot-inner"><div class="boot-logo"></div><div id="boot-status">Starting SkiffCode…</div></div></div>
+    </main>
+  </div>
+  <footer id="statusbar"></footer>
+  <div id="overlay"></div>
+  <div id="toasts"></div>
+  <script src="/vendor/xterm/xterm.js"></script>
+  <script src="/vendor/xterm/addon-fit.js"></script>
+  <script src="/vendor/xterm/addon-web-links.js"></script>
+  <script src="/vendor/xterm/addon-webgl.js"></script>
+  <script src="/vendor/monaco/vs/loader.js"></script>
+  <script>
+    // Monaco's AMD loader clashes with other UMD scripts unless they load first (they did above).
+    (function () {
+      const side = document.getElementById('sidebar');
+      const w = Number(localStorage.getItem('skiffcode.sidebarWidth') || 300);
+      side.style.width = w + 'px';
+      document.getElementById('sidebar-sash').addEventListener('mousedown', function (e) {
+        e.preventDefault();
+        const x0 = e.clientX, w0 = side.offsetWidth;
+        function move(ev) { side.style.width = Math.max(200, Math.min(560, w0 + ev.clientX - x0)) + 'px'; window.dispatchEvent(new Event('resize')); }
+        function up() { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); localStorage.setItem('skiffcode.sidebarWidth', side.offsetWidth); }
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', up);
+      });
+    })();
+  </script>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

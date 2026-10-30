@@ -1,0 +1,1 @@
+window.WebLinksAddon = { WebLinksAddon: class {} };
