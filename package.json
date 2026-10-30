@@ -1,6 +1,6 @@
 {
   "name": "skiffcode",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "SkiffCode: repos, worktrees, Claude Code sessions, editor and git in one browser app.",
   "license": "MIT",

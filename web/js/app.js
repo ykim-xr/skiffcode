@@ -584,7 +584,7 @@ const actions = {
       ['Resume a Claude conversation…', '', () => actions.resumeConversation()],
       ['Open web page or file…', '', () => actions.openWebPage()],
       ['Panel colors…', '', () => colorsDialog()],
-      ['Toggle sidebar', 'Ctrl+B', () => document.body.classList.toggle('no-sidebar')],
+      ['Toggle sidebar', '', () => document.body.classList.toggle('no-sidebar')],
     ];
     const v = await quickPick(cmds.map(([label, key, fn], i) => ({ label, description: key, value: i })), { placeholder: 'Run a command', matchDescription: false });
     if (v !== undefined) cmds[v][2]();
@@ -728,7 +728,6 @@ const SHORTCUTS = [
   ['ctrl+shift+f', () => app.active && app.active.showRight('search')],
   ['ctrl+shift+e', () => app.active && app.active.showRight('files')],
   ['ctrl+shift+g', () => app.active && app.active.showRight('scm')],
-  ['ctrl+b', () => document.body.classList.toggle('no-sidebar')],
   ['ctrl+,', () => openSettings()],
   ['alt+w', () => closeActiveTab()],
   ['ctrl+w', () => closeActiveTab()],

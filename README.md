@@ -71,7 +71,7 @@ Optional: `sudo apt install ripgrep` for faster search.
 | Ctrl+P · Ctrl+Shift+P | open a file · all commands |
 | Ctrl+Alt+J · Ctrl+Alt+K | jump to a session · next session that needs you |
 | Ctrl+Alt+N · Ctrl+\` | new Claude session · new shell |
-| Ctrl+Shift+\` · Ctrl+B | bottom panel · sidebar |
+| Ctrl+Shift+\` | bottom panel |
 | Ctrl+Shift+F · E · G | search · files · source control |
 | Ctrl+Alt+D | review changes vs base |
 | F12 · Shift+F12 | go to definition · references |
