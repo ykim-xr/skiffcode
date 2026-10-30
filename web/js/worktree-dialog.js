@@ -3,6 +3,7 @@
 import { h, icon, clear } from './util.js';
 import { call } from './rpc.js';
 import { store } from './store.js';
+import { isTopModal } from './dialogs.js';
 
 export function newWorktreeDialog(repo) {
   return new Promise(async resolve => {
@@ -98,7 +99,7 @@ export function newWorktreeDialog(repo) {
       h('label.form-check', startClaude, ' Start a Claude session in it'),
       h('div.modal-buttons', h('button.btn', { onclick: () => close(undefined) }, 'Cancel'), create));
     back.append(box);
-    const key = e => { if (e.key === 'Escape') { e.preventDefault(); close(undefined); } };
+    const key = e => { if (e.key === 'Escape' && isTopModal(back)) { e.preventDefault(); close(undefined); } };
     document.addEventListener('keydown', key, true);
     back.addEventListener('mousedown', e => e.target === back && close(undefined));
     function close(v) {

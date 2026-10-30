@@ -25,8 +25,9 @@ get() { # package version → extracted dir
   local pkg="$1" ver="$2" name="${1##*/}"
   local url="$REGISTRY/$pkg/-/$name-$ver.tgz"
   mkdir -p "$tmp/$name"
-  fetch "$url" "$tmp/$name.tgz"
-  tar -xzf "$tmp/$name.tgz" -C "$tmp/$name"
+  # errexit is off inside the $(get …) substitution, so each step must return explicitly
+  fetch "$url" "$tmp/$name.tgz" || { echo "Download failed: $url" >&2; return 1; }
+  tar -xzf "$tmp/$name.tgz" -C "$tmp/$name" || { echo "Bad archive: $url" >&2; return 1; }
   echo "$tmp/$name/package"
 }
 
@@ -43,6 +44,10 @@ f="$(get @xterm/addon-fit "$FIT")";       cp "$f/lib/addon-fit.js" "$VENDOR.new/
 l="$(get @xterm/addon-web-links "$LINKS")"; cp "$l/lib/addon-web-links.js" "$VENDOR.new/xterm/"
 w="$(get @xterm/addon-webgl "$WEBGL")";    cp "$w/lib/addon-webgl.js" "$VENDOR.new/xterm/"
 u="$(get @xterm/addon-unicode11 "$UNICODE11")"; cp "$u/lib/addon-unicode11.js" "$VENDOR.new/xterm/"
+for rel in monaco/vs/loader.js monaco/vs/editor/editor.main.js xterm/xterm.js xterm/xterm.css \
+         xterm/addon-fit.js xterm/addon-web-links.js xterm/addon-webgl.js xterm/addon-unicode11.js; do
+  [[ -s "$VENDOR.new/$rel" ]] || { echo "Vendor download incomplete: $rel is missing or empty" >&2; exit 1; }
+done
 rm -rf "$VENDOR"
 mv "$VENDOR.new" "$VENDOR"
 echo "$MONACO $XTERM" > "$VENDOR/VERSIONS"

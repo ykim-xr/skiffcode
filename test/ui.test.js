@@ -19,6 +19,9 @@ const sh = (cmd, cwd) => execFileSync('bash', ['-c', cmd], { cwd, encoding: 'utf
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let passed = 0;
 const step = async (name, fn) => { await fn(); passed++; console.log(`  ✓ ${name}`); };
+const prefs = () => JSON.parse(fs.readFileSync(path.join(HOME, 'state.json'), 'utf8')).prefs.settings || {};
+/** Saved settings, once ok(settings) holds (or after 2 s). */
+const prefsWhen = async ok => { for (let i = 0; i < 40 && !ok(prefs()); i++) await sleep(50); return prefs(); };
 
 process.env.FAKE_LOG = path.join(tmp, 'claude-calls.jsonl');
 process.env.FAKE_SCRIPT_FILE = path.join(tmp, 'plan.txt');
@@ -163,6 +166,166 @@ const G = {};
     await page.waitForSelector(`${W} .scm-item:has-text("multi-a.txt")`, { state: 'detached' });
   });
 
+  await step('source control: right-click outside the selection selects just that row', async () => {
+    const W = '.workspace:not(.hidden)';
+    for (const n of ['a', 'b', 'c', 'd']) fs.writeFileSync(path.join(repo, `multi-${n}.txt`), n);
+    await page.waitForSelector(`${W} .scm-item:has-text("multi-d.txt")`);
+    await page.click(`${W} .scm-item:has-text("multi-a.txt")`, { modifiers: ['Control'] });
+    await page.click(`${W} .scm-item:has-text("multi-c.txt")`, { modifiers: ['Shift'] });
+    assert.equal(await page.locator(`${W} .scm-item.selected`).count(), 3);
+    await page.click(`${W} .scm-item:has-text("multi-b.txt")`, { button: 'right' });
+    await page.waitForSelector('.menu-item >> text=Stage 3 files');
+    assert.equal(await page.locator(`${W} .scm-item.selected`).count(), 3, 'right-click inside the selection keeps it');
+    await page.evaluate(() => import('/js/dialogs.js').then(m => m.closeMenu()));
+    await page.click(`${W} .scm-item:has-text("multi-d.txt")`, { button: 'right' });
+    await page.waitForSelector('.menu-item span:text-is("Stage")');
+    assert.equal(await page.locator(`${W} .scm-item.selected`).count(), 1);
+    assert.equal(await page.locator(`${W} .scm-item.selected:has-text("multi-d.txt")`).count(), 1);
+    await page.evaluate(() => import('/js/dialogs.js').then(m => m.closeMenu()));
+    sh('rm multi-*.txt', repo);
+    await page.waitForSelector(`${W} .scm-item:has-text("multi-a.txt")`, { state: 'detached' });
+  });
+
+  await step('source control: merge conflicts can be staged but not discarded; staging several asks first', async () => {
+    const W = '.workspace:not(.hidden)';
+    const conf = `${W} .scm-section:has(.scm-section-title:text-is("Merge conflicts")) .scm-item`;
+    sh(`printf base > c1.txt && printf base > c2.txt && git add c1.txt c2.txt && git commit -qm cbase && git checkout -qb ctmp && printf theirs > c1.txt && printf theirs > c2.txt && git commit -qam theirs && git checkout -q main && printf ours > c1.txt && printf ours > c2.txt && git commit -qam ours && (git merge -q ctmp >/dev/null 2>&1 || true)`, repo);
+    await page.locator(conf).nth(1).waitFor();
+    assert.equal(await page.locator(`${conf} button[title="Discard changes"]`).count(), 0, 'no Discard button');
+    assert.equal(await page.locator(`${conf} button[title=Stage]`).count(), 2);
+    await page.click(`${conf}:has-text("c1.txt")`, { button: 'right' });
+    await page.waitForSelector('.menu-item span:text-is("Stage")');
+    assert.equal(await page.locator('.menu-item:has-text("Discard")').count(), 0, 'no Discard in the menu');
+    await page.evaluate(() => import('/js/dialogs.js').then(m => m.closeMenu()));
+    await page.click(`${conf}:has-text("c2.txt")`, { modifiers: ['Shift'] });
+    assert.equal(await page.locator(`${conf}.selected`).count(), 2);
+    await page.hover(`${conf}:has-text("c2.txt")`);
+    await page.click(`${conf}:has-text("c2.txt") button[title=Stage]`);
+    await page.waitForSelector('.modal-title >> text=Mark 2 files as resolved?');
+    await page.click('.modal .btn >> text=Cancel');
+    await sleep(300);
+    assert.equal(await page.locator(conf).count(), 2, 'cancel stages nothing');
+    // one file: a single click, as before
+    await page.click(`${conf}:has-text("c2.txt")`, { modifiers: ['Control'] });
+    assert.equal(await page.locator(`${conf}.selected`).count(), 1);
+    await page.hover(`${conf}:has-text("c1.txt")`);
+    await page.click(`${conf}:has-text("c1.txt") button[title=Stage]`);
+    await page.waitForSelector(`${W} .scm-section:has(.scm-section-title:text-is("Staged changes")) .scm-item:has-text("c1.txt")`);
+    assert.equal(await page.locator(conf).count(), 1);
+    assert.equal(await page.locator('.modal-back').count(), 0, 'no question for one file');
+    assert.match(sh('git status --porcelain', repo), /^M  c1\.txt$/m);
+    sh('git merge --abort && git reset -q --hard HEAD~2 && git branch -q -D ctmp', repo);
+    await page.waitForSelector(`${W} .scm-section-title:text-is("Merge conflicts")`, { state: 'detached' });
+  });
+
+  await step('settings open at the top, with Save focused', async () => {
+    await page.click('.sb-item[title="Settings"]');
+    await page.waitForSelector('.modal-title:text-is("Settings")');
+    await page.waitForFunction(() => document.activeElement && document.activeElement.textContent === 'Save');
+    const m = await page.evaluate(() => { const el = document.querySelector('.modal'); return { top: el.scrollTop, scrolls: el.scrollHeight > el.clientHeight + 100 }; });
+    assert.ok(m.scrolls, 'the dialog scrolls at this size');
+    assert.equal(m.top, 0);
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('.modal-back', { state: 'detached' });
+  });
+
+  const keyRow = id => `.keys-modal .keys-row[data-id="${id}"]`;
+  const keyText = id => page.textContent(`${keyRow(id)} .keys-key`);
+  const sidebarHidden = () => page.evaluate(() => document.body.classList.contains('no-sidebar'));
+  const termKey = init => page.evaluate(i => window.skiffcode.terminalKey(new KeyboardEvent('keydown', i)), init);
+  const jumpTitle = () => page.getAttribute('.sidebar-actions button[title^="Jump to"]', 'title');
+
+  await step('keyboard shortcuts: record keys (plain and reserved keys refused), take one from another action, apply at once', async () => {
+    await page.click('.sb-item[title="Settings"]');
+    // Escape in a dialog opened from Settings closes only that dialog; Settings keeps its edits
+    await page.fill('.modal [data-key=setupCommand]', 'echo unsaved');
+    await page.click('.modal .btn >> text=Change keys…');
+    await page.waitForSelector('.keys-modal');
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('.keys-modal', { state: 'detached' });
+    assert.equal(await page.locator('.modal-title:text-is("Settings")').count(), 1, 'Settings stays open');
+    assert.equal(await page.inputValue('.modal [data-key=setupCommand]'), 'echo unsaved');
+    await page.click('.modal .btn >> text=Change keys…');
+    await page.waitForSelector('.keys-modal');
+    assert.equal(await keyText('toggleSidebar'), 'None');
+    await page.click(`${keyRow('toggleSidebar')} .keys-key`);
+    await page.keyboard.press('b');
+    await page.waitForSelector('.keys-note.warn >> text=Use Ctrl or Alt');
+    await page.keyboard.press('Control+v');
+    await page.waitForSelector('.keys-note.warn >> text=Ctrl+V is reserved');
+    await page.keyboard.press('Escape');
+    await page.waitForSelector(`${keyRow('toggleSidebar')} .keys-key:not(.recording)`);
+    assert.equal(await keyText('toggleSidebar'), 'None', 'refused keys and Escape leave it unbound');
+    await page.click(`${keyRow('toggleSidebar')} .keys-key`);
+    await page.keyboard.press('Control+Alt+j');
+    await page.waitForSelector('.keys-note >> text=Removed from Jump to session or worktree');
+    assert.equal(await keyText('jump'), 'None');
+    assert.equal(await keyText('toggleSidebar'), 'Ctrl+Alt+J');
+    await page.click(`${keyRow('toggleSidebar')} .keys-key`);
+    await page.keyboard.press('Control+Alt+b');
+    assert.equal(await keyText('toggleSidebar'), 'Ctrl+Alt+B');
+    assert.equal(await jumpTitle(), 'Jump to… (Ctrl+Alt+J)');
+    await page.click('.keys-modal .btn >> text=Save');
+    await page.waitForSelector('.keys-modal', { state: 'detached' });
+    await page.click('.modal .btn >> text=Cancel');
+    await page.waitForSelector('.modal-back', { state: 'detached' });
+    await page.waitForFunction(() => document.querySelector('.sidebar-actions button[title^="Jump to"]').title === 'Jump to…'); // hints follow the keys
+    assert.equal(await sidebarHidden(), false);
+    await page.keyboard.press('Control+Alt+b');
+    assert.equal(await sidebarHidden(), true, 'the new key works without a reload');
+    await page.keyboard.press('Control+Alt+b');
+    assert.equal(await sidebarHidden(), false);
+    await page.keyboard.press('Control+Alt+j');
+    await sleep(200);
+    assert.equal(await page.locator('.qp-input').count(), 0, 'Jump lost its key');
+    assert.deepEqual((await prefsWhen(p => p.keybindings?.toggleSidebar)).keybindings, { toggleSidebar: 'ctrl+alt+b', jump: '' });
+  });
+
+  await step('keyboard shortcuts: switched off, only the palette key works; the palette turns them back on', async () => {
+    await page.keyboard.press('Control+Shift+p');
+    await page.fill('.qp-input', 'Keyboard shortcuts');
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('.keys-modal');
+    await page.uncheck('.keys-modal .keys-enabled input');
+    await page.waitForSelector('.keys-modal .keys-rows.off');
+    await page.click('.keys-modal .btn >> text=Save');
+    await page.waitForSelector('.keys-modal', { state: 'detached' });
+    await page.keyboard.press('Control+Alt+b');
+    assert.equal(await sidebarHidden(), false, 'shortcuts off: the sidebar key does nothing');
+    assert.equal(await termKey({ key: 'p', code: 'KeyP', ctrlKey: true }), true, 'shortcuts off: terminals get Ctrl+P');
+    assert.equal((await prefsWhen(p => p.shortcutsEnabled === false)).shortcutsEnabled, false);
+    await page.keyboard.press('Control+Shift+p');
+    await page.fill('.qp-input', 'Turn shortcuts on');
+    await page.waitForSelector('.qp-item.selected >> text=Turn shortcuts on');
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('.qp-input', { state: 'detached' });
+    assert.equal(await termKey({ key: 'p', code: 'KeyP', ctrlKey: true }), false);
+    await page.keyboard.press('Control+Alt+b');
+    assert.equal(await sidebarHidden(), true, 'shortcuts back on');
+    await page.keyboard.press('Control+Alt+b');
+    assert.equal(await sidebarHidden(), false);
+    assert.equal((await prefsWhen(p => p.shortcutsEnabled === true)).shortcutsEnabled, true);
+  });
+
+  await step('keyboard shortcuts: the palette shows the keys; reset restores the defaults', async () => {
+    await page.keyboard.press('Control+Shift+p');
+    await page.fill('.qp-input', 'Toggle sidebar');
+    await page.waitForSelector('.qp-item.selected .qp-desc >> text=Ctrl+Alt+B');
+    await page.fill('.qp-input', 'Keyboard shortcuts');
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('.keys-modal');
+    await page.click(`${keyRow('toggleSidebar')} button[title="Reset to default"]`);
+    await page.click(`${keyRow('jump')} button[title="Reset to default"]`);
+    assert.equal(await keyText('jump'), 'Ctrl+Alt+J');
+    await page.click('.keys-modal .btn >> text=Save');
+    await page.waitForSelector('.keys-modal', { state: 'detached' });
+    const p = await prefsWhen(x => !Object.keys(x.keybindings || {}).length);
+    assert.deepEqual([p.keybindings, p.shortcutsEnabled], [{}, true]);
+    await page.keyboard.press('Control+Alt+j');
+    await page.waitForSelector('.qp-input');
+    await page.keyboard.press('Escape');
+  });
+
   await step('panel colors: presets, live preview, saved; terminals follow', async () => {
     const bg = v => page.evaluate(n => getComputedStyle(document.documentElement).getPropertyValue(n).trim(), v);
     await page.click('.sb-item[title="Panel colors"]');
@@ -203,6 +366,14 @@ const G = {};
 
   await step('terminals use the panel color', async () => {
     await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; return t && t.term && t.term.options.theme && t.term.options.theme.background === '#000000'; });
+  });
+
+  await step('Copy conversation ID is not offered before the first prompt (the id would change)', async () => {
+    assert.equal(await page.evaluate(() => window.skiffcode.active.activeTab.session.prompted), false);
+    await page.click('.workspace:not(.hidden) .row-top .tab.active', { button: 'right' });
+    await page.waitForSelector('.menu-item >> text=Rename…');
+    assert.equal(await page.locator('.menu-item >> text=Copy conversation ID').count(), 0);
+    await page.evaluate(() => import('/js/dialogs.js').then(m => m.closeMenu()));
   });
 
   await step('drag and drop files: from Explorer into a folder, within the Files panel, onto an editor pane and onto sessions', async () => {
@@ -334,6 +505,20 @@ const G = {};
     });
   });
 
+  await step('in a terminal Ctrl+W goes to the program; Alt+W still closes the tab', async () => {
+    assert.equal(await termKey({ key: 'w', code: 'KeyW', ctrlKey: true }), true, 'terminalKey passes Ctrl+W');
+    await page.click('.workspace:not(.hidden) .tabbar-actions button[title^="New shell"]');
+    await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; return t && t.session && t.session.kind === 'shell' && t.attached; });
+    const id = await page.evaluate(() => { const t = window.skiffcode.active.activeTab; t.term.focus(); return t.sessionId; });
+    const open = () => page.evaluate(i => window.skiffcode.active.allTabs().some(t => t.sessionId === i), id);
+    await page.keyboard.press('Control+w');
+    await sleep(300);
+    assert.equal(await page.locator('.modal-back').count(), 0, 'no close question');
+    assert.equal(await open(), true, 'Ctrl+W in a terminal keeps the tab');
+    await page.keyboard.press('Alt+w');
+    await page.waitForFunction(i => !window.skiffcode.active.allTabs().some(t => t.sessionId === i), id);
+  });
+
   await step('bottom panel: split down, hide/show, and the layout survives a reload', async () => {
     await page.keyboard.press('Control+p');
     await page.waitForSelector('.qp-input');
@@ -386,6 +571,18 @@ const G = {};
     await page.waitForSelector('.toast.warn >> text=is asking you a question');
     await page.evaluate(id => import('/js/rpc.js').then(async r => { await r.call('term.open', { id, cols: 100, rows: 30 }); r.sendInput(id, '\x1b'); }), s.id);
     await page.waitForSelector('.toast.warn', { state: 'detached', timeout: 5000 });
+  });
+
+  await step('Claude sessions: Copy conversation ID from the tab and the sidebar', async () => {
+    const W = '.workspace:not(.hidden)';
+    const s = await page.evaluate(() => import('/js/store.js').then(m => m.store.sessions.find(x => x.kind === 'claude' && x.name === 'feat/login')));
+    assert.ok(s.prompted && /^[0-9a-f-]{36}$/.test(s.claudeId));
+    await page.click(`${W} .row-top .tab:has-text("feat/login")`, { button: 'right' });
+    await page.click('.menu-item >> text=Copy conversation ID');
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), s.claudeId);
+    await page.click('.session-row:has-text("feat/login")', { button: 'right' });
+    await page.waitForSelector('.menu-item >> text=Copy conversation ID');
+    await page.evaluate(() => import('/js/dialogs.js').then(m => m.closeMenu()));
   });
 
   await step('sidebar lists Claude sessions only, with the Claude icon; rename and close stay in sync', async () => {

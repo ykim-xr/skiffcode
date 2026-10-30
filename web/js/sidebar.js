@@ -3,6 +3,7 @@ import { h, icon, clear } from './util.js';
 import { store, subscribe, sessionsIn, needsYou } from './store.js';
 import { call } from './rpc.js';
 import { contextMenu } from './dialogs.js';
+import { keyHint, withKey } from './keybindings.js';
 import { customizeDialog, entryIcon } from './customize-dialog.js';
 
 export const STATE_ICON = {
@@ -87,7 +88,7 @@ function render() {
       h('div.sidebar-actions',
         h('button.icon-btn', { title: 'Add repository or folder', onclick: () => A.addRepo() }, icon('plus')),
         h('button.icon-btn', { title: 'New group', onclick: () => A.newGroup() }, icon('group')),
-        h('button.icon-btn', { title: 'Jump to… (Ctrl+Alt+J)', onclick: () => A.jump() }, icon('search')))),
+        h('button.icon-btn', { title: withKey('Jump to…', 'jump'), onclick: () => A.jump() }, icon('search')))),
     activePanel(),
     list);
   list.scrollTop = treeTop;
@@ -176,8 +177,8 @@ function folderRows(r, depth) {
     title: `${r.path}\nFolder (not a git repository)`,
     onclick: () => A.openWorktree(r.path),
     oncontextmenu: e => contextMenu(e, [
-      { label: 'New Claude session', icon: 'claude', hint: 'Ctrl+Alt+N', action: () => A.newSession(r.path, 'claude') },
-      { label: 'New shell', icon: 'terminal', hint: 'Ctrl+`', action: () => A.newSession(r.path, 'shell') },
+      { label: 'New Claude session', icon: 'claude', hint: keyHint('newClaude'), action: () => A.newSession(r.path, 'claude') },
+      { label: 'New shell', icon: 'terminal', hint: keyHint('newShell'), action: () => A.newSession(r.path, 'shell') },
       { label: 'Resume Claude conversation…', icon: 'play', action: () => A.resumeConversation(r.path) },
       { separator: true },
       { label: 'Initialize git here', icon: 'git', action: () => A.gitInit(r.path) },
@@ -259,8 +260,8 @@ function worktreeRows(r, w, depth) {
     title: `${w.path}${st && st.base ? `\nCompared with ${st.base}` : ''}`,
     onclick: () => A.openWorktree(w.path),
     oncontextmenu: e => contextMenu(e, [
-      { label: 'New Claude session', icon: 'claude', hint: 'Ctrl+Alt+N', action: () => A.newSession(w.path, 'claude') },
-      { label: 'New shell', icon: 'terminal', hint: 'Ctrl+`', action: () => A.newSession(w.path, 'shell') },
+      { label: 'New Claude session', icon: 'claude', hint: keyHint('newClaude'), action: () => A.newSession(w.path, 'claude') },
+      { label: 'New shell', icon: 'terminal', hint: keyHint('newShell'), action: () => A.newSession(w.path, 'shell') },
       { label: 'Resume Claude conversation…', icon: 'play', action: () => A.resumeConversation(w.path) },
       { label: 'Review changes vs base', icon: 'diff', action: () => A.reviewChanges(w.path) },
       { separator: true },
@@ -317,6 +318,7 @@ function sessionRow(s, depth, agentsKey) {
       ended ? { label: 'Resume', icon: 'play', action: () => A.resumeSession(s.id) } : null,
       !ended ? { label: 'Stop', icon: 'stop', action: () => A.stopSession(s.id) } : null,
       { label: 'Rename…', icon: 'edit', action: () => A.renameSession(s) },
+      s.kind === 'claude' && s.claudeId && s.prompted ? { label: 'Copy conversation ID', icon: 'link', action: () => navigator.clipboard.writeText(s.claudeId) } : null,
       s.unread ? { label: 'Mark as read', icon: 'circle', action: () => call('sessions.setUnread', { id: s.id, unread: false }) } : { label: 'Mark as unread', icon: 'dot', action: () => call('sessions.setUnread', { id: s.id, unread: true }) },
       { separator: true },
       { label: 'Close session', icon: 'close', action: () => A.closeSession(s) },

@@ -66,6 +66,8 @@ Optional: `sudo apt install ripgrep` for faster search.
 
 ## Keys
 
+Defaults; change or switch them off in Settings → Keyboard shortcuts. F12 · Shift+F12, Alt+1–9 and terminal copy/paste are fixed.
+
 | | |
 |---|---|
 | Ctrl+P · Ctrl+Shift+P | open a file · all commands |

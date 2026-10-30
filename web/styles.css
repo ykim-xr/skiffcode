@@ -568,6 +568,23 @@ span.look-preview-icon { font-size: 15px; }
 .sound-file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sound-none { font-size: 12px; }
 
+/* keyboard shortcuts */
+.keys-modal { width: 500px; }
+.keys-rows { display: flex; flex-direction: column; gap: 2px; }
+.keys-row { display: flex; align-items: center; gap: 6px; height: 28px; }
+.keys-label { flex: 1; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.keys-key { width: 150px; flex: none; height: 24px; padding: 0 8px; text-align: left; font: 12px var(--mono); color: var(--fg-strong); background: var(--bg-input); border: 1px solid var(--border-strong); border-radius: 4px; cursor: pointer; }
+.keys-key:hover { border-color: var(--fg-dim); }
+.keys-key.recording { border-color: var(--focus); color: var(--fg-muted); font-family: var(--font); }
+.keys-none { color: var(--fg-dim); font-family: var(--font); }
+.keys-row .icon-btn:disabled { opacity: .3; cursor: default; background: transparent; }
+.keys-enabled { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--fg-strong); cursor: pointer; }
+.keys-enabled input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.keys-enabled-hint { flex-basis: 100%; padding-left: 24px; font-size: 11px; color: var(--fg-dim); }
+.keys-rows.off { opacity: .5; }
+.keys-note { min-height: 18px; font-size: 12px; color: var(--fg-muted); }
+.keys-note.warn { color: var(--question); }
+
 /* drag and drop of files */
 .file-row.drop-into { background: #0078d433; outline: 1px solid var(--focus); outline-offset: -1px; }
 .file-tree.drop-root { box-shadow: inset 0 0 0 1px var(--focus); background: #0078d414; }

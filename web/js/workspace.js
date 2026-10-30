@@ -12,6 +12,7 @@ import { SearchView } from './searchview.js';
 import { store, sessionsIn, session } from './store.js';
 import { isInternal, isExternal, readInternal } from './dnd.js';
 import { contextMenu, toast } from './dialogs.js';
+import { keyHint, withKey } from './keybindings.js';
 
 const MAX_PANES_PER_ROW = 3;
 
@@ -141,22 +142,28 @@ class Pane {
           if (e.button === 0) this.activate(t);
         },
         dataset: { uid: t.uid },
-        oncontextmenu: e => contextMenu(e, [
-          { label: t.kind === 'session' ? 'Close session' : 'Close', action: () => ws.closeTab(t), hint: 'Alt+W' },
-          t.kind === 'session' && t.session && t.session.kind === 'claude' && t.session.state !== 'ended' ? { label: 'Hide tab (keeps running)', action: () => ws.hideTab(t) } : null,
-          t.kind === 'session' && t.session ? { label: 'Rename…', icon: 'edit', action: () => ws.app.actions.renameSession(t.session) } : null,
-          t.kind === 'session' && t.session && t.session.kind === 'claude' ? { label: 'Delete session and conversation…', icon: 'trash', danger: true, action: () => ws.app.actions.purgeSession(t.session) } : null,
-          { label: 'Close others', action: () => this.tabs.filter(x => x !== t).forEach(x => ws.closeTab(x)) },
-          { separator: true },
-          this.row.panes.length < MAX_PANES_PER_ROW ? { label: 'Split right', icon: 'split', action: () => ws.splitRight(t) } : null,
-          { label: bottom ? 'Move up to the main area' : 'Split down (bottom panel)', icon: bottom ? 'up' : 'down', action: () => ws.splitDown(t) },
-          t.kind === 'file' || t.kind === 'view' || t.kind === 'web' ? { separator: true } : null,
-          t.kind === 'file' && hasPreview(t.path) ? { label: 'Open preview to the side', icon: 'eye', action: () => ws.openPreview(t.path) } : null,
-          t.kind === 'file' || t.kind === 'view' ? { label: 'Copy path', icon: 'link', action: () => navigator.clipboard.writeText(`${ws.root}/${t.path}`) } : null,
-          t.kind === 'web' ? { label: 'Copy address', icon: 'link', action: () => navigator.clipboard.writeText(t.url) } : null,
-          t.kind === 'session' && t.session && t.session.state !== 'ended' ? { separator: true } : null,
-          t.kind === 'session' && t.session && t.session.state !== 'ended' ? { label: 'Stop', icon: 'stop', action: () => call('sessions.stop', { id: t.sessionId }) } : null,
-        ]),
+        oncontextmenu: e => {
+          // a conversation that was never prompted gets a new id when it restarts
+          const cid = t.kind === 'session' && t.session && t.session.kind === 'claude' && t.session.prompted && t.session.claudeId;
+          contextMenu(e, [
+            { label: t.kind === 'session' ? 'Close session' : 'Close', action: () => ws.closeTab(t), hint: keyHint('closeTab') || keyHint('closeTabOutsideTerminals') },
+            t.kind === 'session' && t.session && t.session.kind === 'claude' && t.session.state !== 'ended' ? { label: 'Hide tab (keeps running)', action: () => ws.hideTab(t) } : null,
+            t.kind === 'session' && t.session ? { label: 'Rename…', icon: 'edit', action: () => ws.app.actions.renameSession(t.session) } : null,
+            t.kind === 'session' && t.session && t.session.kind === 'claude' ? { label: 'Delete session and conversation…', icon: 'trash', danger: true, action: () => ws.app.actions.purgeSession(t.session) } : null,
+            { label: 'Close others', action: () => this.tabs.filter(x => x !== t).forEach(x => ws.closeTab(x)) },
+            { separator: true },
+            this.row.panes.length < MAX_PANES_PER_ROW ? { label: 'Split right', icon: 'split', action: () => ws.splitRight(t) } : null,
+            { label: bottom ? 'Move up to the main area' : 'Split down (bottom panel)', icon: bottom ? 'up' : 'down', action: () => ws.splitDown(t) },
+            t.kind === 'file' || t.kind === 'view' || t.kind === 'web' ? { separator: true } : null,
+            t.kind === 'file' && hasPreview(t.path) ? { label: 'Open preview to the side', icon: 'eye', action: () => ws.openPreview(t.path) } : null,
+            t.kind === 'file' || t.kind === 'view' ? { label: 'Copy path', icon: 'link', action: () => navigator.clipboard.writeText(`${ws.root}/${t.path}`) } : null,
+            t.kind === 'web' ? { label: 'Copy address', icon: 'link', action: () => navigator.clipboard.writeText(t.url) } : null,
+            cid ? { separator: true } : null,
+            cid ? { label: 'Copy conversation ID', icon: 'link', action: () => navigator.clipboard.writeText(cid) } : null,
+            t.kind === 'session' && t.session && t.session.state !== 'ended' ? { separator: true } : null,
+            t.kind === 'session' && t.session && t.session.state !== 'ended' ? { label: 'Stop', icon: 'stop', action: () => call('sessions.stop', { id: t.sessionId }) } : null,
+          ]);
+        },
         ondragstart: e => { ws.dragTab = t; e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', t.uid); },
         ondragover: e => { if (ws.dragTab) { e.preventDefault(); e.stopPropagation(); el.classList.add('drop-before'); } },
         ondragleave: () => el.classList.remove('drop-before'),
@@ -181,12 +188,12 @@ class Pane {
       this.active && this.active.kind === 'file' && hasPreview(this.active.path)
         ? h('button.icon-btn', { title: 'Open preview to the side', onclick: () => ws.openPreview(this.active.path) }, icon('eye'))
         : null,
-      bottom ? null : h('button.icon-btn', { title: 'New Claude session (Ctrl+Alt+N)', onclick: () => ws.app.actions.newSession(ws.root, 'claude') }, icon('claude')),
-      h('button.icon-btn', { title: 'New shell (Ctrl+`)', onclick: () => ws.app.actions.newSession(ws.root, 'shell', { pane: bottom ? this : undefined }) }, icon('terminal')),
+      bottom ? null : h('button.icon-btn', { title: withKey('New Claude session', 'newClaude'), onclick: () => ws.app.actions.newSession(ws.root, 'claude') }, icon('claude')),
+      h('button.icon-btn', { title: withKey('New shell', 'newShell'), onclick: () => ws.app.actions.newSession(ws.root, 'shell', { pane: bottom ? this : undefined }) }, icon('terminal')),
       this.row.panes.length < MAX_PANES_PER_ROW ? h('button.icon-btn', { title: 'Split right', onclick: () => this.active && ws.splitRight(this.active) }, icon('split')) : null,
       !bottom ? h('button.icon-btn', { title: 'Split down', onclick: () => this.active && ws.splitDown(this.active) }, icon('splitDown')) : null,
       bottom && this.row.panes.indexOf(this) === this.row.panes.length - 1
-        ? h('button.icon-btn', { title: 'Hide panel (Ctrl+Shift+`)', onclick: () => ws.togglePanel(false) }, icon('chevronDown'))
+        ? h('button.icon-btn', { title: withKey('Hide panel', 'togglePanel'), onclick: () => ws.togglePanel(false) }, icon('chevronDown'))
         : null));
   }
 }
@@ -485,9 +492,7 @@ export class Workspace {
         h('button.btn', { onclick: () => this.app.actions.quickOpen() }, icon('file'), 'Open file…')),
       live.length ? h('div.empty-sessions', h('div.muted', 'Sessions in this worktree'), live.map(s => h('button.link', { onclick: () => this.openSession(s.id) }, s.name))) : null,
       h('div.empty-keys',
-        h('span', h('kbd', 'Ctrl+P'), ' open file'),
-        h('span', h('kbd', 'Ctrl+Alt+J'), ' jump'),
-        h('span', h('kbd', 'Ctrl+`'), ' shell'),
+        [['quickOpen', 'open file'], ['jump', 'jump'], ['newShell', 'shell']].map(([id, what]) => keyHint(id) ? h('span', h('kbd', keyHint(id)), ` ${what}`) : null),
         h('span', h('kbd', 'F12'), ' definition'))));
   }
 
@@ -600,8 +605,8 @@ export class Workspace {
   showRight(view) {
     this.rightView = view;
     localStorage.setItem('skiffcode.rightView', view);
-    const tabs = [['files', 'files', 'Files', 'Ctrl+Shift+E'], ['scm', 'git', 'Changes', 'Ctrl+Shift+G'], ['search', 'search', 'Search', 'Ctrl+Shift+F']];
-    clear(this.rightTabs, tabs.map(([id, ic, label, key]) => h(`button.right-tab${id === view ? '.active' : ''}`, { title: `${label} (${key})`, onclick: () => this.showRight(id) }, icon(ic), h('span', label), id === 'scm' ? this.scm.badge : null)));
+    const tabs = [['files', 'files', 'Files'], ['scm', 'git', 'Changes'], ['search', 'search', 'Search']];
+    clear(this.rightTabs, tabs.map(([id, ic, label]) => h(`button.right-tab${id === view ? '.active' : ''}`, { title: withKey(label, id), onclick: () => this.showRight(id) }, icon(ic), h('span', label), id === 'scm' ? this.scm.badge : null)));
     this.files.el.classList.toggle('hidden', view !== 'files');
     this.scm.el.classList.toggle('hidden', view !== 'scm');
     this.search.el.classList.toggle('hidden', view !== 'search');

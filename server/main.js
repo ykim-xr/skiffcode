@@ -52,6 +52,8 @@ const DEFAULT_SETTINGS = {
   volume: 70, // 0–100, for every alert sound
   desktopNotifications: true,
   fontSize: 13,
+  shortcutsEnabled: true, // off: only the command palette key stays SkiffCode's
+  keybindings: {}, // action id -> key ('ctrl+alt+b'), '' = no key; unset = default (web/js/keybindings.js)
 };
 
 const state = new State(HOME);

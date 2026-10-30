@@ -3,6 +3,12 @@ import { h, icon, fuzzy, highlight } from './util.js';
 
 const layer = () => document.getElementById('overlay');
 
+/** Dialogs stack (Settings → Sounds): only the top one reacts to Escape. */
+export function isTopModal(back) {
+  const open = layer().querySelectorAll('.modal-back');
+  return open[open.length - 1] === back;
+}
+
 export function modal(content, { onClose, wide } = {}) {
   const back = h('div.modal-back');
   const box = h(`div.modal${wide ? '.wide' : ''}`, content);
@@ -13,7 +19,7 @@ export function modal(content, { onClose, wide } = {}) {
     onClose && onClose(v);
   };
   const key = e => {
-    if (e.key === 'Escape') {
+    if (e.key === 'Escape' && isTopModal(back)) {
       e.stopPropagation();
       e.preventDefault();
       close(undefined);
@@ -48,7 +54,7 @@ export function confirmDialog({ title, detail, buttons, typed }) {
       h('div.modal-buttons', h('button.btn', { onclick: () => m.close(undefined) }, 'Cancel'), ...btns),
     ];
     const m = modal(content, { onClose: resolve });
-    setTimeout(() => (input || btns[btns.length - 1]).focus(), 0);
+    setTimeout(() => (input || btns[btns.length - 1]).focus({ preventScroll: true }), 0); // a long dialog stays at its top
     if (input) input.addEventListener('keydown', e => e.key === 'Enter' && btns[btns.length - 1].click());
   });
 }

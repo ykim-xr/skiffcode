@@ -124,7 +124,7 @@ export class ScmView {
       if (!this.sel.paths.size) this.sel.section = null;
     }
     const sections = [];
-    if (s.conflicts.length) sections.push(this.section('conflicts', 'Merge conflicts', s.conflicts, 'working'));
+    if (s.conflicts.length) sections.push(this.section('conflicts', 'Merge conflicts', s.conflicts, 'conflict'));
     if (s.staged.length) sections.push(this.section('staged', 'Staged changes', s.staged, 'staged', [
       h('button.icon-btn', { title: 'Unstage all', onclick: () => this.run('git.unstageAll') }, icon('close')),
     ]));
@@ -318,20 +318,26 @@ export class ScmView {
   fileRow(f, kind, sectionId) {
     const letter = f.status === '?' ? 'U' : f.status;
     const staged = kind === 'staged';
+    const conflict = kind === 'conflict'; // git restore refuses unmerged files, so no Discard
     const picked = this.sel.section === sectionId && this.sel.paths.has(f.path);
     return h(`div.scm-item.g-${letter}${picked ? '.selected' : ''}`, {
       title: `${f.path} — ${STATUS_LABEL[f.status] || f.status}${staged ? ' (staged)' : ''}`,
       onmousedown: e => { if (e.shiftKey) e.preventDefault(); }, // no text selection while range-selecting
       onclick: e => this.clickRow(e, sectionId, f, staged),
       oncontextmenu: e => {
+        if (!(this.sel.section === sectionId && this.sel.paths.has(f.path))) {
+          this.sel = { section: sectionId, paths: new Set([f.path]) };
+          this.anchor = { section: sectionId, path: f.path };
+          this.rerender();
+        }
         const t = this.targets(sectionId, f);
         const many = t.length > 1 ? ` ${t.length} files` : '';
         contextMenu(e, [
           { label: 'Open diff', icon: 'diff', action: () => this.openDiff(f, staged) },
           f.status !== 'D' ? { label: 'Open file', icon: 'file', action: () => this.ws.openFile(f.path) } : null,
           { separator: true },
-          staged ? { label: `Unstage${many}`, action: () => this.run('git.unstage', t) } : { label: `Stage${many}`, action: () => this.run('git.stage', t) },
-          !staged ? { label: many ? `Discard${many}` : 'Discard changes', icon: 'refresh', danger: true, action: () => this.discard(t) } : null,
+          staged ? { label: `Unstage${many}`, action: () => this.run('git.unstage', t) } : { label: `Stage${many}`, action: () => this.stage(t, conflict) },
+          !staged && !conflict ? { label: many ? `Discard${many}` : 'Discard changes', icon: 'refresh', danger: true, action: () => this.discard(t) } : null,
         ]);
       },
     },
@@ -340,10 +346,10 @@ export class ScmView {
     h('span.scm-dir', dirname(f.path)),
     h('span.scm-actions',
       f.status !== 'D' ? h('button.icon-btn', { title: 'Open file', onclick: e => { e.stopPropagation(); this.ws.openFile(f.path); } }, icon('file')) : null,
-      !staged ? h('button.icon-btn', { title: 'Discard changes', onclick: e => { e.stopPropagation(); this.discard(this.targets(sectionId, f)); } }, icon('refresh')) : null,
+      !staged && !conflict ? h('button.icon-btn', { title: 'Discard changes', onclick: e => { e.stopPropagation(); this.discard(this.targets(sectionId, f)); } }, icon('refresh')) : null,
       staged
         ? h('button.icon-btn', { title: 'Unstage', onclick: e => { e.stopPropagation(); this.run('git.unstage', this.targets(sectionId, f)); } }, icon('close'))
-        : h('button.icon-btn', { title: 'Stage', onclick: e => { e.stopPropagation(); this.run('git.stage', this.targets(sectionId, f)); } }, icon('plus'))),
+        : h('button.icon-btn', { title: 'Stage', onclick: e => { e.stopPropagation(); this.stage(this.targets(sectionId, f), conflict); } }, icon('plus'))),
     h('span.git-letter', STATUS_LETTER(f.status)));
   }
 
@@ -364,6 +370,19 @@ export class ScmView {
     } catch (e) {
       toast(e.message, { kind: 'error' });
     }
+  }
+
+  /** Staging a conflicted file marks it resolved, markers or not: ask before doing that to several. */
+  async stage(files, conflict) {
+    if (conflict && files.length > 1) {
+      const v = await confirmDialog({
+        title: `Mark ${files.length} files as resolved?`,
+        detail: 'Staging a file with conflicts marks it resolved, even if conflict markers remain.',
+        buttons: [{ label: 'Mark as resolved', value: 'yes', primary: true }],
+      });
+      if (v !== 'yes') return;
+    }
+    await this.run('git.stage', files);
   }
 
   async discard(files) {

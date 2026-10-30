@@ -3,7 +3,7 @@
 import { h, icon, clear } from './util.js';
 import { call, on } from './rpc.js';
 import { store, notify } from './store.js';
-import { toast, promptDialog, confirmDialog } from './dialogs.js';
+import { toast, promptDialog, confirmDialog, isTopModal } from './dialogs.js';
 
 on('usage', u => {
   store.usage = u;
@@ -89,7 +89,7 @@ export async function accountsDialog() {
       h('button.btn', { onclick: addAccount }, icon('plus'), 'Add account…'),
       h('button.btn.primary', { onclick: () => close() }, 'Done')));
   back.append(box);
-  const key = e => { if (e.key === 'Escape') { e.preventDefault(); close(); } };
+  const key = e => { if (e.key === 'Escape' && isTopModal(back)) { e.preventDefault(); close(); } };
   document.addEventListener('keydown', key, true);
   back.addEventListener('mousedown', e => e.target === back && close());
   function close() {

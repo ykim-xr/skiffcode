@@ -14,6 +14,7 @@ import { resumeDialog, offerPastConversations } from './resume-dialog.js';
 import { applyColors, colorsDialog, defineEditorTheme } from './colors.js';
 import { addRepoDialog } from './add-repo-dialog.js';
 import { soundsDialog } from './sounds-dialog.js';
+import { activeKeys, keyHint, withKey, keybindingsDialog, shortcutsOn, setShortcutsOn, NOT_IN_TERMINALS } from './keybindings.js';
 import { openLink } from './viewers.js';
 
 const app = {
@@ -559,32 +560,35 @@ const actions = {
   },
   async commands() {
     const ws = app.active;
+    const k = keyHint;
     const cmds = [
-      ['Jump to session or worktree', 'Ctrl+Alt+J', () => actions.jump()],
-      ['Go to next session that needs you', 'Ctrl+Alt+K', () => actions.nextNeedsYou()],
-      ['Open file…', 'Ctrl+P', () => actions.quickOpen()],
-      ['New Claude session', 'Ctrl+Alt+N', () => actions.newSession(null, 'claude')],
-      ['New shell', 'Ctrl+`', () => actions.newSession(null, 'shell')],
-      ['Review changes vs base', 'Ctrl+Alt+D', () => ws && ws.openReview()],
-      ['Search in worktree', 'Ctrl+Shift+F', () => ws && ws.showRight('search')],
-      ['Show files', 'Ctrl+Shift+E', () => ws && ws.showRight('files')],
-      ['Show source control', 'Ctrl+Shift+G', () => ws && ws.showRight('scm')],
+      ['Jump to session or worktree', k('jump'), () => actions.jump()],
+      ['Go to next session that needs you', k('nextNeedsYou'), () => actions.nextNeedsYou()],
+      ['Open file…', k('quickOpen'), () => actions.quickOpen()],
+      ['New Claude session', k('newClaude'), () => actions.newSession(null, 'claude')],
+      ['New shell', k('newShell'), () => actions.newSession(null, 'shell')],
+      ['Review changes vs base', k('review'), () => ws && ws.openReview()],
+      ['Search in worktree', k('search'), () => ws && ws.showRight('search')],
+      ['Show files', k('files'), () => ws && ws.showRight('files')],
+      ['Show source control', k('scm'), () => ws && ws.showRight('scm')],
       ['Add repository or folder…', '', () => actions.addRepo()],
       ['New group…', '', () => actions.newGroup()],
-      ['Next worktree', 'Alt+↓', () => stepWorktree(1)],
-      ['Previous worktree', 'Alt+↑', () => stepWorktree(-1)],
+      ['Next worktree', k('nextWorktree'), () => stepWorktree(1)],
+      ['Previous worktree', k('prevWorktree'), () => stepWorktree(-1)],
       ['Split right', '', () => ws && ws.activeTab && ws.splitRight(ws.activeTab)],
       ['Split down (move to bottom panel)', '', () => ws && ws.activeTab && ws.splitDown(ws.activeTab)],
-      ['Toggle bottom panel', 'Ctrl+Shift+`', () => ws && ws.togglePanel()],
+      ['Toggle bottom panel', k('togglePanel'), () => ws && ws.togglePanel()],
       [store.prefs.muted ? 'Unmute sounds' : 'Mute sounds', '', () => toggleMute()],
       ['Test alert sound', '', () => playSound('question')],
       ['Sounds…', '', () => soundsDialog()],
-      ['Settings…', 'Ctrl+,', () => openSettings()],
+      ['Settings…', k('settings'), () => openSettings()],
+      ['Keyboard shortcuts…', '', () => keybindingsDialog()],
+      [shortcutsOn() ? 'Turn shortcuts off' : 'Turn shortcuts on', '', () => setShortcutsOn(!shortcutsOn())],
       ['Claude accounts & usage…', '', () => accountsDialog()],
       ['Resume a Claude conversation…', '', () => actions.resumeConversation()],
       ['Open web page or file…', '', () => actions.openWebPage()],
       ['Panel colors…', '', () => colorsDialog()],
-      ['Toggle sidebar', '', () => document.body.classList.toggle('no-sidebar')],
+      ['Toggle sidebar', k('toggleSidebar'), () => KEY_RUN.toggleSidebar()],
     ];
     const v = await quickPick(cmds.map(([label, key, fn], i) => ({ label, description: key, value: i })), { placeholder: 'Run a command', matchDescription: false });
     if (v !== undefined) cmds[v][2]();
@@ -609,6 +613,7 @@ async function openSettings() {
   const form = h('div.settings',
     h('div.setting', h('span.setting-label', 'Panel colors'), h('button.btn', { type: 'button', onclick: () => colorsDialog() }, icon('palette'), 'Choose…'), h('span.setting-hint', 'Background of the sidebar, editor & terminals, bottom panel and right panel.')),
     field('Sidebar density', select('density', [['comfortable', 'Comfortable'], ['compact', 'Compact']]), 'Compact fits more sessions on screen.'),
+    h('div.setting', h('span.setting-label', 'Keyboard shortcuts'), h('button.btn', { type: 'button', onclick: () => keybindingsDialog() }, icon('keyboard'), 'Change keys…'), h('span.setting-hint', 'Change or remove the key of each action.')),
     h('h3', 'Claude'),
     field('Command', text('claudeCommand', 'claude'), 'SkiffCode adds --session-id / --resume, --name and --settings.'),
     field('Extra arguments', text('claudeArgs', '--permission-mode acceptEdits'), 'Added to every session.'),
@@ -668,7 +673,7 @@ function updateStatusBar() {
   clear(bar,
     h('div.sb-left',
       usageItem(),
-      h('span.sb-item.click', { title: 'Jump to a session (Ctrl+Alt+J)', onclick: () => actions.jump() }, icon('claude', working ? 'spin st-claude' : 'st-claude-idle'), `${running} running`,
+      h('span.sb-item.click', { title: withKey('Jump to a session', 'jump'), onclick: () => actions.jump() }, icon('claude', working ? 'spin st-claude' : 'st-claude-idle'), `${running} running`,
         working ? ` · ${working} working` : null,
         need ? [' ', icon('question', 'st-question'), String(need)] : null,
         unread ? [' ', h('span.unread-dot'), String(unread)] : null),
@@ -716,28 +721,30 @@ function isKey(e, spec) {
   return k === key || e.code.toLowerCase() === `key${key}` || (key === '`' && e.code === 'Backquote') || e.code.toLowerCase() === key;
 }
 
-const SHORTCUTS = [
-  ['ctrl+p', () => actions.quickOpen()],
-  ['ctrl+shift+p', () => actions.commands()],
-  ['ctrl+alt+j', () => actions.jump()],
-  ['ctrl+alt+k', () => actions.nextNeedsYou()],
-  ['ctrl+alt+n', () => actions.newSession(null, 'claude')],
-  ['ctrl+`', () => actions.newSession(null, 'shell')],
-  ['ctrl+shift+`', () => app.active && app.active.togglePanel()],
-  ['ctrl+alt+d', () => app.active && app.active.openReview()],
-  ['ctrl+shift+f', () => app.active && app.active.showRight('search')],
-  ['ctrl+shift+e', () => app.active && app.active.showRight('files')],
-  ['ctrl+shift+g', () => app.active && app.active.showRight('scm')],
-  ['ctrl+,', () => openSettings()],
-  ['alt+w', () => closeActiveTab()],
-  ['ctrl+w', () => closeActiveTab()],
-  ['alt+arrowdown', () => stepWorktree(1)],
-  ['alt+arrowup', () => stepWorktree(-1)],
-  ['alt+]', () => stepTab(1)],
-  ['alt+[', () => stepTab(-1)],
-  ['ctrl+tab', () => stepTab(1)],
-  ['ctrl+shift+tab', () => stepTab(-1)],
-];
+/** What each shortcut does, by action id (keys: keybindings.js). */
+const KEY_RUN = {
+  quickOpen: () => actions.quickOpen(),
+  commands: () => actions.commands(),
+  jump: () => actions.jump(),
+  nextNeedsYou: () => actions.nextNeedsYou(),
+  newClaude: () => actions.newSession(null, 'claude'),
+  newShell: () => actions.newSession(null, 'shell'),
+  togglePanel: () => app.active && app.active.togglePanel(),
+  review: () => app.active && app.active.openReview(),
+  search: () => app.active && app.active.showRight('search'),
+  files: () => app.active && app.active.showRight('files'),
+  scm: () => app.active && app.active.showRight('scm'),
+  settings: () => openSettings(),
+  toggleSidebar: () => document.body.classList.toggle('no-sidebar'),
+  closeTab: () => closeActiveTab(),
+  closeTabOutsideTerminals: () => closeActiveTab(),
+  nextWorktree: () => stepWorktree(1),
+  prevWorktree: () => stepWorktree(-1),
+  nextTab: () => stepTab(1),
+  prevTab: () => stepTab(-1),
+  nextTabAlt: () => stepTab(1),
+  prevTabAlt: () => stepTab(-1),
+};
 
 function closeActiveTab() {
   const ws = app.active;
@@ -753,15 +760,17 @@ function stepTab(d) {
 }
 
 function globalKey(e) {
-  for (const [spec, fn] of SHORTCUTS) {
+  const inTerminal = e.target instanceof Element && e.target.closest('.term-host');
+  for (const [id, spec] of activeKeys()) {
+    if (inTerminal && NOT_IN_TERMINALS.has(id)) continue;
     if (isKey(e, spec)) {
       e.preventDefault();
       e.stopPropagation();
-      fn();
+      KEY_RUN[id]();
       return true;
     }
   }
-  if (e.altKey && !e.ctrlKey && /^Digit[1-9]$/.test(e.code)) {
+  if (shortcutsOn() && e.altKey && !e.ctrlKey && /^Digit[1-9]$/.test(e.code)) {
     const list = orderedWorktrees();
     const w = list[Number(e.code.slice(5)) - 1];
     if (w) {
@@ -789,8 +798,8 @@ app.terminalKey = (e, tab) => {
   }
   if (isKey(e, 'ctrl+shift+c')) return false;
   if (isKey(e, 'ctrl+v') || isKey(e, 'ctrl+shift+v')) return false; // the browser's paste event reaches xterm
-  for (const [spec] of SHORTCUTS) if (isKey(e, spec) && spec !== 'ctrl+w') return false;
-  if (e.altKey && /^Digit[1-9]$/.test(e.code)) return false;
+  for (const [id, spec] of activeKeys()) if (!NOT_IN_TERMINALS.has(id) && isKey(e, spec)) return false;
+  if (shortcutsOn() && e.altKey && /^Digit[1-9]$/.test(e.code)) return false;
   return true;
 };
 
