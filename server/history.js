@@ -134,6 +134,7 @@ function deleteConversation(configDirs, folder, id) {
       const keep = lines.filter(l => !l.includes(id) || (() => { try { return JSON.parse(l).sessionId !== id; } catch { return true; } })());
       if (keep.length !== lines.length) {
         fs.writeFileSync(`${hist}.skiffcode-tmp`, keep.join('\n'));
+        fs.chmodSync(`${hist}.skiffcode-tmp`, fs.statSync(hist).mode & 0o7777);
         fs.renameSync(`${hist}.skiffcode-tmp`, hist);
         gone.push(`${hist} (${lines.length - keep.length} lines)`);
       }
@@ -148,4 +149,4 @@ function parseConversationId(text) {
   return m ? m[0].toLowerCase() : null;
 }
 
-module.exports = { listConversations, parseConversationId, encode, readTranscript, deleteConversation };
+module.exports = { listConversations, parseConversationId, encode, readTranscript, deleteConversation, UUID };

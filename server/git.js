@@ -5,8 +5,17 @@ const { run } = require('./util');
 
 const git = (cwd, args, opts = {}) => run('git', args, { cwd, ...opts });
 
+/** A ref, sha or branch from a page goes into git's arguments: never one git would read as an option. */
+function safeRef(ref) {
+  if (typeof ref !== 'string' || !ref || ref.startsWith('-')) throw new Error(`Not a valid ref: ${ref}`);
+  return ref;
+}
+
 async function resolveRepoRoot(dir) {
   const common = (await git(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).trim();
+  // A submodule's git dir sits in its parent's .git/modules: the repo is its own working folder.
+  const superproject = (await git(dir, ['rev-parse', '--show-superproject-working-tree']).catch(() => '')).trim();
+  if (superproject || common.includes(`${path.sep}.git${path.sep}modules${path.sep}`)) return (await git(dir, ['rev-parse', '--show-toplevel'])).trim();
   return path.basename(common) === '.git' ? path.dirname(common) : common;
 }
 
@@ -31,6 +40,9 @@ function parseWorktreeList(porcelain) {
 
 async function listWorktrees(repo) {
   const wts = parseWorktreeList(await git(repo, ['worktree', 'list', '--porcelain']));
+  // git lists a submodule's main checkout at its git dir (.git/modules/…), not at its files.
+  const main = wts.find(w => w.isMain);
+  if (main && main.path.includes(`${path.sep}.git${path.sep}modules${path.sep}`)) main.path = (await git(repo, ['rev-parse', '--show-toplevel'])).trim();
   return wts.sort((a, b) => (a.isMain === b.isMain ? (a.branch || a.path).localeCompare(b.branch || b.path) : a.isMain ? -1 : 1));
 }
 
@@ -39,13 +51,17 @@ async function localBranches(repo) {
   return out.split('\n').map(s => s.trim()).filter(Boolean);
 }
 
+async function remoteNames(repo) {
+  return (await git(repo, ['remote']).catch(() => '')).split('\n').map(s => s.trim()).filter(Boolean);
+}
+
 async function baseRefs(repo) {
   const [refs, remotes] = await Promise.all([
     git(repo, ['for-each-ref', '--format=%(refname:short)', '--sort=-committerdate', 'refs/heads', 'refs/remotes']),
-    git(repo, ['remote']).catch(() => ''),
+    remoteNames(repo),
   ]);
-  const remoteNames = new Set(remotes.split('\n').map(s => s.trim()).filter(Boolean));
-  return refs.split('\n').map(s => s.trim()).filter(r => r && !r.endsWith('/HEAD') && !remoteNames.has(r));
+  const remoteSet = new Set(remotes);
+  return refs.split('\n').map(s => s.trim()).filter(r => r && !r.endsWith('/HEAD') && !remoteSet.has(r));
 }
 
 async function defaultBase(repo) {
@@ -62,7 +78,7 @@ async function defaultBase(repo) {
 
 async function refExists(dir, ref) {
   try {
-    await git(dir, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
+    await git(dir, ['rev-parse', '--verify', '--quiet', `${safeRef(ref)}^{commit}`]);
     return true;
   } catch {
     return false;
@@ -134,7 +150,7 @@ async function status(dir) {
 async function branchStatus(dir, base) {
   const st = { base, mergeBase: undefined, ahead: 0, behind: 0, insertions: 0, deletions: 0, files: 0, dirty: 0 };
   const s = await status(dir).catch(() => null);
-  if (s) st.dirty = s.staged.length + s.changes.length + s.untracked.length + s.conflicts.length;
+  if (s) st.dirty = new Set([...s.staged, ...s.changes, ...s.untracked, ...s.conflicts].map(f => f.path)).size; // a staged file edited again is one
   let from = 'HEAD';
   if (base) {
     try {
@@ -190,8 +206,8 @@ function parseLog(out) {
 }
 
 async function commitsSince(dir, since, max = 200) {
-  const range = since ? [`${since}..HEAD`] : ['HEAD', '-n', '20'];
-  return parseLog(await git(dir, ['log', LOG_FORMAT, '-n', String(max), ...range]).catch(() => ''));
+  const range = since ? [`${since}..HEAD`] : ['HEAD'];
+  return parseLog(await git(dir, ['log', LOG_FORMAT, '-n', String(since ? max : 20), ...range]).catch(() => ''));
 }
 
 /** Full history of HEAD, newest first, one page at a time. */
@@ -200,10 +216,11 @@ async function history(dir, skip = 0, max = 50) {
 }
 
 async function commitFiles(dir, sha) {
-  return parseNameStatus(await git(dir, ['show', '--name-status', '-z', '-M', '--format=', sha]).catch(() => ''));
+  return parseNameStatus(await git(dir, ['show', '--name-status', '-z', '-M', '--format=', safeRef(sha)]).catch(() => ''));
 }
 
 async function parentOf(dir, sha) {
+  safeRef(sha);
   try {
     return (await git(dir, ['rev-parse', '--verify', '--quiet', `${sha}^`])).trim() || undefined;
   } catch {
@@ -213,7 +230,7 @@ async function parentOf(dir, sha) {
 
 /** File content at a ref ('' if missing). ref ":0" = staged version. */
 async function showFile(dir, ref, rel) {
-  const spec = ref === ':0' ? `:0:${rel}` : `${ref}:${rel}`;
+  const spec = ref === ':0' ? `:0:${rel}` : `${safeRef(ref)}:${rel}`;
   return git(dir, ['show', spec], { maxBuffer: 32 * 1024 * 1024 }).catch(() => '');
 }
 
@@ -271,8 +288,8 @@ async function pull(dir) {
 
 async function addWorktree(repo, target, spec) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  if (spec.newBranch) await git(repo, ['worktree', 'add', ...(spec.track ? ['--track'] : ['--no-track']), '-b', spec.newBranch, target, spec.base]);
-  else await git(repo, ['worktree', 'add', target, spec.branch]);
+  if (spec.newBranch) await git(repo, ['worktree', 'add', ...(spec.track ? ['--track'] : ['--no-track']), '-b', spec.newBranch, target, safeRef(spec.base)]);
+  else await git(repo, ['worktree', 'add', target, safeRef(spec.branch)]);
 }
 async function removeWorktree(repo, target, force) {
   const args = ['worktree', 'remove'];
@@ -283,9 +300,10 @@ async function pruneWorktrees(repo) {
   await git(repo, ['worktree', 'prune']).catch(() => undefined);
 }
 async function deleteBranch(repo, branch, force) {
-  await git(repo, ['branch', force ? '-D' : '-d', branch]);
+  await git(repo, ['branch', force ? '-D' : '-d', safeRef(branch)]);
 }
 async function unpushedCount(repo, branch) {
+  safeRef(branch);
   const o = await git(repo, ['rev-list', '--count', branch, '--not', '--remotes']).catch(() => '0');
   return Number(o.trim()) || 0;
 }
@@ -298,7 +316,7 @@ function sanitizeForPath(branch) {
 }
 
 module.exports = {
-  git, resolveRepoRoot, parseWorktreeList, listWorktrees, localBranches, baseRefs, defaultBase, refExists, isValidBranchName,
+  git, resolveRepoRoot, parseWorktreeList, listWorktrees, localBranches, remoteNames, baseRefs, defaultBase, refExists, isValidBranchName,
   compareBase, parseStatusV2, status, branchStatus, parseNameStatus, changesSince, commitsSince, history, commitFiles, parentOf, showFile,
   stage, stageAll, unstage, unstageAll, discard, commit, push, pull, addWorktree, removeWorktree, pruneWorktrees, deleteBranch,
   unpushedCount, gitDir, sanitizeForPath,

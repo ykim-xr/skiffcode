@@ -13,25 +13,47 @@ const fsops = require('./fsops');
 const search = require('./search');
 const { State } = require('./state');
 const { Sessions } = require('./sessions');
-const { PtyClient } = require('./pty');
+const { PtyClient, hostPids } = require('./pty');
 const notify = require('./notify');
 const { Accounts, claudeBin } = require('./accounts');
 const history = require('./history');
 const { Sounds, DEFAULTS: SOUND_DEFAULTS } = require('./sounds');
-const { skiffcodeHome, realpath, within, safeToDelete, pool } = require('./util');
+const { run, skiffcodeHome, privateDir, realpath, isGitDir, TERM_SIZE, within, safeToDelete, pool } = require('./util');
 
 const VERSION = require('../package.json').version;
+const VIEW_SANDBOX = 'allow-scripts allow-forms allow-popups allow-modals allow-downloads'; // what a previewed page may do: its own origin, no SkiffCode access
 const HOME = skiffcodeHome();
 const PORT = Number(process.env.SKIFFCODE_PORT || 3417);
 const HOSTNAME = process.env.SKIFFCODE_BIND || '127.0.0.1';
 const APP = path.resolve(__dirname, '..');
 const WEB = path.join(APP, 'web');
 const VENDOR = process.env.SKIFFCODE_VENDOR || path.join(APP, 'vendor');
+const PID_FILE = path.join(HOME, 'server.pid');
 
-fs.mkdirSync(HOME, { recursive: true });
+// One server per home: two would both drive the same sessions and overwrite each other's state.
+// Checked before anything below touches the home folder.
+(() => {
+  let pid;
+  try { pid = Number(fs.readFileSync(PID_FILE, 'utf8').trim()); } catch { return; }
+  if (!pid || pid === process.pid) return;
+  let args;
+  try { args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0'); } catch { return; }
+  if (!args.some(a => a.endsWith(path.join('server', 'main.js')))) return;
+  console.error(`skiffcode: a SkiffCode server (pid ${pid}) is already running for ${HOME}. Stop it first: skiffcode stop`);
+  process.exit(1);
+})();
+
+// Private folders, made one by one: a umask would pass to terminals, shells and Claude and make your own files private too.
+for (const d of ['', 'status', 'inbox', 'drops', 'accounts']) privateDir(path.join(HOME, d));
 const TOKEN_FILE = path.join(HOME, 'token');
-if (!fs.existsSync(TOKEN_FILE)) fs.writeFileSync(TOKEN_FILE, crypto.randomBytes(24).toString('hex'), { mode: 0o600 });
-const TOKEN = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
+const TOKEN = (() => {
+  const t = fs.existsSync(TOKEN_FILE) ? fs.readFileSync(TOKEN_FILE, 'utf8').trim() : '';
+  if (t) return t;
+  const fresh = crypto.randomBytes(24).toString('hex');
+  fs.writeFileSync(TOKEN_FILE, fresh, { mode: 0o600 });
+  fs.chmodSync(TOKEN_FILE, 0o600);
+  return fresh;
+})();
 
 const DEFAULT_SETTINGS = {
   claudeCommand: 'claude',
@@ -48,7 +70,7 @@ const DEFAULT_SETTINGS = {
   unloadAfterMinutes: 30, // free the UI (editor, terminal views) of worktrees you haven't opened for this long; 0 = never
   alerts: 'all', // all | needsYou | off
   sound: true,
-  sounds: { question: 'ding', permission: 'alert', done: 'chime' }, // per alert: a built-in name, "custom:<file>" or "none"
+  sounds: { ...SOUND_DEFAULTS }, // per alert: a built-in name, "custom:<file>" or "none"
   volume: 70, // 0–100, for every alert sound
   desktopNotifications: true,
   fontSize: 13,
@@ -57,8 +79,13 @@ const DEFAULT_SETTINGS = {
 };
 
 const state = new State(HOME);
-const settings = () => ({ ...DEFAULT_SETTINGS, ...(state.prefs.settings || {}) });
+const settings = () => {
+  const s = { ...DEFAULT_SETTINGS, ...(state.prefs.settings || {}) };
+  s.sounds = { ...DEFAULT_SETTINGS.sounds, ...s.sounds }; // the pages rely on a complete set
+  return s;
+};
 const accounts = new Accounts(state, HOME);
+const accountDirs = () => accounts.list().map(a => ({ id: a.id, dir: a.dir || accounts.defaultConfigDir() }));
 const sounds = new Sounds(HOME);
 // Attachments dropped onto sessions are kept a week.
 try {
@@ -118,11 +145,9 @@ function snapshot() {
 
 const rootsByRepo = new Map(); // repo path -> Set of its worktree paths
 const knownRoots = new Set(); // worktree paths of registered repos (where file/git access is allowed)
+fsops.setLinkRoots(() => knownRoots);
 const statusCache = new Map(); // path -> { at, value, pending }
 const baseCache = new Map();
-
-/** A folder git knows about (a repo root or a linked worktree has a .git entry). */
-const isGitDir = p => fs.existsSync(path.join(p, '.git'));
 
 async function worktreesOf(repo) {
   if (repo.kind === 'folder') {
@@ -166,15 +191,32 @@ setInterval(() => {
   for (const r of state.repos) if (r.kind === 'folder' && isGitDir(r.path)) void folderBecameGit(r.path);
 }, 3000).unref();
 
+/** Lists every repo's worktrees again. Roots stay usable meanwhile: only the ones no repo lists any more are dropped. */
 async function refreshRoots() {
-  knownRoots.clear();
   await pool(state.repos, 4, r => worktreesOf(r).catch(() => []));
+  const live = new Set([...rootsByRepo.values()].flatMap(s => [...s]));
+  for (const r of [...knownRoots]) if (!live.has(r)) knownRoots.delete(r);
+}
+
+/** A repo is gone: its folders no longer grant file access (knownRoots changes in place: fsops holds it). Returns them. */
+function forgetRoots(repoPath, wts) {
+  const roots = new Set([repoPath, ...(rootsByRepo.get(repoPath) || []), ...wts.map(w => w.path)]);
+  rootsByRepo.delete(repoPath);
+  baseCache.delete(repoPath);
+  for (const w of roots) { knownRoots.delete(w); statusCache.delete(w); }
+  return roots;
 }
 
 function rootOf(p) {
   const r = realpath(p);
   if (knownRoots.has(r)) return r;
   throw new Error('Not a worktree SkiffCode knows about');
+}
+
+/** A session id from a page ends up in file paths (sockets, logs, status files): only ids of real sessions. */
+function sessionId(id) {
+  if (typeof id !== 'string' || !state.session(id)) throw new Error('No such session');
+  return id;
 }
 
 function repoForWorktree(wt) {
@@ -233,7 +275,9 @@ async function watchGit(root) {
     });
     w.on('error', () => {});
     gitWatchers.set(root, w);
-  } catch { /* not a repo */ }
+  } catch {
+    gitWatchers.delete(root); // not a repo yet: a later `git init` must be able to start the watch
+  }
 }
 
 function worktreeTarget(repo, branch) {
@@ -257,12 +301,14 @@ function copyIntoWorktree(repoPath, target) {
 
 /** Only folders SkiffCode knows (repos, their worktrees): never arbitrary paths. */
 function knownFolders(folders) {
-  return (folders || []).map(f => { try { return realpath(f); } catch { return null; } }).filter(f => f && (knownRoots.has(f) || state.repo(f)));
+  return (folders || []).map(f => realpath(f)).filter(f => f && (knownRoots.has(f) || state.repo(f)));
 }
 
+const graphemes = new Intl.Segmenter();
 function cleanLook(icon, color) {
   const ic = typeof icon === 'string' ? icon.trim() : '';
-  const okIcon = /^i:[a-z][a-zA-Z0-9]{0,20}$/.test(ic) || (ic && [...ic].length <= 4 && !/[<>&"'\\]/.test(ic));
+  // two emoji at most, counted as the eye sees them (a family or a flag is one), like the customize dialog
+  const okIcon = /^i:[a-z][a-zA-Z0-9]{0,20}$/.test(ic) || (ic && [...graphemes.segment(ic)].length <= 2 && !/[<>&"'\\]/.test(ic));
   return { icon: okIcon ? ic : undefined, color: /^#[0-9a-fA-F]{6}$/.test(color || '') ? color.toLowerCase() : undefined };
 }
 
@@ -281,6 +327,8 @@ async function addRepo(dir) {
 }
 
 // ------------------------------------------------------------------ API
+
+const MAX_LAYOUT = 256 * 1024;
 
 function moveItems(d, items, target) {
   for (const it of items) {
@@ -312,6 +360,13 @@ function moveItems(d, items, target) {
   }
 }
 
+/** A URL that reaches this server: any loopback name on our port (other local ports are dev servers, fine to frame). */
+function isSelf(u) {
+  const h = u.hostname.toLowerCase().replace(/\.$/, '');
+  const loopback = h === 'localhost' || h === '0.0.0.0' || h === '[::]' || h === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(h) || /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(h);
+  return loopback && Number(u.port || (u.protocol === 'https:' ? 443 : 80)) === PORT;
+}
+
 const api = {
   async hello(_p, client) {
     client.hello = true;
@@ -322,8 +377,13 @@ const api = {
   // repos & groups
   async 'repos.add'({ path: p }) { return addRepo(p); },
   async 'repos.remove'({ path: p }) {
+    const wts = await git.listWorktrees(p).catch(() => []);
     for (const s of state.sessions.filter(s => s.repoPath === p)) await sessions.forget(s.id);
-    state.update(d => { d.repos = d.repos.filter(r => r.path !== p); });
+    const roots = forgetRoots(p, wts);
+    state.update(d => {
+      d.repos = d.repos.filter(r => r.path !== p);
+      for (const w of roots) { delete d.worktrees[w]; if (d.layouts) delete d.layouts[w]; }
+    });
   },
   async 'repos.deleteInfo'({ path: p }) {
     const repo = state.repo(p);
@@ -342,9 +402,10 @@ const api = {
     for (const s of state.sessions.filter(s => s.repoPath === p)) await sessions.forget(s.id);
     for (const w of wts) if (!w.isMain && !within(p, w.path) && safeToDelete(w.path)) fs.rmSync(w.path, { recursive: true, force: true });
     fs.rmSync(p, { recursive: true, force: true });
+    const roots = forgetRoots(p, wts);
     state.update(d => {
       d.repos = d.repos.filter(r => r.path !== p);
-      for (const w of wts) { delete d.worktrees[w.path]; if (d.layouts) delete d.layouts[w.path]; }
+      for (const w of roots) { delete d.worktrees[w]; if (d.layouts) delete d.layouts[w]; }
     });
   },
   'repos.move'({ items, target }) { state.update(d => moveItems(d, items, target)); },
@@ -408,11 +469,10 @@ const api = {
   },
   async 'worktrees.status'({ path: p, fresh }) { return worktreeStatus(rootOf(p), fresh ? 0 : 5000); },
   async 'worktrees.branches'({ repo }) {
-    const [branches, wts, refs, def, remotes] = await Promise.all([
-      git.localBranches(repo), git.listWorktrees(repo), git.baseRefs(repo).catch(() => []), git.defaultBase(repo), git.git(repo, ['remote']).catch(() => ''),
+    const [branches, wts, refs, def, remoteNames] = await Promise.all([
+      git.localBranches(repo), git.listWorktrees(repo), git.baseRefs(repo).catch(() => []), git.defaultBase(repo), git.remoteNames(repo),
     ]);
     const out = new Set(wts.map(w => w.branch).filter(Boolean));
-    const remoteNames = remotes.split('\n').map(x => x.trim()).filter(Boolean);
     const local = new Set(branches);
     // remote branches you don't have locally yet (checked out as a new tracking branch)
     const remoteOnly = refs.filter(r => remoteNames.some(n => r.startsWith(n + '/')) && !local.has(r.slice(r.indexOf('/') + 1)));
@@ -489,16 +549,18 @@ const api = {
     knownRoots.delete(p);
     state.update(d => { delete d.worktrees[p]; if (d.layouts) delete d.layouts[p]; });
     let branchResult = 'kept';
+    let branchError;
     if (deleteBranch && w.branch) {
       try {
         await git.deleteBranch(repo, w.branch, !!forceBranch);
         branchResult = 'deleted';
       } catch (e) {
-        branchResult = 'unmerged';
+        if (/not fully merged/i.test(e.message)) branchResult = 'unmerged';
+        else { branchResult = 'error'; branchError = e.message; }
       }
     }
     broadcast('worktrees.changed', { repo });
-    return { branch: branchResult, branchName: w.branch };
+    return { branch: branchResult, branchName: w.branch, branchError };
   },
   async 'branches.delete'({ repo, branch, force }) { await git.deleteBranch(repo, branch, !!force); broadcast('worktrees.changed', { repo }); },
 
@@ -519,7 +581,6 @@ const api = {
     let st;
     try { st = fs.statSync(dir); } catch { throw new Error(`Folder not found: ${dir}`); }
     if (!st.isDirectory()) dir = path.dirname(dir);
-    const isRepo = d => fs.existsSync(path.join(d, '.git'));
     const added = new Set(state.repos.map(r => r.path));
     let names = [];
     try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { throw new Error(`Can't open ${dir}: ${e.code || e.message}`); }
@@ -529,7 +590,7 @@ const api = {
       .slice(0, 3000)
       .map(d => {
         const full = path.join(dir, d.name);
-        return { name: d.name, path: full, hidden: d.name.startsWith('.'), git: isRepo(full), added: added.has(full) };
+        return { name: d.name, path: full, hidden: d.name.startsWith('.'), git: isGitDir(full), added: added.has(full) };
       })
       .sort((a, b) => Number(b.git) - Number(a.git) || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
     const root = await git.resolveRepoRoot(dir).catch(() => null);
@@ -539,7 +600,7 @@ const api = {
   'claude.history'({ worktreePath }) {
     const root = rootOf(worktreePath);
     const tracked = new Map(state.sessions.filter(s => s.kind === 'claude' && s.claudeId).map(s => [s.claudeId, s.id]));
-    const accts = accounts.list().map(a => ({ id: a.id, dir: a.dir || accounts.defaultConfigDir() }));
+    const accts = accountDirs();
     return history.listConversations(root, accts, tracked);
   },
   /** Delete a session completely: stop it, remove it here, and delete Claude's saved conversation. */
@@ -550,23 +611,23 @@ const api = {
     const cid = s.kind === 'claude' ? s.claudeId : null;
     await sessions.forget(id);
     if (!cid) return { deleted: [] };
-    return { deleted: history.deleteConversation(accounts.list().map(a => a.dir || accounts.defaultConfigDir()), folder, cid) };
+    return { deleted: history.deleteConversation(accountDirs().map(a => a.dir), folder, cid) };
   },
   /** Delete a past conversation from the Resume list (and its session here, if it has one). */
   async 'claude.deleteConversation'({ worktreePath, id }) {
     const root = rootOf(worktreePath);
     const open = state.sessions.find(x => x.kind === 'claude' && x.claudeId === id);
     if (open) await sessions.forget(open.id);
-    return { deleted: history.deleteConversation(accounts.list().map(a => a.dir || accounts.defaultConfigDir()), root, id) };
+    return { deleted: history.deleteConversation(accountDirs().map(a => a.dir), root, id) };
   },
   /** How many saved Claude conversations these folders have (for the "also delete" checkbox). */
   'claude.countConversations'({ folders }) {
-    const accts = accounts.list().map(a => ({ id: a.id, dir: a.dir || accounts.defaultConfigDir() }));
+    const accts = accountDirs();
     return knownFolders(folders).reduce((n, f) => n + history.listConversations(f, accts, new Map(), Infinity).length, 0);
   },
   /** Delete every saved Claude conversation of these folders (a worktree or repo you're removing). */
   async 'claude.purgeFolders'({ folders }) {
-    const accts = accounts.list().map(a => ({ id: a.id, dir: a.dir || accounts.defaultConfigDir() }));
+    const accts = accountDirs();
     let n = 0;
     for (const f of knownFolders(folders)) {
       for (const s of state.sessions.filter(x => x.worktreePath === f && x.kind === 'claude')) await sessions.forget(s.id);
@@ -592,15 +653,15 @@ const api = {
     const short = label ? (label.length > 40 ? `${label.slice(0, 38).trimEnd()}…` : label) : '';
     return api['sessions.create']({ kind: 'claude', worktreePath: root, name: name || short || undefined, cols, rows, resumeClaudeId: id, account: account || (found && found.account) });
   },
-  async 'sessions.resume'({ id, cols, rows }) { return sessions.resume(id, cols, rows); },
-  async 'sessions.stop'({ id }) { await sessions.stop(id); },
-  async 'sessions.forget'({ id }) { await sessions.forget(id); },
-  'sessions.rename'({ id, name }) { sessions.rename(id, name); },
-  'sessions.setUnread'({ id, unread }) { sessions.setUnread(id, unread); },
+  async 'sessions.resume'({ id, cols, rows }) { return sessions.resume(sessionId(id), cols, rows); },
+  async 'sessions.stop'({ id }) { await sessions.stop(sessionId(id)); },
+  async 'sessions.forget'({ id }) { await sessions.forget(sessionId(id)); },
+  async 'sessions.rename'({ id, name }) { await sessions.rename(sessionId(id), name); },
+  'sessions.setUnread'({ id, unread }) { sessions.setUnread(sessionId(id), unread); },
   view(info, client) { sessions.setViewing(client.id, info); },
   /** Memory: the SkiffCode server, and each session's terminal + everything running in it (Claude, tools). */
   async 'system.memory'() {
-    const out = await require('./util').run('ps', ['-eo', 'pid=,ppid=,rss=']).catch(() => '');
+    const out = await run('ps', ['-eo', 'pid=,ppid=,rss=']).catch(() => '');
     const kids = new Map();
     const rss = new Map();
     for (const line of out.split('\n')) {
@@ -625,15 +686,14 @@ const api = {
     };
     const per = {};
     for (const s of state.sessions) {
-      try {
-        const [hostPid] = fs.readFileSync(sessions.sock(s.id) + '.pid', 'utf8').trim().split(/\s+/).map(Number);
-        if (hostPid && rss.has(hostPid)) per[s.id] = tree(hostPid);
-      } catch { /* not running */ }
+      const { host } = hostPids(sessions.sock(s.id));
+      if (host && rss.has(host)) per[s.id] = tree(host);
     }
     return { server: process.memoryUsage().rss, sessions: per };
   },
 
   async 'term.open'({ id, cols, rows }, client) {
+    sessionId(id);
     if (client.terms.has(id)) return { ok: true };
     const sock = sessions.sock(id);
     const c = await new PtyClient(sock).connect();
@@ -657,7 +717,7 @@ const api = {
   'accounts.setActive'({ id }) { accounts.setActive(id); },
   'accounts.add'({ name, share }) { return accounts.add(name, share !== false); },
   'accounts.rename'({ id, name }) { accounts.rename(id, name); },
-  'accounts.remove'({ id }) { accounts.remove(id, state.sessions.some(s => (s.account || 'default') === id && sessions.stateOf(s.id) !== 'ended')); },
+  'accounts.remove'({ id }) { accounts.remove(id, state.sessions.filter(s => (s.account || 'default') === id).map(s => s.name)); },
   /** Sign in (or switch org) for an account: a shell tab running `claude auth login` with that account's config. */
   async 'accounts.login'({ id, worktreePath, console: useConsole }) {
     const root = rootOf(worktreePath);
@@ -670,20 +730,20 @@ const api = {
   async 'accounts.logout'({ id }) {
     const cmd = claudeBin(settings().claudeCommand);
     const env = accounts.env(id);
-    await require('./util').run('sh', ['-lc', `${cmd} auth logout`], { env, timeout: 30_000 }).catch(() => {});
+    await run('sh', ['-lc', `${cmd} auth logout`], { env, timeout: 30_000 }).catch(() => {});
     accounts.invalidate(id);
   },
 
   'term.history'({ id }) {
-    return { data: sessions.history(id).toString('base64') };
+    return { data: sessions.history(sessionId(id)).toString('base64') };
   },
   'term.close'({ id }, client) {
-    const c = client.terms.get(id);
+    const c = client.terms.get(sessionId(id));
     if (c) c.close();
     client.terms.delete(id);
   },
   'term.resize'({ id, cols, rows }, client) {
-    const c = client.terms.get(id);
+    const c = client.terms.get(sessionId(id));
     if (c) c.resize(cols, rows);
   },
 
@@ -711,7 +771,7 @@ const api = {
   },
   /** A /view URL for a file anywhere (you clicked its path): HTML, images, PDFs, text. */
   'fs.viewUrl'({ path: p }) {
-    const abs = toLinuxPath(p);
+    const abs = realpath(toLinuxPath(p));
     let st;
     try { st = fs.statSync(abs); } catch { throw new Error(`Not found: ${p}`); }
     if (!st.isFile()) throw new Error(`Not a file: ${p}`);
@@ -724,19 +784,21 @@ const api = {
     let u;
     try { u = new URL(url); } catch { throw new Error('Not a web address'); }
     if (!/^https?:$/.test(u.protocol)) throw new Error('Only http and https addresses can be opened');
-    if ((u.hostname === 'localhost' || u.hostname === '127.0.0.1') && Number(u.port || 80) === PORT) return { frameable: false, reason: 'That’s SkiffCode itself.' };
+    const self = { frameable: false, reason: 'That’s SkiffCode itself.' };
+    if (isSelf(u)) return self;
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 5000);
     try {
       const r = await fetch(u, { method: 'GET', redirect: 'follow', signal: ctl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (SkiffCode link check)' } });
       try { await r.body?.cancel(); } catch { /* fine */ }
+      if (isSelf(new URL(r.url))) return self;
       const xfo = (r.headers.get('x-frame-options') || '').trim().toLowerCase();
       const fa = /frame-ancestors([^;]*)/i.exec(r.headers.get('content-security-policy') || '');
       const allowed = fa && fa[1].trim().split(/\s+/).some(v => v === '*' || /^(https?:\/\/)?(localhost|127\.0\.0\.1)(:|$)/.test(v) || v === 'http:');
       if (fa && !allowed) return { frameable: false, reason: 'This site doesn’t allow being shown inside other apps.' };
       if (!fa && xfo && xfo !== 'allowall') return { frameable: false, reason: 'This site doesn’t allow being shown inside other apps.' };
       return { frameable: true, status: r.status };
-    } catch (e) {
+    } catch {
       // unreachable from here (offline, VPN-only, …): let the browser try, it shows its own error
       return { frameable: true, unknown: true };
     } finally {
@@ -758,23 +820,25 @@ const api = {
   async 'drops.save'({ name, data }) {
     const buf = Buffer.from(String(data || ''), 'base64');
     if (!buf.length) throw new Error('That file is empty');
-    if (buf.length > 50 * 1024 * 1024) throw new Error('Files over 50 MB can’t be attached');
+    if (buf.length > fsops.MAX_UPLOAD) throw new Error('Files over 50 MB can’t be attached');
     const day = new Date().toISOString().slice(0, 10);
     const dir = path.join(HOME, 'drops', day);
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const clean = path.basename(String(name || 'file')).replace(/[^\w.@+-]+/g, '-').replace(/^-+/, '').slice(0, 80) || 'file';
     const ext = path.extname(clean);
     let target = path.join(dir, clean);
     for (let i = 2; fs.existsSync(target); i++) target = path.join(dir, `${clean.slice(0, clean.length - ext.length)}-${i}${ext}`);
-    fs.writeFileSync(target, buf);
+    fs.writeFileSync(target, buf, { mode: 0o600 });
     return { path: target };
   },
   async 'fs.delete'({ root, path: p }) { const r = rootOf(root); await fsops.remove(r, p); gitChanged(r); },
   'fs.watch'({ root, path: p }, client) {
     const r = rootOf(root);
     const abs = fsops.guard(r, p || '');
-    client.watched.add(abs);
-    watcher.add(abs);
+    if (!client.watched.has(abs)) { // one count per client: unwatch and disconnect remove it once
+      client.watched.add(abs);
+      watcher.add(abs);
+    }
     void watchGit(r);
   },
   'fs.unwatch'({ root, path: p }, client) {
@@ -804,7 +868,7 @@ const api = {
     const r = rootOf(root);
     if (!isGitDir(r)) return { commits: [] };
     const st = await worktreeStatus(r);
-    return { base: st.base, commits: st.base ? await git.commitsSince(r, st.mergeBase) : await git.commitsSince(r, undefined) };
+    return { base: st.base, commits: await git.commitsSince(r, st.mergeBase) };
   },
   async 'git.log'({ root, skip, max }) {
     const r = rootOf(root);
@@ -841,7 +905,8 @@ const api = {
 
   // per-worktree UI layout (open tabs), restored after reloads
   'layout.save'({ root, layout }) {
-    const r = realpath(root);
+    const r = rootOf(root);
+    if (JSON.stringify(layout ?? null).length > MAX_LAYOUT) throw new Error('That layout is too large to save');
     state.data.layouts = state.data.layouts || {};
     state.data.layouts[r] = layout;
     clearTimeout(api._layoutTimer);
@@ -853,14 +918,11 @@ const watcher = new fsops.Watcher((abs, name) => {
   let isDir = false;
   try { isDir = fs.statSync(abs).isDirectory(); } catch { /* deleted */ }
   const changed = isDir && name ? path.join(abs, name) : abs;
-  for (const r of knownRoots) {
-    if (within(r, abs)) {
-      if (name === '.git' || path.basename(abs) === '.git') void folderBecameGit(r);
-      broadcast('fs.changed', { root: r, path: path.relative(r, changed).split(path.sep).join('/'), dir: isDir ? path.relative(r, abs).split(path.sep).join('/') : undefined });
-      gitChanged(r);
-      break;
-    }
-  }
+  const r = knownRootOf(abs);
+  if (!r) return;
+  if (name === '.git' || path.basename(abs) === '.git') void folderBecameGit(r);
+  broadcast('fs.changed', { root: r, path: path.relative(r, changed).split(path.sep).join('/'), dir: isDir ? path.relative(r, abs).split(path.sep).join('/') : undefined });
+  gitChanged(r);
 });
 
 // ------------------------------------------------------------------ HTTP
@@ -882,7 +944,8 @@ const VIEW_TYPES = {
 };
 const viewKey = root => crypto.createHmac('sha256', TOKEN).update(`view:${root}`).digest('hex').slice(0, 32);
 // Files outside the worktrees (a report in /tmp, a build folder…), opened from a path you clicked:
-// key -> { root: its folder, only: the one file when the folder is too broad to share (/, ~, a drive) }
+// key -> { root: its folder, only: the one file, unless it is a page that needs its neighbours (CSS, images)
+// and the folder isn't too broad to share (/, ~, a drive) }
 const externalViews = new Map();
 const encodeRel = rel => rel.split('/').map(encodeURIComponent).join('/');
 
@@ -909,7 +972,7 @@ function viewUrlFor(abs) {
   if (root) return `/view/${viewKey(root)}/${encodeRel(path.relative(root, abs).split(path.sep).join('/'))}`;
   const dir = path.dirname(abs);
   const broad = dir.split('/').filter(Boolean).length < 2 || dir === os.homedir() || /^\/mnt\/[a-z]\/Users\/[^/]+$/i.test(dir);
-  const only = broad ? path.basename(abs) : null;
+  const only = broad || !/\.html?$/i.test(abs) ? path.basename(abs) : null;
   const key = viewKey(`external:${dir}:${only || ''}`);
   externalViews.set(key, { root: dir, only });
   return `/view/${key}/${encodeRel(path.basename(abs))}`;
@@ -932,6 +995,7 @@ function serveView(req, res, url) {
       try { st = fs.statSync(file); } catch (e) { err = e; }
     }
     if (err || !st.isFile()) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('not found'); }
+    if (!fsops.realInside(root, file)) { res.writeHead(403); return res.end(); }
     const ext = path.extname(file).toLowerCase();
     let type = VIEW_TYPES[ext];
     if (!type) {
@@ -954,10 +1018,10 @@ function serveView(req, res, url) {
       'Referrer-Policy': 'no-referrer',
     };
     // PDFs need the browser's own viewer, which doesn't run in a sandbox (and a PDF can't script the page).
-    if (ext !== '.pdf') headers['Content-Security-Policy'] = 'sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads';
+    if (ext !== '.pdf') headers['Content-Security-Policy'] = `sandbox ${VIEW_SANDBOX}`;
     res.writeHead(200, headers);
     if (req.method === 'HEAD') return res.end();
-    fs.createReadStream(file).pipe(res);
+    fs.createReadStream(file).on('error', () => res.destroy()).pipe(res);
   });
 }
 
@@ -965,16 +1029,30 @@ function cookieToken(req) {
   const m = /(?:^|;\s*)skiffcode_tkn=([0-9a-f]+)/.exec(req.headers.cookie || '');
   return m && m[1];
 }
-function authed(req) {
-  const t = cookieToken(req);
-  return !!t && t.length === TOKEN.length && crypto.timingSafeEqual(Buffer.from(t), Buffer.from(TOKEN));
+function tokenOk(t) {
+  if (typeof t !== 'string') return false;
+  const a = Buffer.from(t);
+  const b = Buffer.from(TOKEN);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
-function originOk(req) {
-  const o = req.headers.origin;
-  if (!o) return true;
+function authed(req) {
+  return tokenOk(cookieToken(req));
+}
+const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+// Bound to another address on purpose (SKIFFCODE_BIND), SkiffCode can be reached by names we can't know,
+// so the Host check is skipped there and only the token protects it.
+const CHECK_HOST = /^(127\.\d+\.\d+\.\d+|localhost|::1)$/.test(HOSTNAME);
+/**
+ * The request names SkiffCode by a loopback host (a DNS-rebinding page would send its own name), and
+ * with `origin`, comes from SkiffCode's own page (no cross-site websockets).
+ */
+function hostOk(req, { origin = false } = {}) {
+  const hostname = h => { try { return new URL(`http://${h}`).hostname; } catch { return null; } };
+  if (CHECK_HOST && !LOOPBACK_NAMES.has(hostname(req.headers.host))) return false;
+  if (!origin || !req.headers.origin) return true;
   try {
-    const u = new URL(o);
-    return (u.hostname === 'localhost' || u.hostname === '127.0.0.1') && Number(u.port || 80) === PORT;
+    const u = new URL(req.headers.origin);
+    return LOOPBACK_NAMES.has(u.hostname) && Number(u.port || 80) === PORT;
   } catch {
     return false;
   }
@@ -986,12 +1064,14 @@ function serveFile(res, file) {
       res.writeHead(404);
       return res.end('not found');
     }
-    res.writeHead(200, {
+    const headers = {
       'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream',
       'Content-Length': st.size,
       'Cache-Control': file.startsWith(VENDOR) ? 'public, max-age=604800' : 'no-cache',
-    });
-    fs.createReadStream(file).pipe(res);
+    };
+    if (path.extname(file) === '.html') Object.assign(headers, { 'Content-Security-Policy': "frame-ancestors 'none'", 'X-Frame-Options': 'DENY' });
+    res.writeHead(200, headers);
+    fs.createReadStream(file).on('error', () => res.destroy()).pipe(res);
   });
 }
 
@@ -1000,10 +1080,14 @@ process.on('uncaughtException', e => console.error('skiffcode: uncaught error (k
 process.on('unhandledRejection', e => console.error('skiffcode: unhandled rejection (kept running):', e && e.stack || e));
 
 const server = http.createServer((req, res) => {
+  if (!hostOk(req)) {
+    res.writeHead(403);
+    return res.end();
+  }
   const url = new URL(req.url, 'http://localhost');
   if (url.searchParams.has('tkn')) {
     const t = url.searchParams.get('tkn');
-    if (t === TOKEN) {
+    if (tokenOk(t)) {
       res.writeHead(302, { 'Set-Cookie': `skiffcode_tkn=${TOKEN}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`, Location: '/' });
       return res.end();
     }
@@ -1012,7 +1096,7 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/manifest.webmanifest' || /^\/icons\/[\w.-]+$/.test(url.pathname)) return serveFile(res, path.join(WEB, url.pathname.slice(1)));
   if (url.pathname === '/api/status') {
     // For the `skiffcode` launcher: is a page open? (token in a header, never in logs)
-    if (req.headers['x-skiffcode-token'] !== TOKEN) {
+    if (!tokenOk(req.headers['x-skiffcode-token'])) {
       res.writeHead(403);
       return res.end();
     }
@@ -1020,7 +1104,7 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({ version: VERSION, clients: clients.size, pid: process.pid }));
   }
   if (url.pathname === '/api/cli' && req.method === 'POST') {
-    if (req.headers['x-skiffcode-token'] !== TOKEN) {
+    if (!tokenOk(req.headers['x-skiffcode-token'])) {
       res.writeHead(403);
       return res.end();
     }
@@ -1047,12 +1131,15 @@ const server = http.createServer((req, res) => {
   }
   if (url.pathname === '/') return serveFile(res, path.join(WEB, 'index.html'));
   if (url.pathname.startsWith('/custom-sounds/')) {
-    const f = sounds.file(`custom:${decodeURIComponent(url.pathname.slice(15))}`);
+    let name;
+    try { name = decodeURIComponent(url.pathname.slice(15)); } catch { res.writeHead(400); return res.end(); }
+    const f = sounds.file(`custom:${name}`);
     if (!f) { res.writeHead(404); return res.end(); }
     return serveFile(res, f);
   }
   const base = url.pathname.startsWith('/vendor/') ? VENDOR : WEB;
-  const rel = decodeURIComponent(url.pathname.replace(/^\/(vendor\/)?/, ''));
+  let rel;
+  try { rel = decodeURIComponent(url.pathname.replace(/^\/(vendor\/)?/, '')); } catch { res.writeHead(400); return res.end(); }
   const file = path.resolve(base, rel);
   if (!within(base, file)) {
     res.writeHead(403);
@@ -1062,7 +1149,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.on('upgrade', (req, socket) => {
-  if (req.url !== '/ws' || !authed(req) || !originOk(req)) {
+  if (req.url !== '/ws' || !authed(req) || !hostOk(req, { origin: true })) {
     socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
     return;
   }
@@ -1077,7 +1164,7 @@ server.on('upgrade', (req, socket) => {
     } catch {
       return;
     }
-    const fn = api[msg.method];
+    const fn = typeof msg.method === 'string' && Object.hasOwn(api, msg.method) && typeof api[msg.method] === 'function' ? api[msg.method] : null;
     try {
       if (!fn) throw new Error(`Unknown method ${msg.method}`);
       const result = await fn(msg.params || {}, client);
@@ -1126,18 +1213,16 @@ const cli = {
         : await (async () => {
           const from = (base && String(base).trim()) || (await git.defaultBase(repo.path));
           // A remote base (origin/develop) is fetched first, so the branch starts from its latest commit.
-          const remotes = (await git.git(repo.path, ['remote']).catch(() => '')).split('\n').map(x => x.trim()).filter(Boolean);
-          const rm = remotes.find(n => from.startsWith(n + '/'));
+          const rm = (await git.remoteNames(repo.path)).find(n => from.startsWith(n + '/'));
           if (rm) await git.git(repo.path, ['fetch', '--quiet', rm, `${from.slice(rm.length + 1)}:refs/remotes/${from}`]).catch(() => {});
-          const ok = await git.git(repo.path, ['rev-parse', '--verify', '--quiet', `${from}^{commit}`]).then(() => true, () => false);
-          if (!ok) throw new Error(`Base branch not found: ${from}`);
+          if (!(await git.refExists(repo.path, from))) throw new Error(`Base branch not found: ${from}`);
           return api['worktrees.create']({ repo: repo.path, newBranch: b, base: from, startClaude: false });
         })();
       wt = { path: res.path, branch: res.branch };
       created = true;
     }
     let session = null;
-    if (claude) session = await sessions.create({ kind: 'claude', repoPath: repo.path, worktreePath: wt.path, branch: wt.branch, name, prompt, cols: 120, rows: 32 });
+    if (claude) session = await sessions.create({ kind: 'claude', repoPath: repo.path, worktreePath: wt.path, branch: wt.branch, name, prompt, ...TERM_SIZE });
     if (show) broadcast('open.worktree', { path: wt.path, repo: repo.path, session: session && session.id });
     return { repo: repo.path, worktree: wt.path, branch: wt.branch, created, session: session && { id: session.id, name: session.name } };
   },
@@ -1147,7 +1232,7 @@ const cli = {
     const repo = await addRepo(dir);
     const root = rootOf(realpath(dir));
     const wt = (await worktreesOf(repo)).find(w => w.path === root) || { path: root };
-    const session = await sessions.create({ kind: 'claude', repoPath: repo.path, worktreePath: wt.path, branch: wt.branch, name, prompt, cols: 120, rows: 32 });
+    const session = await sessions.create({ kind: 'claude', repoPath: repo.path, worktreePath: wt.path, branch: wt.branch, name, prompt, ...TERM_SIZE });
     if (show) broadcast('open.worktree', { path: wt.path, repo: repo.path, session: session.id });
     return { repo: repo.path, worktree: wt.path, branch: wt.branch, session: { id: session.id, name: session.name } };
   },
@@ -1165,7 +1250,7 @@ const cli = {
 // ------------------------------------------------------------------ inbox (`skiffcode <dir>`)
 
 const INBOX = path.join(HOME, 'inbox');
-fs.mkdirSync(INBOX, { recursive: true });
+fs.mkdirSync(INBOX, { recursive: true, mode: 0o700 });
 let draining = false;
 async function drainInbox() {
   if (draining) return;
@@ -1179,7 +1264,7 @@ async function drainInbox() {
         const repo = await addRepo(dir);
         broadcast('open.worktree', { path: realpath(dir), repo: repo.path });
       } catch (e) {
-        broadcast('toast', { kind: 'error', text: `${dir}: not a git repository` });
+        broadcast('toast', { kind: 'error', text: e.message });
       }
     }
   } catch { /* ignore */ } finally {
@@ -1190,8 +1275,10 @@ fs.watch(INBOX, () => void drainInbox());
 void drainInbox();
 
 server.listen(PORT, HOSTNAME, () => {
-  fs.writeFileSync(path.join(HOME, 'server.pid'), String(process.pid));
-  console.log(`SkiffCode ${VERSION} on http://localhost:${PORT}/?tkn=${TOKEN}`);
+  fs.writeFileSync(PID_FILE, String(process.pid));
+  // The token goes only to a terminal: `skiffcode` sends this output to server.log.
+  if (process.stdout.isTTY) console.log(`SkiffCode ${VERSION} on http://localhost:${PORT}/?tkn=${TOKEN}`);
+  else console.log(`SkiffCode ${VERSION} on http://localhost:${PORT}/ (token in ${TOKEN_FILE})`);
 });
 server.on('error', e => {
   console.error(`skiffcode: cannot listen on ${HOSTNAME}:${PORT}: ${e.message}`);
@@ -1202,6 +1289,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => {
   // Sessions keep running in their terminal hosts; just stop serving.
   sessions.dispose();
   server.close();
+  try { if (fs.readFileSync(PID_FILE, 'utf8').trim() === String(process.pid)) fs.rmSync(PID_FILE); } catch { /* gone */ }
   process.exit(0);
 });
 module.exports = { api, state, sessions, server };

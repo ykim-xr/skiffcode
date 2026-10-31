@@ -39,10 +39,23 @@ function skiffcodeHome() {
   return process.env.SKIFFCODE_HOME || path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'skiffcode');
 }
 
+/** Write a private (0600) file in one step: synced to disk before it replaces the old one. */
 function writeFileAtomic(file, content) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, content);
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  try {
+    fs.writeFileSync(fd, content);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(tmp, file);
+}
+
+/** A folder only you can open (made 0700, and an existing one tightened). */
+function privateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
 }
 
 const whichCache = new Map();
@@ -60,7 +73,7 @@ function which(cmd) {
       }
     } catch { /* next */ }
   }
-  whichCache.set(cmd, found);
+  if (found) whichCache.set(cmd, found); // a miss is not cached: the tool may be installed later
   return found;
 }
 
@@ -80,10 +93,16 @@ function realpath(p) {
   }
 }
 
+/** A folder git knows about (a repo root or a linked worktree has a .git entry). */
+const isGitDir = p => fs.existsSync(path.join(p, '.git'));
+
+/** Size of a new terminal until the page reports the real one. */
+const TERM_SIZE = Object.freeze({ cols: 120, rows: 32 });
+
 /** Is `child` inside (or equal to) `parent`? */
 function within(parent, child) {
   const rel = path.relative(parent, child);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  return rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
 }
 
 /** Never delete /, a top-level folder like /mnt/c, your home folder or anything above it. */
@@ -109,4 +128,4 @@ async function pool(items, limit, fn) {
   return out;
 }
 
-module.exports = { run, shq, skiffcodeHome, writeFileAtomic, which, userShell, realpath, within, safeToDelete, pool };
+module.exports = { run, shq, skiffcodeHome, writeFileAtomic, privateDir, which, userShell, realpath, isGitDir, TERM_SIZE, within, safeToDelete, pool };

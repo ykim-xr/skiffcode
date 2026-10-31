@@ -7,6 +7,8 @@ import { toast } from './dialogs.js';
 
 const IMAGE = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'ico', 'svg']);
 const HTML = new Set(['html', 'htm']);
+// What a previewed page may do: it runs in an origin of its own, with no way into SkiffCode.
+const PAGE_SANDBOX = 'allow-scripts allow-forms allow-popups allow-modals allow-downloads';
 const ext = p => { const n = basename(p).toLowerCase(); return n.includes('.') ? n.split('.').pop() : ''; };
 
 /** How a file opens when clicked: 'image', 'pdf', or null (the editor). */
@@ -119,7 +121,7 @@ export class FileViewTab extends ViewerBase {
     this.frame = this.mode === 'pdf'
       ? h('iframe.viewer-frame', { src, title: this.path })
       // own origin (from the server's sandbox header), and sandboxed here as well
-      : h('iframe.viewer-frame.page', { src, title: this.path, sandbox: 'allow-scripts allow-forms allow-popups allow-modals allow-downloads' });
+      : h('iframe.viewer-frame.page', { src, title: this.path, sandbox: PAGE_SANDBOX });
     clear(this.stage, this.frame);
   }
 
@@ -210,26 +212,27 @@ export class WebTab extends ViewerBase {
   async navigate(raw, { push = true } = {}) {
     if (!raw) return;
     if (isPathLike(raw)) return this.openFilePath(raw, { push });
-    this.file = false;
     let url = raw;
     if (!/^[a-z][\w+.-]*:/i.test(url)) url = /^(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(url) ? `http://${url}` : `https://${url}`;
-    this.url = url;
     this.input.value = url;
+    clear(this.stage, h('div.tab-message.muted', 'Loading…'));
+    const nav = (this.nav = {});
+    let check;
+    try {
+      check = await call('web.check', { url });
+    } catch (e) {
+      if (this.nav === nav) clear(this.stage, h('div.tab-message', e.message)); // a refused address is not kept in the tab or its history
+      return;
+    }
+    if (this.disposed || this.nav !== nav) return;
+    this.file = false;
+    this.url = url;
     if (push) {
       this.history = this.history.slice(0, this.at + 1);
       this.history.push(url);
       this.at = this.history.length - 1;
     }
     this.changed();
-    clear(this.stage, h('div.tab-message.muted', 'Loading…'));
-    let check;
-    try {
-      check = await call('web.check', { url });
-    } catch (e) {
-      clear(this.stage, h('div.tab-message', e.message));
-      return;
-    }
-    if (this.disposed || this.url !== url) return;
     if (!check.frameable) {
       clear(this.stage, h('div.viewer-blocked',
         icon('globe'),
@@ -249,6 +252,7 @@ export class WebTab extends ViewerBase {
   }
   /** A file path typed or pasted in the address bar: shown from SkiffCode's read-only file server. */
   async openFilePath(raw, { push }) {
+    this.nav = {}; // an address still being checked is dropped
     this.url = raw;
     this.file = true;
     this.input.value = raw;
@@ -275,17 +279,17 @@ export class WebTab extends ViewerBase {
     if (this.disposed) return;
     this.frame = /\.pdf$/i.test(this.url)
       ? h('iframe.viewer-frame', { src, title: this.url })
-      : h('iframe.viewer-frame.page', { src, title: this.url, sandbox: 'allow-scripts allow-forms allow-popups allow-modals allow-downloads' });
+      : h('iframe.viewer-frame.page', { src, title: this.url, sandbox: PAGE_SANDBOX });
     clear(this.stage, this.frame);
   }
   serialize() { return this.url ? { kind: 'web', url: this.url } : null; }
 }
 
+export const LINK_HINT = 'Click: open in your browser · Ctrl+click: open in SkiffCode';
 /**
  * A link clicked in a terminal or the editor: Ctrl+click (Cmd+click) opens it in a SkiffCode tab,
  * a plain click in your browser. (In the editor, following a link always takes Ctrl+click: a tab here.)
  */
-export const LINK_HINT = 'Click: open in your browser · Ctrl+click: open in SkiffCode';
 export function openLink(app, uri, e) {
   if (e && e.button > 0) return; // right / middle click on a link: the terminal's menu, not a navigation
   let u;

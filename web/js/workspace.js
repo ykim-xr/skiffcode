@@ -2,7 +2,7 @@
 // panel for shells), each row can split right, plus its own Files / Changes /
 // Search panel. Every opened worktree stays alive in the page, so switching
 // between them is instant.
-import { h, icon, clear, basename } from './util.js';
+import { h, icon, clear, basename, readStored, debounce, TERM_SIZE } from './util.js';
 import { call } from './rpc.js';
 import { EditorTab, DiffTab, ReviewTab, TerminalTab, tabFromSpec } from './tabs.js';
 import { FileViewTab, WebTab, viewerFor, hasPreview } from './viewers.js';
@@ -99,7 +99,8 @@ class Pane {
     else this.renderBar();
   }
 
-  activate(tab) {
+  /** `rebuild: false` marks the tab in place, so the element under the pointer survives and a drag can start on it. */
+  activate(tab, { rebuild = true } = {}) {
     if (this.active === tab && !tab.el.classList.contains('hidden')) {
       this.ws.changed(); // no re-render: keeps a double-click on the same element
       return;
@@ -112,8 +113,16 @@ class Pane {
     tab.el.classList.remove('hidden');
     tab.show();
     requestAnimationFrame(() => tab.layout());
-    this.renderBar();
+    if (rebuild) this.renderBar();
+    else this.markActive();
     this.ws.changed();
+  }
+
+  markActive() {
+    for (const t of this.tabs) if (t.tabEl) t.tabEl.classList.toggle('active', t === this.active);
+    const actions = this.renderActions();
+    this.actionsEl.replaceWith(actions);
+    this.actionsEl = actions;
   }
 
   remove(tab) {
@@ -139,7 +148,7 @@ class Pane {
         draggable: 'true',
         onmousedown: e => {
           if (e.button === 1) { e.preventDefault(); ws.closeTab(t); return; }
-          if (e.button === 0) this.activate(t);
+          if (e.button === 0) this.activate(t, { rebuild: false });
         },
         dataset: { uid: t.uid },
         oncontextmenu: e => {
@@ -150,7 +159,7 @@ class Pane {
             t.kind === 'session' && t.session && t.session.kind === 'claude' && t.session.state !== 'ended' ? { label: 'Hide tab (keeps running)', action: () => ws.hideTab(t) } : null,
             t.kind === 'session' && t.session ? { label: 'Rename…', icon: 'edit', action: () => ws.app.actions.renameSession(t.session) } : null,
             t.kind === 'session' && t.session && t.session.kind === 'claude' ? { label: 'Delete session and conversation…', icon: 'trash', danger: true, action: () => ws.app.actions.purgeSession(t.session) } : null,
-            { label: 'Close others', action: () => this.tabs.filter(x => x !== t).forEach(x => ws.closeTab(x)) },
+            { label: 'Close others', action: async () => { for (const x of this.tabs.filter(y => y !== t)) await ws.closeTab(x); } }, // one question at a time
             { separator: true },
             this.row.panes.length < MAX_PANES_PER_ROW ? { label: 'Split right', icon: 'split', action: () => ws.splitRight(t) } : null,
             { label: bottom ? 'Move up to the main area' : 'Split down (bottom panel)', icon: bottom ? 'up' : 'down', action: () => ws.splitDown(t) },
@@ -165,6 +174,7 @@ class Pane {
           ]);
         },
         ondragstart: e => { ws.dragTab = t; e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', t.uid); },
+        ondragend: () => { ws.dragTab = null; }, // a drag that ends without a drop
         ondragover: e => { if (ws.dragTab) { e.preventDefault(); e.stopPropagation(); el.classList.add('drop-before'); } },
         ondragleave: () => el.classList.remove('drop-before'),
         ondrop: e => { e.preventDefault(); e.stopPropagation(); el.classList.remove('drop-before'); ws.dropTab(this, t, 'center'); },
@@ -177,13 +187,20 @@ class Pane {
         onmousedown: e => e.stopPropagation(),
         onclick: e => { e.stopPropagation(); ws.closeTab(t); },
       }, icon('close')));
+      t.tabEl = el;
       return el;
     }),
     h('div.tabbar-fill', {
       ondblclick: () => ws.app.actions.newSession(ws.root, bottom ? 'shell' : 'claude'),
       title: bottom ? 'Double-click for a new shell' : 'Double-click for a new Claude session',
     }),
-    h('div.tabbar-actions',
+    (this.actionsEl = this.renderActions()));
+  }
+
+  renderActions() {
+    const ws = this.ws;
+    const bottom = this.row.kind === 'bottom';
+    return h('div.tabbar-actions',
       bottom ? null : h('button.icon-btn', { title: 'New browser tab: a web address or a file path', onclick: () => ws.openWeb('', { pane: this }) }, icon('globe')),
       this.active && this.active.kind === 'file' && hasPreview(this.active.path)
         ? h('button.icon-btn', { title: 'Open preview to the side', onclick: () => ws.openPreview(this.active.path) }, icon('eye'))
@@ -194,7 +211,7 @@ class Pane {
       !bottom ? h('button.icon-btn', { title: 'Split down', onclick: () => this.active && ws.splitDown(this.active) }, icon('splitDown')) : null,
       bottom && this.row.panes.indexOf(this) === this.row.panes.length - 1
         ? h('button.icon-btn', { title: withKey('Hide panel', 'togglePanel'), onclick: () => ws.togglePanel(false) }, icon('chevronDown'))
-        : null));
+        : null);
   }
 }
 
@@ -277,7 +294,8 @@ export class Workspace {
     this.rowsEl = h('div.ws-rows', this.top.el, this.hsash, this.bottom.el);
     this.empty = h('div.ws-empty');
     this.center = h('div.ws-center', this.rowsEl, this.empty);
-    const width = Number(localStorage.getItem('skiffcode.rightWidth') || 320);
+    const saved = Number(readStored('skiffcode.rightWidth') || 320);
+    const width = Number.isFinite(saved) ? Math.max(200, Math.min(window.innerWidth * 0.6, saved)) : 320; // same range as the drag
     this.right = h('div.ws-right', { style: { width: `${width}px` } });
     this.sash = h('div.sash.vertical', { onmousedown: e => this.dragSash(e) });
     this.el = h('div.workspace.hidden', this.center, this.sash, this.right);
@@ -288,11 +306,11 @@ export class Workspace {
     this.rightBody = h('div.right-body', this.files.el, this.scm.el, this.search.el);
     this.right.append(this.rightTabs, this.rightBody);
     // A plain folder has no git, so it starts on Files.
-    const lastView = localStorage.getItem('skiffcode.rightView') || 'files';
+    const lastView = readStored('skiffcode.rightView') || 'files';
     this.showRight(lastView === 'scm' && !fs_isGit(this.root) ? 'files' : lastView);
     this.top.addPane();
     this.focused = this.top.panes[0];
-    this.saveSoon = (() => { let t; return () => { clearTimeout(t); t = setTimeout(() => this.saveLayout(), 400); }; })();
+    this.saveSoon = debounce(() => this.saveLayout(), 400);
     this.applyPanel();
   }
 
@@ -306,12 +324,13 @@ export class Workspace {
     if (this.focused === p) return;
     this.focused = p;
     this.panes.forEach(x => x.el.classList.toggle('focused', x === p));
+    this.files.markActive();
     this.app.reportView();
   }
 
   /** The pane a new tab of this kind goes to: shells → bottom panel, everything else → main area. */
   paneFor(kind) {
-    if (kind === 'shell' && store.settings.shellsInPanel !== false) {
+    if (kind === 'shell' && store.settings.shellsInPanel) {
       if (this.focused && this.focused.row === this.bottom) return this.focused;
       return this.bottom.panes[0] || this.bottom.addPane();
     }
@@ -414,10 +433,12 @@ export class Workspace {
       return this.moveTab(t, p);
     }
     if (t === before || (t.pane === pane && !before)) return;
-    this.moveTab(t, pane, before ? pane.tabs.indexOf(before) : pane.tabs.length);
+    let at = before ? pane.tabs.indexOf(before) : pane.tabs.length;
+    if (t.pane === pane && pane.tabs.indexOf(t) < at) at--; // moveTab removes the tab first
+    this.moveTab(t, pane, at);
   }
 
-  togglePanel(show = this.panelHidden) {
+  togglePanel(show = this.panelHidden || !this.bottom.panes.length) {
     if (show && !this.bottom.panes.length) {
       this.panelHidden = false;
       this.app.actions.newSession(this.root, 'shell');
@@ -466,9 +487,17 @@ export class Workspace {
     for (const p of this.panes) if (p.active) p.active.layout();
   }
 
+  /** A tab's state changed (each keystroke marks it dirty): update its element, don't rebuild the bar. */
   tabChanged(t) {
-    if (t.pane) t.pane.renderBar();
-    this.app.updateStatusBar();
+    const el = t.tabEl;
+    if (!el || !el.isConnected) {
+      if (t.pane) t.pane.renderBar();
+      return;
+    }
+    el.classList.toggle('dirty', t.dirty());
+    el.classList.toggle('preview', t.pinned === false);
+    el.title = t.tooltip();
+    el.querySelector('.tab-title').textContent = t.title();
   }
 
   changed() {
@@ -476,6 +505,7 @@ export class Workspace {
     this.empty.classList.toggle('hidden', has);
     this.rowsEl.classList.toggle('hidden', !has);
     if (!has) this.renderEmpty();
+    this.files.markActive();
     this.app.reportView();
     this.app.updateStatusBar();
     if (this.saveSoon) this.saveSoon();
@@ -538,6 +568,7 @@ export class Workspace {
 
   openDiff(spec) {
     let t = this.find(x => x.kind === 'diff' && x.spec.path === spec.path && x.spec.label === spec.label);
+    if (t && t.view.losesEdits()) return this.reveal(t); // rebuilding it would drop the unsaved edits
     if (t) {
       const pane = t.pane;
       pane.remove(t);
@@ -589,11 +620,11 @@ export class Workspace {
 
   /** After a reboot: restart this worktree's interrupted sessions and shells (setting: autoResume). */
   async autoResume() {
-    if (this.autoResumed || store.settings.autoResume === false) return;
+    if (this.autoResumed || !store.settings.autoResume) return;
     this.autoResumed = true;
     for (const s of sessionsIn(this.root).filter(x => x.interrupted && x.state === 'ended')) {
       try {
-        await call('sessions.resume', { id: s.id, cols: 120, rows: 32 });
+        await call('sessions.resume', { id: s.id, ...TERM_SIZE });
         const t = this.find(x => x.kind === 'session' && x.sessionId === s.id) || this.openSession(s.id, { activate: false });
         setTimeout(() => { t.attached = false; t.attach(); }, 250);
       } catch { /* leave it stopped */ }
@@ -641,7 +672,7 @@ export class Workspace {
     this.el.classList.remove('hidden');
     requestAnimationFrame(() => this.layoutAll());
     this.files.ensure();
-    this.scm.refresh();
+    if (this.rightView === 'scm') this.scm.refresh();
     this.syncSessions();
     void this.autoResume();
   }
@@ -651,11 +682,10 @@ export class Workspace {
   }
 
   saveLayout() {
-    const rowSpec = row => row.panes.map(p => ({
-      tabs: p.tabs.filter(t => t.pinned !== false).map(t => t.serialize()).filter(Boolean),
-      active: p.active ? p.tabs.filter(t => t.pinned !== false).indexOf(p.active) : 0,
-      flex: p.el.style.flex || '',
-    }));
+    const rowSpec = row => row.panes.map(p => {
+      const saved = p.tabs.filter(t => t.pinned !== false && t.serialize()); // blank web tabs have nothing to save
+      return { tabs: saved.map(t => t.serialize()), active: Math.max(0, saved.indexOf(p.active)), flex: p.el.style.flex || '' };
+    });
     const layout = {
       v: 2,
       top: rowSpec(this.top),
@@ -674,19 +704,20 @@ export class Workspace {
     const layout = raw && raw.v === 2 ? raw : raw && raw.panes ? { top: raw.panes, bottom: [], expanded: raw.expanded } : null;
     const open = new Set();
     if (layout) {
-      if (layout.panelHeight) this.panelHeight = layout.panelHeight;
+      if (Number.isFinite(layout.panelHeight)) this.panelHeight = Math.max(0.1, Math.min(0.8, layout.panelHeight));
       this.panelHidden = !!layout.panelHidden;
       const fill = (row, specs) => specs.forEach((ps, i) => {
         const pane = row === this.top && i === 0 ? this.top.panes[0] : row.addPane();
-        for (const spec of ps.tabs || []) {
-          const t = tabFromSpec(this, spec);
-          if (!t) continue;
+        const made = (ps.tabs || []).map(spec => {
+          const t = tabFromSpec(this, spec); // null for a session that is gone
+          if (!t) return null;
           if (t.kind === 'session') open.add(t.sessionId);
           pane.add(t, { activate: false });
-        }
+          return t;
+        });
         if (ps.flex) pane.el.style.flex = ps.flex;
-        if (pane.tabs[ps.active]) pane.activate(pane.tabs[ps.active]);
-        else if (pane.tabs[0]) pane.activate(pane.tabs[0]);
+        const want = made[ps.active] || pane.tabs[0];
+        if (want) pane.activate(want);
       });
       fill(this.top, layout.top || []);
       fill(this.bottom, layout.bottom || []);
@@ -707,6 +738,7 @@ export class Workspace {
   dispose() {
     for (const t of this.allTabs()) t.dispose();
     this.files.dispose();
+    this.scm.dispose();
     this.el.remove();
   }
 }

@@ -7,14 +7,20 @@ const { execFile } = require('child_process');
 const path = require('path');
 const crypto = require('crypto');
 const { EventEmitter } = require('events');
-const { spawnHost, hostAlive, PtyClient } = require('./pty');
-const { shq, userShell } = require('./util');
-const { userStatusLine } = require('./accounts');
+const { spawnHost, hostAlive, hostPids, isHost, PtyClient } = require('./pty');
+const { shq, userShell, TERM_SIZE } = require('./util');
+const { userStatusLine, quotedPath } = require('./accounts');
+const { UUID } = require('./history');
 
 const STALL_MS = Number(process.env.SKIFFCODE_STALL_MS) || 8000; // "working" but silent this long (and nothing running) = stopped
-const HOOK_STATES = new Set(['working', 'question', 'permission', 'idle', 'ended']);
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// No 'ended': liveness decides that (a /clear also fires SessionEnd).
+const HOOK_STATES = new Set(['working', 'question', 'permission', 'idle']);
+const UUID_RE = new RegExp(`^${UUID.source}$`, 'i');
 const needsYou = s => s === 'question' || s === 'permission';
+// Claude's own line, "⎿  Interrupted · What should Claude do instead?" (older: "⎿  Interrupted by user").
+// The gap may be drawn with cursor moves, which are stripped first.
+const INTERRUPTED_RE = /⎿\s*Interrupted/;
+let statusSeq = 0;
 
 class Sessions extends EventEmitter {
   constructor(state, home, config, accounts) {
@@ -25,10 +31,11 @@ class Sessions extends EventEmitter {
     this.agents = new Map(); // id -> { offset, rest, list } subagents, from the agent hook log
     this.busy = new Set(); // sessions with a command running (a shell's command, or a Bash command Claude started)
     this.outWatch = new Map(); // id -> PtyClient listening to a Claude session's output (to notice Esc interrupts)
-    this.config = config; // () => prefs-like settings
+    this.inflight = new Map(); // id -> the launch or resume under way
+    this.config = config; // () => the user's settings
     this.statusDir = path.join(home, 'status');
     this.ptyDir = path.join(home, 'pty');
-    fs.mkdirSync(this.statusDir, { recursive: true });
+    fs.mkdirSync(this.statusDir, { recursive: true, mode: 0o700 });
     fs.mkdirSync(this.ptyDir, { recursive: true, mode: 0o700 });
     this.hookFile = path.join(home, 'claude-hooks.json');
     this.writeHooks();
@@ -42,9 +49,13 @@ class Sessions extends EventEmitter {
     for (const s of state.sessions) {
       this.readAgents(s.id);
       if (!hostAlive(this.sock(s.id))) this.settleAgents(s.id, 'ended');
+      this.readStatusLine(s.id, { initial: true });
     }
+    // Picking up states from before the restart: nothing new happened, so nothing turns unread.
+    this.starting = true;
     this.poll();
     for (const s of state.sessions) this.readStatus(s.id, true);
+    this.starting = false;
     this.watch();
     this.timer = setInterval(() => { this.poll(); void this.scanCommands(); }, 2000);
   }
@@ -97,21 +108,34 @@ class Sessions extends EventEmitter {
     };
     this.live.set(rec.id, { state: kind === 'shell' ? 'running' : 'starting', changedAt: Date.now(), localAt: Date.now() });
     this.state.update(d => void d.sessions.push(rec));
-    await this.launch(rec, cols, rows);
+    await this.oneAtATime(rec.id, () => this.launch(rec, cols, rows));
     return rec;
   }
 
-  async resume(id, cols, rows) {
-    const s = this.state.session(id);
-    if (!s) throw new Error('No such session');
-    if (hostAlive(this.sock(id))) return s;
-    if (s.kind === 'claude' && !s.prompted && !fs.existsSync(path.join(this.statusDir, `${id}.prompted`))) {
-      // Nothing to resume yet: fresh conversation under a new id.
-      this.state.update(d => { const x = d.sessions.find(y => y.id === id); if (x) x.claudeId = crypto.randomUUID(); });
+  resume(id, cols, rows) {
+    return this.oneAtATime(id, async () => {
+      const s = this.state.session(id);
+      if (!s) throw new Error('No such session');
+      if (hostAlive(this.sock(id))) return s;
+      if (s.kind === 'claude' && !s.prompted && !fs.existsSync(path.join(this.statusDir, `${id}.prompted`))) {
+        // Nothing to resume yet: fresh conversation under a new id.
+        this.state.update(d => { const x = d.sessions.find(y => y.id === id); if (x) x.claudeId = crypto.randomUUID(); });
+      }
+      this.setState(id, s.kind === 'shell' ? 'running' : 'starting', true);
+      await this.launch(this.state.session(id), cols, rows, { preload: true });
+      return this.state.session(id);
+    });
+  }
+
+  /** Runs launches of one session one after another: a second resume then finds the first one's host. */
+  async oneAtATime(id, fn) {
+    const run = (this.inflight.get(id) || Promise.resolve()).catch(() => {}).then(fn);
+    this.inflight.set(id, run);
+    try {
+      return await run;
+    } finally {
+      if (this.inflight.get(id) === run) this.inflight.delete(id);
     }
-    this.setState(id, s.kind === 'shell' ? 'running' : 'starting', true);
-    await this.launch(this.state.session(id), cols, rows, { preload: true });
-    return this.state.session(id);
   }
 
   async stop(id) {
@@ -132,15 +156,31 @@ class Sessions extends EventEmitter {
   }
 
   /**
-   * Rename in SkiffCode. Claude gets the new name as its session title (prompt bar, /resume)
-   * with your next prompt or the next start: hooks may set it then, so nothing is typed for you.
+   * Rename in SkiffCode. An idle Claude nobody has typed into since gets `/rename <name>` typed now.
+   * Otherwise Claude gets the new name as its session title (prompt bar, /resume) with your next
+   * prompt or the next start: hooks may set it then, so nothing you are typing is disturbed.
    */
-  rename(id, name) {
+  async rename(id, name) {
     const s = this.state.session(id);
     this.state.update(d => { const x = d.sessions.find(y => y.id === id); if (x) x.name = name; });
-    if (s && s.kind === 'claude') {
-      try { fs.writeFileSync(path.join(this.statusDir, `${id}.title`), JSON.stringify(String(name))); } catch { /* ignore */ }
+    if (!s || s.kind !== 'claude') return;
+    const title = path.join(this.statusDir, `${id}.title`);
+    const l = this.live.get(id);
+    const typed = String(name).replace(/[\x00-\x1f\x7f-\x9f]/g, '').trim();
+    if (typed && l && l.state === 'idle' && !l.typedSinceIdle && hostAlive(this.sock(id))) {
+      try {
+        const c = await new PtyClient(this.sock(id)).connect();
+        c.write(`/rename ${typed}`);
+        // Enter on its own: text and Enter in one chunk can read as a paste.
+        await new Promise(r => setTimeout(r, 80));
+        c.write('\r');
+        await new Promise(r => setTimeout(r, 80));
+        c.close();
+        fs.rmSync(title, { force: true });
+        return;
+      } catch { /* hand it over with the next prompt instead */ }
     }
+    try { fs.writeFileSync(title, JSON.stringify(String(name))); } catch { /* ignore */ }
   }
 
   setUnread(id, unread) {
@@ -166,7 +206,8 @@ class Sessions extends EventEmitter {
 
   claudeCommand(s) {
     const cfg = this.config();
-    const cmd = (cfg.claudeCommand || 'claude').trim();
+    const raw = (cfg.claudeCommand || 'claude').trim();
+    const cmd = quotedPath(raw) || raw;
     const args = s.prompted ? ['--resume', s.claudeId] : ['--session-id', s.claudeId];
     if (!s.prompted && cfg.nameClaudeSessions !== false) args.push('--name', s.name);
     args.push('--settings', this.hookFile, ...(cfg.claudeArgs || []));
@@ -174,7 +215,7 @@ class Sessions extends EventEmitter {
     return `${cmd} ${args.map(shq).join(' ')}`;
   }
 
-  async launch(s, cols = 120, rows = 32, { preload = false } = {}) {
+  async launch(s, cols = TERM_SIZE.cols, rows = TERM_SIZE.rows, { preload = false } = {}) {
     this.removeStatus(s.id);
     this.state.update(d => { const x = d.sessions.find(y => y.id === s.id); if (x) { x.stoppedByUser = undefined; x.interrupted = undefined; } });
     const shell = userShell();
@@ -191,11 +232,10 @@ class Sessions extends EventEmitter {
     };
     if (account === 'default' && !process.env.CLAUDE_CONFIG_DIR) delete env.CLAUDE_CONFIG_DIR;
     // Keep your own status line: SkiffCode's wrapper records usage, then runs yours.
-    const own = s.kind === 'claude' ? userStatusLine(s.worktreePath, this.accounts.configDir(account), this.accounts.defaultConfigDir()) : undefined;
+    const own = s.kind === 'claude' ? userStatusLine(this.accounts.configDir(account), this.accounts.defaultConfigDir()) : undefined;
     if (own) env.SKIFFCODE_USER_STATUSLINE = own.command;
     else delete env.SKIFFCODE_USER_STATUSLINE;
     if (preload && fs.existsSync(this.logFile(s.id))) env.SKIFFCODE_PTY_PRELOAD = this.logFile(s.id);
-    delete env.SKIFFCODE_TOKEN;
     await spawnHost({ sock: this.sock(s.id), cols, rows, cwd: s.worktreePath, command, env });
     // The first prompt is passed once; a later restart must not send it again.
     if (s.initialPrompt) this.state.update(d => { const x = d.sessions.find(y => y.id === s.id); if (x) delete x.initialPrompt; });
@@ -204,34 +244,28 @@ class Sessions extends EventEmitter {
 
   async killHost(id) {
     const sock = this.sock(id);
-    if (!hostAlive(sock)) return;
-    let hostPid;
-    try {
-      hostPid = Number(fs.readFileSync(sock + '.pid', 'utf8').trim().split(/\s+/)[0]);
-    } catch { /* gone */ }
+    const { host } = hostPids(sock);
+    if (!host) return;
     try {
       const c = await new PtyClient(sock).connect();
       c.kill();
       await new Promise(r => setTimeout(r, 150));
       c.close();
     } catch { /* gone */ }
-    try {
-      const [hostPid, childPid] = fs.readFileSync(sock + '.pid', 'utf8').trim().split(/\s+/).map(Number);
-      for (const p of [childPid, hostPid]) {
-        try { process.kill(-p, 'SIGHUP'); } catch { /* not a group leader */ }
-        try { process.kill(p, 'SIGTERM'); } catch { /* gone */ }
+    // Checked again: the child may have exited meanwhile, and its pid gone to another process.
+    const signal = sig => {
+      const { child } = hostPids(sock);
+      if (child) {
+        try { process.kill(-child, sig === 'SIGKILL' ? sig : 'SIGHUP'); } catch { /* not a group leader */ }
+        try { process.kill(child, sig); } catch { /* gone */ }
       }
-    } catch { /* gone */ }
+      if (isHost(host, sock)) try { process.kill(host, sig); } catch { /* gone */ }
+    };
+    signal('SIGTERM');
     // Wait for the old host to finish cleaning up before anything reuses its socket path.
     const end = Date.now() + 3000;
-    while (hostPid && Date.now() < end) {
-      try {
-        process.kill(hostPid, 0);
-      } catch {
-        break;
-      }
-      await new Promise(r => setTimeout(r, 30));
-    }
+    while (isHost(host, sock) && Date.now() < end) await new Promise(r => setTimeout(r, 30));
+    if (isHost(host, sock)) signal('SIGKILL');
   }
 
   forgetRecord(id) {
@@ -255,6 +289,7 @@ class Sessions extends EventEmitter {
     if (l.state === 'question' && state === 'permission' && !local) return;
     const from = l.state;
     l.state = state;
+    if (state === 'idle') l.typedSinceIdle = false;
     if (!local || state === 'ended') this.settleAgents(id, state); // a hook said so, or Claude exited
     l.changedAt = Date.now();
     const s = this.state.session(id);
@@ -263,7 +298,7 @@ class Sessions extends EventEmitter {
     }
     if (s) {
       const kind = alertKind(from, state);
-      if (s.kind === 'claude' && kind && !quiet && !this.isBeingViewed(id)) {
+      if (s.kind === 'claude' && kind && !quiet && !this.starting && !this.isBeingViewed(id)) {
         this.setUnread(id, true);
         this.emit('alert', { sessionId: id, kind });
       }
@@ -309,7 +344,6 @@ class Sessions extends EventEmitter {
     }
     if (!HOOK_STATES.has(st)) return;
     if (!ignoreAge && mtime + 50 < l.localAt) return;
-    if (st === 'ended') return; // liveness decides (a /clear also fires SessionEnd)
     this.setState(id, st, false);
   }
 
@@ -349,7 +383,7 @@ class Sessions extends EventEmitter {
   }
 
   /** Claude's status-line JSON: context %, model, cost, and the account's 5-hour / weekly usage. */
-  readStatusLine(id) {
+  readStatusLine(id, { initial = false } = {}) {
     const s = this.state.session(id);
     if (!s) return;
     let j;
@@ -378,24 +412,28 @@ class Sessions extends EventEmitter {
     this.info.set(id, info);
     // You renamed it in Claude (/rename): use that name here too. Only a change counts, so a
     // rename made here that Claude hasn't picked up yet isn't undone by the old name.
+    // At startup the last name Claude reported counts as a change, unless a rename made here is
+    // still waiting to be handed over (.title): that one is newer.
     const l = this.live.get(id);
     const cname = typeof j.session_name === 'string' ? j.session_name.trim() : '';
     if (l && cname) {
-      if (l.claudeName !== undefined && cname !== l.claudeName && cname !== s.name) {
+      const changed = initial ? !fs.existsSync(path.join(this.statusDir, `${id}.title`)) : l.claudeName !== undefined && cname !== l.claudeName;
+      if (changed && cname !== s.name) {
         this.state.update(d => { const x = d.sessions.find(y => y.id === id); if (x) x.name = cname.slice(0, 120); });
         fs.rmSync(path.join(this.statusDir, `${id}.title`), { force: true });
         this.emit('change');
       }
       l.claudeName = cname;
     }
-    if (this.accounts.recordUsage(s.account || 'default', j.rate_limits)) this.emit('usage');
+    // Usage from an old snapshot would be stamped as fresh: only live reports count.
+    if (!initial && this.accounts.recordUsage(s.account || 'default', j.rate_limits)) this.emit('usage');
     if (JSON.stringify(prev) !== JSON.stringify(info)) this.emit('change');
   }
 
   /**
    * Claude runs no hook when you interrupt it (Esc), so a session would look busy forever.
    * Listen to each Claude session's output: while Claude works its spinner redraws constantly,
-   * so "Interrupted" followed by quiet, or a long silence with nothing running, means it stopped.
+   * so its "⎿  Interrupted" line followed by quiet, or a long silence with nothing running, means it stopped.
    */
   watchOutput(s) {
     if (s.kind !== 'claude' || this.outWatch.has(s.id) || !hostAlive(this.sock(s.id))) return;
@@ -405,7 +443,7 @@ class Sessions extends EventEmitter {
       const l = this.live.get(s.id);
       if (!l) return;
       l.lastOut = Date.now();
-      if (l.state === 'working' && /Interrupted/.test(buf.toString('latin1').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ''))) l.interruptAt = Date.now();
+      if (l.state === 'working' && INTERRUPTED_RE.test(buf.toString('utf8').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ''))) l.interruptAt = Date.now();
     });
     c.on('close', () => { if (this.outWatch.get(s.id) === c) this.outWatch.delete(s.id); });
     c.connect().then(() => { const l = this.live.get(s.id); if (l) l.lastOut = Date.now(); }, () => this.outWatch.delete(s.id));
@@ -414,15 +452,20 @@ class Sessions extends EventEmitter {
   /**
    * You answered a session that was waiting for you (permission prompt or question): Enter, Esc or an
    * option number. Claude runs no hook when you cancel (Esc), and none until an approved command
-   * finishes, so treat it as working now; its output (spinner, or "Interrupted" then quiet) settles it.
+   * finishes, so treat a permission answer or any Esc as working now; its output (spinner, or
+   * "Interrupted" then quiet) settles it. A question may have several parts: Enter or a number
+   * answers one, and PostToolUse fires after the last, so the question state holds until then.
    */
   userInput(id, data) {
     const s = this.state.session(id);
     const l = this.live.get(id);
+    if (l) l.typedSinceIdle = true;
     if (!s || !l || s.kind !== 'claude' || !needsYou(l.state)) return;
     const text = data.toString('latin1');
-    const answered = text.includes('\r') || text === '\x1b' || /^[1-9]$/.test(text);
+    const esc = text === '\x1b';
+    const answered = esc || text.includes('\r') || /^[1-9]$/.test(text);
     if (!answered) return; // arrow keys etc.: still choosing
+    if (l.state === 'question' && !esc) return;
     this.writeStatus(id, 'working');
     this.setState(id, 'working', true, { quiet: true });
     this.setUnread(id, false);
@@ -430,7 +473,8 @@ class Sessions extends EventEmitter {
 
   writeStatus(id, state) {
     const f = path.join(this.statusDir, `${id}.json`);
-    try { fs.writeFileSync(`${f}.srv`, `{"state":"${state}"}\n`); fs.renameSync(`${f}.srv`, f); } catch { /* ignore */ }
+    const tmp = `${f}.${process.pid}-${++statusSeq}.srv`;
+    try { fs.writeFileSync(tmp, `{"state":"${state}"}\n`); fs.renameSync(tmp, f); } catch { fs.rmSync(tmp, { force: true }); }
   }
 
   checkStalled() {
@@ -478,9 +522,8 @@ class Sessions extends EventEmitter {
       const below = pid => { const all = []; const st = [...(kids.get(pid) || [])]; while (st.length) { const p = st.pop(); all.push(p); st.push(...(kids.get(p) || [])); } return all; };
       const next = new Set();
       for (const s of this.state.sessions) {
-        let hostPid;
-        try { [hostPid] = fs.readFileSync(this.sock(s.id) + '.pid', 'utf8').trim().split(/\s+/).map(Number); } catch { continue; }
-        if (!info.has(hostPid)) continue;
+        const { host: hostPid } = hostPids(this.sock(s.id));
+        if (!hostPid || !info.has(hostPid)) continue;
         const top = kids.get(hostPid) || []; // the login shell the host started
         let busy = false;
         if (s.kind === 'shell') {
@@ -582,7 +625,7 @@ class Sessions extends EventEmitter {
       },
       statusLine: { type: 'command', command: `sh ${shq(path.join(__dirname, 'statusline.sh'))}` },
     };
-    const own = userStatusLine('/nonexistent', null, this.accounts.defaultConfigDir());
+    const own = userStatusLine(null, this.accounts.defaultConfigDir());
     if (own && own.padding !== undefined) settings.statusLine.padding = own.padding;
     if (own && own.refreshInterval !== undefined) settings.statusLine.refreshInterval = own.refreshInterval;
     fs.writeFileSync(this.hookFile, JSON.stringify(settings, null, 2) + '\n');
@@ -619,8 +662,12 @@ function applyAgentEvent(list, ev, at) {
   }
   if (e === 'PostToolUse' && AGENT_TOOLS.has(ev.tool_name)) {
     // A background subagent's tool call returns as soon as it starts; it finishes at SubagentStop.
+    // Claude also runs subagents in the background without run_in_background: the result says so.
     const m = list.find(x => x.toolUseId && x.toolUseId === ev.tool_use_id);
-    return m && !m.background && m.state === 'running' ? done(m) : false;
+    if (!m || m.state !== 'running') return false;
+    const r = ev.tool_response;
+    if (r && (r.isAsync || r.status === 'async_launched')) return m.background ? false : (m.background = true);
+    return m.background ? false : done(m);
   }
   return false;
 }

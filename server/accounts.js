@@ -6,11 +6,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { run } = require('./util');
+const { run, shq } = require('./util');
 
 // Shared from ~/.claude into new accounts (symlinks), so your settings, memory,
 // agents, commands and skills are the same whichever org you're signed in to.
 const SHAREABLE = ['settings.json', 'CLAUDE.md', 'agents', 'commands', 'skills', 'output-styles', 'keybindings.json'];
+// Where `claude auth login` keeps the login inside a CLAUDE_CONFIG_DIR (on Linux).
+const CREDENTIALS = ['.credentials.json'];
 
 class Accounts {
   constructor(state, home) {
@@ -81,15 +83,35 @@ class Accounts {
     });
   }
 
-  remove(id, inUse) {
+  /** Forget an account and sign it out here: only its credentials are deleted, its conversations and settings stay. */
+  remove(id, sessionNames = []) {
     if (id === 'default') throw new Error('The default account can’t be removed');
-    if (inUse) throw new Error('Close the sessions that use this account first');
+    if (sessionNames.length) throw new Error(`Close the sessions that use this account first: ${sessionNames.join(', ')}`);
+    const a = (this.state.prefs.accounts || []).find(x => x.id === id);
+    if (a && a.dir) this.removeCredentials(a.dir);
     this.state.update(d => {
       d.prefs.accounts = (d.prefs.accounts || []).filter(a => a.id !== id);
       if (d.prefs.activeAccount === id) d.prefs.activeAccount = 'default';
     });
     delete this.usage[id];
     this.saveUsage();
+  }
+
+  /** Never follows links: the folder holds links into ~/.claude. */
+  removeCredentials(dir) {
+    if (path.dirname(path.resolve(dir)) !== path.resolve(this.dir)) return;
+    try {
+      if (!fs.lstatSync(dir).isDirectory()) return;
+    } catch {
+      return;
+    }
+    for (const name of CREDENTIALS) {
+      const f = path.join(dir, name);
+      try {
+        const st = fs.lstatSync(f);
+        if (st.isFile() || st.isSymbolicLink()) fs.unlinkSync(f);
+      } catch { /* not there */ }
+    }
   }
 
   setActive(id) {
@@ -109,7 +131,6 @@ class Accounts {
     let value;
     try {
       const env = { ...this.env(id) };
-      if (id !== 'default') env.CLAUDE_CONFIG_DIR = this.configDir(id);
       const out = await run('sh', ['-lc', `${claudeBin(claudeCmd)} auth status`], { env, timeout: 20_000 }).catch(e => e.stdout || '');
       const j = JSON.parse(out.slice(out.indexOf('{')));
       value = {
@@ -150,18 +171,27 @@ class Accounts {
   }
 }
 
-/** The Claude program from the "Claude command" setting, without its flags ("claude --foo" -> "claude"). */
+/** A command that is one existing path with spaces in it ("/opt/my tools/claude"), quoted for a shell. */
+function quotedPath(cmd) {
+  const s = String(cmd || '').trim();
+  return /\s/.test(s) && fs.existsSync(s) ? shq(s) : undefined;
+}
+
+/** The Claude program from the "Claude command" setting, as shell words without its flags ("claude --foo" -> "claude"). */
 function claudeBin(cmd) {
+  const whole = quotedPath(cmd);
+  if (whole) return whole;
   const words = String(cmd || 'claude').trim().split(/\s+/);
   const i = words.findIndex(w => w.startsWith('-'));
   return (i === -1 ? words : words.slice(0, i)).join(' ') || 'claude';
 }
 
-/** The statusLine command the user has set (project local > project > account > ~/.claude). */
-function userStatusLine(worktree, configDir, defaultDir) {
+/**
+ * The statusLine command the user has set (account > ~/.claude). Never a repo's .claude settings:
+ * statusline.sh runs it with sh, so a cloned repo could run code.
+ */
+function userStatusLine(configDir, defaultDir) {
   const files = [
-    path.join(worktree, '.claude', 'settings.local.json'),
-    path.join(worktree, '.claude', 'settings.json'),
     configDir ? path.join(configDir, 'settings.json') : null,
     path.join(defaultDir, 'settings.json'),
   ].filter(Boolean);
@@ -174,4 +204,4 @@ function userStatusLine(worktree, configDir, defaultDir) {
   return undefined;
 }
 
-module.exports = { Accounts, userStatusLine, claudeBin };
+module.exports = { Accounts, userStatusLine, claudeBin, quotedPath };

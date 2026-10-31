@@ -32,9 +32,11 @@
     ta.addEventListener('input', () => model && model.setValue(ta.value));
     const ed = {
       _ta: ta,
-      addCommand() {}, onDidChangeCursorPosition() { return { dispose() {} }; }, getPosition: () => ({ lineNumber: 1, column: 1 }),
+      _opts: { ...(opts || {}) }, // every option it was created or updated with, for tests
+      addCommand() {}, createContextKey() { return { set() {}, get() {}, reset() {} }; },
+      onDidChangeCursorPosition() { return { dispose() {} }; }, getPosition: () => ({ lineNumber: 1, column: 1 }),
       setSelection() {}, revealRangeInCenterIfOutsideViewport() {}, revealLineInCenter() {}, focus() { ta.focus(); }, layout() {}, dispose() { ta.remove(); },
-      updateOptions(o) { if ('readOnly' in o) ta.readOnly = !!o.readOnly; }, getModel: () => model,
+      updateOptions(o) { Object.assign(ed._opts, o); if ('readOnly' in o) ta.readOnly = !!o.readOnly; }, getModel: () => model,
       setModel(m) { model = m; sync(); if (m) m.onDidChangeContent(() => { if (model === m && document.activeElement !== ta) sync(); }); },
     };
     if (model) model.onDidChangeContent(() => { if (document.activeElement !== ta) sync(); });
@@ -55,7 +57,7 @@
           const o = editorStub(left, {}), m = editorStub(right, {});
           o.updateOptions({ readOnly: true });
           let cur = null;
-          return { setModel(p) { cur = p; o.setModel(p.original); m.setModel(p.modified); }, getModel: () => cur, getModifiedEditor: () => m, getOriginalEditor: () => o, getLineChanges: () => [], revealLineInCenter() {}, layout() {}, dispose() { o.dispose(); m.dispose(); } };
+          return { updateOptions({ readOnly, ...rest }) { o.updateOptions(rest); m.updateOptions(rest); }, setModel(p) { cur = p; o.setModel(p.original); m.setModel(p.modified); }, getModel: () => cur, getModifiedEditor: () => m, getOriginalEditor: () => o, getLineChanges: () => [], revealLineInCenter() {}, layout() {}, dispose() { o.dispose(); m.dispose(); } };
         },
         createModel: (t, l, u) => new Model(t, l, u),
         getModel: u => models.get(u.toString()) || null,

@@ -28,7 +28,7 @@ export function customizeDialog(kind, item) {
   const preview = h('div.look-preview');
   const grid = h('div.look-icons');
   const swatches = h('div.look-colors');
-  const emoji = h('input.input.look-emoji', { placeholder: 'or type an emoji', maxlength: '4', value: look.icon && !look.icon.startsWith('i:') ? look.icon : '' });
+  const emoji = h('input.input.look-emoji', { placeholder: 'or type an emoji', value: look.icon && !look.icon.startsWith('i:') ? look.icon : '' });
   const custom = h('input.color-pick', { type: 'color', value: look.color || '#e5e5e5', title: 'Any color' });
   const render = () => {
     clear(preview, entryIcon(look, fallback, 'look-preview-icon'), h('span', { style: look.color ? { color: look.color } : {} }, item.name));
@@ -40,7 +40,13 @@ export function customizeDialog(kind, item) {
       COLORS.map(c => h(`button.look-color${look.color === c ? '.on' : ''}`, { title: c, style: { background: c }, onclick: () => { look.color = c; custom.value = c; render(); } })),
       custom);
   };
-  emoji.addEventListener('input', () => { look.icon = emoji.value.trim(); render(); });
+  emoji.addEventListener('input', () => {
+    // two emoji at most, counted as the eye sees them (a family or a flag is one)
+    const glyphs = typeof Intl.Segmenter === 'function' ? [...new Intl.Segmenter().segment(emoji.value)].map(g => g.segment) : [...emoji.value];
+    if (glyphs.length > 2) emoji.value = glyphs.slice(0, 2).join('');
+    look.icon = emoji.value.trim();
+    render();
+  });
   custom.addEventListener('input', () => { look.color = custom.value; render(); });
   const m = modal([
     h('div.modal-title', `Customize ${item.name}`),

@@ -5,7 +5,7 @@
 //   right-click  → a menu: open here, open in your browser, show in Files, copy
 import { call } from './rpc.js';
 import { toast } from './dialogs.js';
-import { openPath, openLink, pathHint, pathKind, LINK_HINT } from './viewers.js';
+import { openPath, openLink, pathHint, pathKind } from './viewers.js';
 
 // Linux (/…, ~/…, ./…), Windows (C:\…), WSL shares (\\wsl.localhost\…), relative (src/app.py) and bare
 // file names with an extension (index.html); an optional :line or :line:col after any of them.
@@ -52,7 +52,8 @@ function logicalLine(term, y) {
       if (!cell) break;
       if (cell.getWidth() === 0) continue; // second half of a wide character
       const ch = cell.getChars() || ' ';
-      for (const c of ch) { text += c; at.push({ x: x + 1, y: r + 1 }); }
+      text += ch;
+      for (let i = 0; i < ch.length; i++) at.push({ x: x + 1, y: r + 1 }); // one per UTF-16 unit: match offsets count units
     }
   }
   return { text, at };
@@ -148,5 +149,3 @@ export function linkMenuItems(tab, link) {
 function copy(text) {
   navigator.clipboard.writeText(text).then(() => toast('Copied.', { timeout: 1500 }), () => {});
 }
-
-export { LINK_HINT };

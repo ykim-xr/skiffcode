@@ -1,10 +1,10 @@
 'use strict';
 // Alerts from the server itself, for when no SkiffCode window is open:
 // on WSL through Windows (PowerShell sound + toast), on Linux via paplay/notify-send.
-const { spawn, execFileSync } = require('child_process');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { which } = require('./util');
+const { which, run } = require('./util');
 
 let wsl;
 function isWSL() {
@@ -40,23 +40,30 @@ function runPS(script) {
 const psq = s => String(s).replace(/'/g, "''");
 const xml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-let winSoundDir;
-function windowsSoundPath(file) {
-  if (winSoundDir === undefined) {
-    try {
-      const temp = execFileSync('cmd.exe', ['/d', '/c', 'echo %TEMP%'], { encoding: 'utf8', cwd: fs.existsSync('/mnt/c') ? '/mnt/c' : undefined, stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }).trim();
-      const unix = execFileSync('wslpath', ['-u', temp], { encoding: 'utf8', timeout: 5000 }).trim();
-      winSoundDir = path.join(unix, 'skiffcode-sounds');
-      fs.mkdirSync(winSoundDir, { recursive: true });
-    } catch {
-      winSoundDir = null;
-    }
+let winSoundDir; // a promise of the Windows temp folder for sounds, or null
+function windowsSoundDir() {
+  if (!winSoundDir) {
+    const opts = { cwd: fs.existsSync('/mnt/c') ? '/mnt/c' : undefined, timeout: 5000, input: '' }; // input '': cmd.exe must not inherit a pipe that never closes
+    winSoundDir = (async () => {
+      const temp = (await run('cmd.exe', ['/d', '/c', 'echo %TEMP%'], opts)).trim();
+      const dir = path.join((await run('wslpath', ['-u', temp], { timeout: 5000 })).trim(), 'skiffcode-sounds');
+      await fs.promises.mkdir(dir, { recursive: true });
+      return dir;
+    })().catch(() => null);
   }
-  if (!winSoundDir) return undefined;
-  const dst = path.join(winSoundDir, path.basename(file));
+  return winSoundDir;
+}
+
+/** The Windows path of a sound file, copied to the Windows temp folder first (again when its content changed). */
+async function windowsSoundPath(file) {
+  const dir = await windowsSoundDir();
+  if (!dir) return undefined;
+  const dst = path.join(dir, path.basename(file));
   try {
-    if (!fs.existsSync(dst) || fs.statSync(dst).size !== fs.statSync(file).size) fs.copyFileSync(file, dst);
-    return execFileSync('wslpath', ['-w', dst], { encoding: 'utf8', timeout: 5000 }).trim();
+    const src = await fs.promises.readFile(file);
+    const old = await fs.promises.readFile(dst).catch(() => null);
+    if (!old || !old.equals(src)) await fs.promises.writeFile(dst, src);
+    return (await run('wslpath', ['-w', dst], { timeout: 5000 })).trim();
   } catch {
     return undefined;
   }
@@ -68,19 +75,20 @@ function playFile(file, volume = 0.7) {
   const v = Math.max(0, Math.min(1, Number(volume)));
   if (v === 0) return;
   if (isWSL()) {
-    const win = windowsSoundPath(file);
-    if (!win) return;
-    // MediaPlayer plays wav/mp3 and has a volume (SoundPlayer has neither)
-    runPS([
-      'Add-Type -AssemblyName PresentationCore',
-      '$p = New-Object System.Windows.Media.MediaPlayer',
-      `$p.Open([Uri]'${psq(win)}')`,
-      `$p.Volume = ${v.toFixed(2)}`,
-      'Start-Sleep -Milliseconds 250',
-      '$p.Play()',
-      'Start-Sleep -Seconds 5',
-      '$p.Close()',
-    ].join('; '));
+    void windowsSoundPath(file).then(win => {
+      if (!win) return;
+      // MediaPlayer plays wav/mp3 and has a volume (SoundPlayer has neither)
+      runPS([
+        'Add-Type -AssemblyName PresentationCore',
+        '$p = New-Object System.Windows.Media.MediaPlayer',
+        `$p.Open([Uri]'${psq(win)}')`,
+        `$p.Volume = ${v.toFixed(2)}`,
+        'Start-Sleep -Milliseconds 250',
+        '$p.Play()',
+        'Start-Sleep -Seconds 5',
+        '$p.Close()',
+      ].join('; '));
+    });
     return;
   }
   if (which('pw-play')) return quiet(which('pw-play'), ['--volume', v.toFixed(2), file]);

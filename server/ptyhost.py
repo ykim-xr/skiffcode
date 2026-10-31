@@ -25,6 +25,8 @@ import time
 
 HISTORY_LIMIT = 4 * 1024 * 1024  # bytes of scrollback kept for reconnecting clients
 SAVE_EVERY = 4.0  # seconds between scrollback saves (survives reboots)
+CLIENT_BACKLOG = HISTORY_LIMIT + 4 * 1024 * 1024  # output queued for a client that doesn't read; past this it is dropped
+MAX_FRAME = 64 * 1024 * 1024  # largest frame a client may send
 
 
 def frame(kind, payload):
@@ -32,10 +34,21 @@ def frame(kind, payload):
 
 
 def set_size(fd, cols, rows):
+    cols, rows = (min(65535, max(1, n)) for n in (cols, rows))  # the sizes are 16-bit
     try:
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     except OSError:
         pass
+
+
+def clean_cut(buf, cut):
+    """Where to cut the first `cut` bytes off: after the next newline if one is near, else not inside a UTF-8 character."""
+    nl = buf.find(b"\n", cut, cut + 65536)
+    if nl != -1:
+        return nl + 1
+    while cut < len(buf) and buf[cut] & 0xC0 == 0x80:
+        cut += 1
+    return cut
 
 
 def main():
@@ -49,7 +62,8 @@ def main():
     if preload_path:
         try:
             with open(preload_path, "rb") as f:
-                preload = f.read()[-HISTORY_LIMIT // 2:]
+                preload = f.read()
+            preload = preload[clean_cut(preload, max(0, len(preload) - HISTORY_LIMIT // 2)):]
             if preload:
                 preload += b"\r\n\x1b[2m\xe2\x94\x80\xe2\x94\x80 restarted \xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n\r\n"
         except OSError:
@@ -61,7 +75,7 @@ def main():
             os.chdir(cwd)
         except OSError:
             pass
-        os.environ["TERM"] = os.environ.get("SKIFFCODE_TERM", "xterm-256color")
+        os.environ["TERM"] = "xterm-256color"
         os.environ["COLORTERM"] = "truecolor"
         try:
             os.execvp(cmd[0], cmd)
@@ -90,7 +104,8 @@ def main():
     sel = selectors.DefaultSelector()
     sel.register(master, selectors.EVENT_READ, "pty")
     sel.register(srv, selectors.EVENT_READ, "accept")
-    clients = {}  # sock -> receive buffer
+    clients = {}  # sock -> {"rx": received bytes, "tx": output not yet sent}
+    pending = bytearray()  # input the program hasn't taken yet (the pty is non-blocking)
     history = bytearray(preload)
     exit_code = None
     state = {"dirty": False, "saved": time.monotonic()}
@@ -108,12 +123,36 @@ def main():
         except OSError:
             pass
 
+    def watch(c):
+        events = selectors.EVENT_READ | (selectors.EVENT_WRITE if clients[c]["tx"] else 0)
+        if sel.get_key(c).events != events:
+            sel.modify(c, events, "client")
+
+    def flush(c):
+        tx = clients[c]["tx"]
+        try:
+            n = c.send(tx)
+        except (BlockingIOError, InterruptedError):
+            n = 0
+        except OSError:
+            drop(c)
+            return
+        del tx[:n]
+        watch(c)
+
+    def send(c, data):
+        st = clients.get(c)
+        if st is None:
+            return
+        st["tx"].extend(data)
+        if len(st["tx"]) > CLIENT_BACKLOG:
+            drop(c)  # it stopped reading; it can reconnect for the history
+            return
+        flush(c)
+
     def broadcast(data):
         for c in list(clients):
-            try:
-                c.sendall(data)
-            except OSError:
-                drop(c)
+            send(c, data)
 
     def drop(c):
         try:
@@ -128,20 +167,29 @@ def main():
 
     def trim_history():
         if len(history) > HISTORY_LIMIT:
-            cut = len(history) - HISTORY_LIMIT
-            nl = history.find(b"\n", cut)
-            del history[: (nl + 1 if 0 <= nl < cut + 65536 else cut)]
+            del history[: clean_cut(history, len(history) - HISTORY_LIMIT)]
+
+    def write_input():
+        try:
+            n = os.write(master, pending)
+        except (BlockingIOError, InterruptedError):
+            n = 0
+        except OSError:
+            n = len(pending)
+        del pending[:n]
+        try:
+            sel.modify(master, selectors.EVENT_READ | (selectors.EVENT_WRITE if pending else 0), "pty")
+        except (KeyError, ValueError):
+            pass  # the program has exited
 
     def handle(c, kind, payload):
         if kind == b"i":
-            try:
-                os.write(master, payload)
-            except OSError:
-                pass
+            pending.extend(payload)
+            write_input()
         elif kind == b"r":
             try:
                 c_, r_ = payload.decode().split(",")
-                set_size(master, max(2, int(c_)), max(2, int(r_)))
+                set_size(master, int(c_), int(r_))
                 os.kill(pid, signal.SIGWINCH)
             except (ValueError, OSError):
                 pass
@@ -163,9 +211,11 @@ def main():
     signal.signal(signal.SIGTERM, on_term)
 
     while True:
-        for key, _ in sel.select(timeout=1.0):
+        for key, mask in sel.select(timeout=1.0):
             tag = key.data
-            if tag == "pty":
+            if tag == "pty" and mask & selectors.EVENT_WRITE:
+                write_input()
+            if tag == "pty" and mask & selectors.EVENT_READ:
                 try:
                     data = os.read(master, 65536)
                 except OSError as e:
@@ -187,29 +237,32 @@ def main():
                     c, _ = srv.accept()
                 except OSError:
                     continue
-                c.settimeout(10)  # slow clients get 10 s before being dropped
-                try:
-                    c.sendall(frame(b"h", bytes(history)))
-                except OSError:
-                    c.close()
-                    continue
-                clients[c] = bytearray()
+                c.setblocking(False)
+                clients[c] = {"rx": bytearray(), "tx": bytearray()}
                 sel.register(c, selectors.EVENT_READ, "client")
-            else:
+                send(c, frame(b"h", bytes(history)))
+            elif tag == "client":
                 c = key.fileobj
+                if mask & selectors.EVENT_WRITE and c in clients:
+                    flush(c)
+                if not (mask & selectors.EVENT_READ) or c not in clients:
+                    continue
                 try:
                     data = c.recv(65536)
-                except (BlockingIOError, socket.timeout):
+                except (BlockingIOError, InterruptedError):
                     continue
                 except OSError:
                     data = b""
                 if not data:
                     drop(c)
                     continue
-                buf = clients[c]
+                buf = clients[c]["rx"]
                 buf.extend(data)
                 while len(buf) >= 5:
                     (n,) = struct.unpack(">I", bytes(buf[1:5]))
+                    if n > MAX_FRAME:
+                        drop(c)
+                        break
                     if len(buf) < 5 + n:
                         break
                     kind, payload = bytes(buf[0:1]), bytes(buf[5:5 + n])
@@ -221,7 +274,14 @@ def main():
             save_history()
 
     save_history(force=True)
-    # Give clients a moment to read the exit frame, then clean up.
+    # Give clients a moment to read what is still queued and the exit frame, then clean up.
+    for c, st in list(clients.items()):
+        if st["tx"]:
+            try:
+                c.settimeout(1.0)
+                c.sendall(st["tx"])
+            except OSError:
+                pass
     time.sleep(0.2)
     for c in list(clients):
         drop(c)

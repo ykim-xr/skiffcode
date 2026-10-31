@@ -1,9 +1,10 @@
 // Right panel: file tree of the worktree, colored by git status.
-import { h, icon, clear, basename, dirname } from './util.js';
+import { h, icon, clear, basename, dirname, dirtyCount, STATUS_LETTER } from './util.js';
 import { call, on } from './rpc.js';
 import { contextMenu, promptDialog, confirmDialog, toast } from './dialogs.js';
 import { hasPreview, viewerFor } from './viewers.js';
 import { startInternal, isInternal, isExternal, readInternal, takeExternal, uploadInto, moveInto } from './dnd.js';
+import { move as moveModels } from './models.js';
 
 export class FilesView {
   constructor(ws) {
@@ -22,8 +23,9 @@ export class FilesView {
         h('button.icon-btn', { title: 'Refresh', onclick: () => this.reloadAll() }, icon('refresh')),
         h('button.icon-btn', { title: 'Collapse all', onclick: () => this.collapseAll() }, icon('chevronRight'))),
       this.tree);
-    this.children = new Map(); // dir -> entries
+    this.children = new Map(); // dir -> entries (expanded folders only)
     this.expanded = new Set(['']);
+    this.watched = new Set(); // folders the server watches for us: once each, however often they reload
     this.gitMarks = new Map(); // path -> status letter
     this.loaded = false;
     this.off = [
@@ -34,6 +36,7 @@ export class FilesView {
         else if (this.children.has(d)) this.reloadDir(d);
       }),
       on('git.changed', e => { if (e.root === this.ws.root) this.loadGit(); }),
+      on('reconnect', () => { this.watched.clear(); this.reloadAll(); }), // the new connection has no watches yet
     ];
   }
 
@@ -63,7 +66,7 @@ export class FilesView {
       for (const f of s.changes) mark(f.path, f.status);
       for (const f of s.staged) if (!this.gitMarks.has(f.path) || this.gitMarks.get(f.path) === 'dir') mark(f.path, f.status);
       for (const f of s.conflicts) mark(f.path, '!');
-      this.ws.scm.setCount(s.staged.length + s.changes.length + s.untracked.length + s.conflicts.length);
+      this.ws.scm.setCount(dirtyCount(s));
       this.render();
     } catch { /* not ready */ }
   }
@@ -71,13 +74,22 @@ export class FilesView {
   async reloadDir(d) {
     try {
       const entries = await call('fs.list', { root: this.ws.root, dir: d });
+      if (!this.expanded.has(d)) return; // collapsed while the list was coming
       this.children.set(d, entries);
-      void call('fs.watch', { root: this.ws.root, path: d }).catch(() => {});
+      if (!this.watched.has(d)) {
+        this.watched.add(d);
+        void call('fs.watch', { root: this.ws.root, path: d }).catch(() => {});
+      }
     } catch {
       this.children.delete(d);
       this.expanded.delete(d);
+      this.unwatch(d);
     }
     this.render();
+  }
+
+  unwatch(d) {
+    if (this.watched.delete(d)) void call('fs.unwatch', { root: this.ws.root, path: d }).catch(() => {});
   }
 
   reloadAll() {
@@ -107,7 +119,7 @@ export class FilesView {
   }
 
   collapseAll() {
-    for (const d of this.expanded) if (d) void call('fs.unwatch', { root: this.ws.root, path: d }).catch(() => {});
+    for (const d of this.expanded) if (d) { this.unwatch(d); this.children.delete(d); }
     this.expanded = new Set(['']);
     this.render();
     this.ws.saveSoon();
@@ -116,7 +128,8 @@ export class FilesView {
   toggle(d) {
     if (this.expanded.has(d)) {
       this.expanded.delete(d);
-      void call('fs.unwatch', { root: this.ws.root, path: d }).catch(() => {});
+      this.unwatch(d);
+      this.children.delete(d); // not listed again while collapsed
       this.render();
     } else {
       this.expanded.add(d);
@@ -126,14 +139,26 @@ export class FilesView {
     this.ws.saveSoon();
   }
 
+  /** The file the active tab shows, if the tree can show it. */
+  activePath() {
+    const t = this.ws.activeTab;
+    return t && (t.kind === 'file' || (t.kind === 'view' && t.mode !== 'html')) ? t.path : null;
+  }
+
+  /** The active tab changed: move the highlight without drawing the tree again. */
+  markActive() {
+    const path = this.activePath();
+    for (const row of this.tree.querySelectorAll('.file-row')) row.classList.toggle('active', row.dataset.path === path);
+  }
+
   render() {
     const rows = [];
     const walk = (d, depth) => {
       for (const e of this.children.get(d) || []) {
         const st = this.gitMarks.get(e.path);
         const open = e.type === 'dir' && this.expanded.has(e.path);
-        const active = this.ws.activeTab && (this.ws.activeTab.kind === 'file' || (this.ws.activeTab.kind === 'view' && this.ws.activeTab.mode !== 'html')) && this.ws.activeTab.path === e.path;
-        rows.push(h(`div.file-row${e.ignored ? '.ignored' : ''}${active ? '.active' : ''}${st && st !== 'dir' ? `.g-${st === '?' ? 'U' : st}` : st === 'dir' ? '.g-dir' : ''}`, {
+        const active = this.activePath() === e.path;
+        rows.push(h(`div.file-row${e.ignored ? '.ignored' : ''}${active ? '.active' : ''}${st && st !== 'dir' ? `.g-${STATUS_LETTER(st)}` : st === 'dir' ? '.g-dir' : ''}`, {
           style: { paddingLeft: `${8 + depth * 12}px` },
           title: e.path,
           onclick: () => (e.type === 'dir' ? this.toggle(e.path) : this.ws.openFile(e.path, { preview: true })),
@@ -146,7 +171,7 @@ export class FilesView {
         e.type === 'dir' ? icon(open ? 'chevronDown' : 'chevronRight', 'twisty') : h('span.twisty-space'),
         icon(e.type === 'dir' ? 'folder' : 'file', 'file-type'),
         h('span.file-name', e.name),
-        st && st !== 'dir' ? h('span.git-letter', st === '?' ? 'U' : st) : null));
+        st && st !== 'dir' ? h('span.git-letter', STATUS_LETTER(st)) : null));
         if (open) walk(e.path, depth + 1);
       }
     };
@@ -162,6 +187,7 @@ export class FilesView {
   }
 
   markDrop(dir) {
+    if (dir === null) { clearTimeout(this.hoverT); this.hoverDir = null; } // left or dropped: no pending expand
     for (const el of this.tree.querySelectorAll('.drop-into')) el.classList.remove('drop-into');
     this.tree.classList.toggle('drop-root', dir === '');
     if (dir) {
@@ -189,7 +215,6 @@ export class FilesView {
   async drop(e) {
     if (!isInternal(e) && !isExternal(e)) return;
     e.preventDefault();
-    clearTimeout(this.hoverT);
     const dir = this.dropDir(e);
     this.markDrop(null);
     if (isInternal(e)) {
@@ -240,6 +265,7 @@ export class FilesView {
     if (!to || to === e.path) return;
     try {
       await call('fs.rename', { root: this.ws.root, from: e.path, to });
+      moveModels(this.ws.root, e.path, to); // open tabs follow, unsaved edits included
       this.reloadDir(dirname(e.path));
       if (dirname(to) !== dirname(e.path)) this.reloadDir(dirname(to));
     } catch (err) {
@@ -260,5 +286,6 @@ export class FilesView {
 
   dispose() {
     this.off.forEach(f => f());
+    for (const d of [...this.watched]) this.unwatch(d);
   }
 }

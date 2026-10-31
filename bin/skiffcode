@@ -43,17 +43,18 @@ esac
 
 [[ -f "$APP/server/main.js" ]] || die "not installed — run: skiffcode update  (or ./install.sh from a copy of the repo)"
 command -v node >/dev/null || die "Node.js 18+ is required (see the README)"
-mkdir -p "$SKIFFCODE_HOME/inbox"
+(umask 077; mkdir -p "$SKIFFCODE_HOME/inbox")
 
 token() { cat "$SKIFFCODE_HOME/token" 2>/dev/null; }
 
 # Ask the server whether it's SkiffCode and whether a window is open. Prints JSON or nothing.
 status_json() {
   local t; t="$(token)"; [[ -n "$t" ]] || return 1
-  node -e '
-    fetch(`http://127.0.0.1:${process.argv[1]}/api/status`, { headers: { "x-skiffcode-token": process.argv[2] }, signal: AbortSignal.timeout(2000) })
+  # The token goes in the environment: other users can read a command line (ps), not an environment.
+  SKIFFCODE_TOKEN="$t" node -e '
+    fetch(`http://127.0.0.1:${process.argv[1]}/api/status`, { headers: { "x-skiffcode-token": process.env.SKIFFCODE_TOKEN }, signal: AbortSignal.timeout(2000) })
       .then(r => (r.ok ? r.text() : "")).then(t => process.stdout.write(t)).catch(() => {});
-  ' "$PORT" "$t"
+  ' "$PORT"
 }
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
 port_owner() { command -v ss >/dev/null && ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'users:(([^)]*' | sed 's/users:((//' | head -1; }
@@ -66,8 +67,12 @@ start() {
 Stop it, or run SkiffCode on another port:  SKIFFCODE_PORT=3418 skiffcode"
   fi
   echo "Starting SkiffCode on http://localhost:$PORT …" >&2
+  # The last run's log stays as server.log.1 (it may say why that server stopped).
+  if [[ -s "$LOG" ]]; then mv -f "$LOG" "$LOG.1"; fi
+  # A private log without changing the server's umask (its terminals inherit that).
+  (umask 077; : >>"$LOG"); chmod 600 "$LOG"
   # Always from the home folder: started from a Windows folder (/mnt/c/…, slow in WSL) the server can hang or fail.
-  ( cd "$HOME" 2>/dev/null || cd /; exec setsid nohup node "$APP/server/main.js" >"$LOG" 2>&1 </dev/null ) &
+  ( cd "$HOME" 2>/dev/null || cd /; exec setsid nohup node "$APP/server/main.js" >>"$LOG" 2>&1 </dev/null ) &
   for _ in $(seq 1 150); do
     running && return 0
     sleep 0.1
@@ -79,8 +84,20 @@ Stop it, or run SkiffCode on another port:  SKIFFCODE_PORT=3418 skiffcode"
 # Stop the server and wait until it has really exited and let go of the port (sessions keep running).
 # Without the wait, a restart could find the old server still answering, think it was already up,
 # and leave nothing running once the old one finished exiting.
+# Only a pid SkiffCode itself reports, or one whose command line is a SkiffCode server: a stale
+# server.pid may name an unrelated process by now.
+server_pid() {
+  local pid
+  pid="$(status_json 2>/dev/null | grep -o '"pid":[0-9]*' | cut -d: -f2 || true)"
+  if [[ -z "$pid" ]]; then
+    pid="$(cat "$SKIFFCODE_HOME/server.pid" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] && tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | grep -Eq '(^|/)server/main\.js$' || pid=""
+  fi
+  printf '%s' "$pid"
+}
+
 stop() {
-  local pid; pid="$(cat "$SKIFFCODE_HOME/server.pid" 2>/dev/null || true)"
+  local pid; pid="$(server_pid)"
   if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then echo "not running"; return 0; fi
   kill "$pid" 2>/dev/null || true
   local i
@@ -136,11 +153,12 @@ cli() {
   local base="" name="" prompt="" claude=1 show=1 json=0
   while (($#)); do
     case "$1" in
-      -b|--base) base="${2:-}"; shift 2 ;;
+      -b|--base|-n|--name|-p|--prompt) (($# >= 2)) || die "$1 needs a value" ;;&
+      -b|--base) base="$2"; shift 2 ;;
       --base=*) base="${1#*=}"; shift ;;
-      -n|--name) name="${2:-}"; shift 2 ;;
+      -n|--name) name="$2"; shift 2 ;;
       --name=*) name="${1#*=}"; shift ;;
-      -p|--prompt) prompt="${2:-}"; shift 2 ;;
+      -p|--prompt) prompt="$2"; shift 2 ;;
       --prompt=*) prompt="${1#*=}"; shift ;;
       --no-claude) claude=0; shift ;;
       --no-show) show=0; shift ;;
@@ -158,11 +176,11 @@ cli() {
     dir="$(cd "${pos[0]}" && pwd -P)"
   fi
   start >&2
-  CLI_CMD="$cmd" CLI_DIR="$dir" CLI_BRANCH="${pos[1]:-}" CLI_BASE="$base" CLI_NAME="$name" CLI_PROMPT="$prompt" \
+  SKIFFCODE_TOKEN="$(token)" CLI_CMD="$cmd" CLI_DIR="$dir" CLI_BRANCH="${pos[1]:-}" CLI_BASE="$base" CLI_NAME="$name" CLI_PROMPT="$prompt" \
   CLI_CLAUDE="$claude" CLI_SHOW="$show" CLI_JSON="$json" node -e '
     const e = process.env;
     const args = { dir: e.CLI_DIR || undefined, branch: e.CLI_BRANCH || undefined, base: e.CLI_BASE || undefined, name: e.CLI_NAME || undefined, prompt: e.CLI_PROMPT || undefined, claude: e.CLI_CLAUDE === "1", show: e.CLI_SHOW === "1" };
-    fetch(`http://127.0.0.1:${process.argv[1]}/api/cli`, { method: "POST", headers: { "x-skiffcode-token": process.argv[2], "content-type": "application/json" }, body: JSON.stringify({ cmd: e.CLI_CMD, args }) })
+    fetch(`http://127.0.0.1:${process.argv[1]}/api/cli`, { method: "POST", headers: { "x-skiffcode-token": e.SKIFFCODE_TOKEN, "content-type": "application/json" }, body: JSON.stringify({ cmd: e.CLI_CMD, args }) })
       .then(r => r.json()).then(j => {
         if (!j.ok) { console.error("skiffcode: " + j.error); process.exit(1); }
         const r = j.result;
@@ -175,7 +193,7 @@ cli() {
         if (r.session) console.log(`Claude    “${r.session.name}” started`);
         if (args.show) console.log(j.clients ? "Showing it in your SkiffCode window." : "Open SkiffCode to see it: skiffcode");
       }).catch(err => { console.error("skiffcode: " + err.message); process.exit(1); });
-  ' "$PORT" "$(token)"
+  ' "$PORT"
 }
 case "${1:-}" in
   new|claude|list) c="$1"; shift; cli "$c" "$@"; exit $? ;;
@@ -187,7 +205,7 @@ case "${1:-}" in
   stop) stop; exit 0 ;;
   restart) stop >/dev/null || true; start; echo "restarted"; exit 0 ;;
   logs) exec tail -n 200 -f "$LOG" ;;
-  url) start; url "${2:+$(cd "$2" && pwd -P)}"; echo; exit 0 ;;
+  url) if [[ -n "${2:-}" && ! -d "$2" ]]; then die "not a folder: $2"; fi; start; url "${2:+$(cd "$2" && pwd -P)}"; echo; exit 0 ;;
   --tab) app=0; shift ;;
   --app) shift ;;
   -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;

@@ -1,13 +1,19 @@
 // "New worktree" form, Orca style: pick any branch as the base, name your
 // new branch, see where the folder goes — or check out an existing branch.
-import { h, icon, clear } from './util.js';
+import { h, icon, clear, debounce } from './util.js';
 import { call } from './rpc.js';
 import { store } from './store.js';
-import { isTopModal } from './dialogs.js';
+import { modal, toast } from './dialogs.js';
 
-export function newWorktreeDialog(repo) {
-  return new Promise(async resolve => {
-    const br = await call('worktrees.branches', { repo: repo.path });
+export async function newWorktreeDialog(repo) {
+  let br;
+  try {
+    br = await call('worktrees.branches', { repo: repo.path });
+  } catch (e) {
+    toast(e.message, { kind: 'error' });
+    return undefined;
+  }
+  return new Promise(resolve => {
     let mode = 'new';
 
     const listId = `bases-${Math.random().toString(36).slice(2)}`;
@@ -17,7 +23,7 @@ export function newWorktreeDialog(repo) {
     const existing = h('select.input', {},
       br.free.length ? h('optgroup', { label: 'Local branches' }, br.free.map(b => h('option', { value: JSON.stringify({ branch: b }) }, b))) : null,
       br.remoteOnly.length ? h('optgroup', { label: 'Remote branches (creates a local tracking branch)' }, br.remoteOnly.map(r => h('option', { value: JSON.stringify({ remote: r }) }, r))) : null);
-    const startClaude = h('input', { type: 'checkbox', checked: store.settings.startClaudeOnCreate !== false ? true : undefined });
+    const startClaude = h('input', { type: 'checkbox', checked: store.settings.startClaudeOnCreate ? true : undefined });
     const where = h('div.form-hint');
     const err = h('div.modal-error');
     const create = h('button.btn.primary', { onclick: submit }, icon('branch'), 'Create worktree');
@@ -81,33 +87,24 @@ export function newWorktreeDialog(repo) {
         (mode === 'new' ? name : existing).focus();
         return;
       }
-      close({ ...spec(), startClaude: startClaude.checked });
+      m.close({ ...spec(), startClaude: startClaude.checked });
     }
 
-    let t;
-    name.addEventListener('input', () => { clearTimeout(t); t = setTimeout(check, 150); });
-    base.addEventListener('input', () => { clearTimeout(t); t = setTimeout(check, 150); });
+    const checkSoon = debounce(check, 150);
+    name.addEventListener('input', checkSoon);
+    base.addEventListener('input', checkSoon);
     existing.addEventListener('change', check);
     for (const el of [name, base]) el.addEventListener('keydown', e => e.key === 'Enter' && submit());
 
-    const back = h('div.modal-back');
-    const box = h('div.modal.worktree-form',
+    const m = modal([
       h('div.modal-title', `New worktree in ${repo.name}`),
       h('div.segmented', tabNew, tabExisting),
       newFields, existingFields,
       where, err,
       h('label.form-check', startClaude, ' Start a Claude session in it'),
-      h('div.modal-buttons', h('button.btn', { onclick: () => close(undefined) }, 'Cancel'), create));
-    back.append(box);
-    const key = e => { if (e.key === 'Escape' && isTopModal(back)) { e.preventDefault(); close(undefined); } };
-    document.addEventListener('keydown', key, true);
-    back.addEventListener('mousedown', e => e.target === back && close(undefined));
-    function close(v) {
-      back.remove();
-      document.removeEventListener('keydown', key, true);
-      resolve(v);
-    }
-    document.getElementById('overlay').append(back);
+      h('div.modal-buttons', h('button.btn', { onclick: () => m.close(undefined) }, 'Cancel'), create),
+    ], { onClose: resolve });
+    m.box.classList.add('worktree-form');
     void check();
     setTimeout(() => name.focus(), 0);
   });

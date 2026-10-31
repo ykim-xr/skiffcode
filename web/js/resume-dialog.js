@@ -1,6 +1,6 @@
 // "Resume a Claude conversation": past conversations of a worktree (from Claude's own
 // transcripts, wherever they were started), or a pasted `claude --resume …` line / ID.
-import { h, icon, clear, basename, relTime } from './util.js';
+import { h, icon, clear, basename, relTime, TERM_SIZE } from './util.js';
 import { call } from './rpc.js';
 import { store, session } from './store.js';
 import { modal, toast, confirmDialog } from './dialogs.js';
@@ -100,7 +100,7 @@ export async function resumeDialog(app, worktreePath, { value = '' } = {}) {
     if (busy) return;
     busy = true;
     try {
-      const s = await call('sessions.adopt', { worktreePath, conversation, account, cols: 120, rows: 32 });
+      const s = await call('sessions.adopt', { worktreePath, conversation, account, ...TERM_SIZE });
       m.close(s);
       await app.actions.focusSession(s.id);
     } catch (e) {

@@ -39,10 +39,17 @@ const RESERVED = new Set(['ctrl+c', 'ctrl+v', 'ctrl+x', 'ctrl+shift+c', 'ctrl+sh
 const DEFAULTS = Object.fromEntries(KEY_ACTIONS.map(([id, , key]) => [id, key]));
 const LABELS = Object.fromEntries(KEY_ACTIONS.map(([id, label]) => [id, label]));
 
+/** Modifiers in the order ctrl, alt, shift: settings can be edited by hand, in any order or case. */
+const norm = spec => {
+  const parts = spec.toLowerCase().split('+');
+  const key = parts.pop();
+  return [...['ctrl', 'alt', 'shift'].filter(m => parts.includes(m)), key].join('+');
+};
+
 /** The key an action has now: the user's choice, else the default. '' = none. */
 export function keyOf(id) {
   const o = store.settings.keybindings || {};
-  return typeof o[id] === 'string' ? o[id] : DEFAULTS[id] || '';
+  return typeof o[id] === 'string' ? norm(o[id]) : DEFAULTS[id] || '';
 }
 
 /** Settings → Keyboard shortcuts → "Use SkiffCode shortcuts". */
@@ -68,12 +75,6 @@ export async function setShortcutsOn(on) {
   await call('settings.set', { values: { shortcutsEnabled: on } });
 }
 
-const norm = spec => {
-  const parts = spec.toLowerCase().split('+');
-  const key = parts.pop();
-  return [...['ctrl', 'alt', 'shift'].filter(m => parts.includes(m)), key].join('+');
-};
-
 const NAMES = { arrowdown: '↓', arrowup: '↑', arrowleft: '←', arrowright: '→', space: 'Space', escape: 'Esc' };
 /** 'ctrl+shift+p' → 'Ctrl+Shift+P' */
 export function keyLabel(spec) {
@@ -90,7 +91,10 @@ export function keyLabel(spec) {
 /** A key press → { spec } in the form isKey() matches, { error }, or null for a lone modifier. */
 function specFromEvent(e) {
   if (['Control', 'Alt', 'Shift', 'Meta', 'AltGraph', 'CapsLock'].includes(e.key)) return null;
-  if (!(e.ctrlKey || e.metaKey || e.altKey)) return { error: 'Use Ctrl or Alt with the key, so typing still works.' };
+  if (!(e.ctrlKey || e.metaKey || e.altKey)) {
+    if (e.key === 'F12') return { error: 'F12 is reserved for go to definition.' };
+    if (!/^F(?:[1-9]|1[0-2])$/.test(e.key)) return { error: 'Use Ctrl or Alt with the key, so typing still works.' };
+  }
   let key;
   // Letters and digits by physical key: with Shift or Alt, e.key can be another character.
   if (/^Key[A-Z]$/.test(e.code)) key = e.code.slice(3).toLowerCase();
@@ -119,7 +123,7 @@ export function keybindingsDialog() {
     const taken = [];
     if (spec) {
       for (const [other] of KEY_ACTIONS) {
-        if (other !== id && keys[other] && norm(keys[other]) === norm(spec)) {
+        if (other !== id && keys[other] === spec) {
           keys[other] = '';
           taken.push(LABELS[other]);
         }

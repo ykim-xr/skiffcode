@@ -3,7 +3,7 @@
 import { h, icon, clear } from './util.js';
 import { call, on } from './rpc.js';
 import { store, notify } from './store.js';
-import { toast, promptDialog, confirmDialog, isTopModal } from './dialogs.js';
+import { toast, promptDialog, confirmDialog, modal } from './dialogs.js';
 
 on('usage', u => {
   store.usage = u;
@@ -11,11 +11,11 @@ on('usage', u => {
 });
 
 export function activeAccount() {
-  return (store.accounts || []).find(a => a.id === store.activeAccount) || (store.accounts || [])[0];
+  return store.accounts.find(a => a.id === store.activeAccount) || store.accounts[0];
 }
 
 export function accountName(id) {
-  const a = (store.accounts || []).find(x => x.id === (id || 'default'));
+  const a = store.accounts.find(x => x.id === (id || 'default'));
   return a ? a.name : 'Default';
 }
 
@@ -60,7 +60,7 @@ export function usageItem() {
   const u = (store.usage || {})[a ? a.id : 'default'];
   const five = live(u && u.fiveHour);
   const week = live(u && u.weekly);
-  const multi = (store.accounts || []).length > 1;
+  const multi = store.accounts.length > 1;
   const tip = [
     `Claude account: ${a ? a.name : 'Default'}`,
     five ? `5-hour: ${Math.round(five.used)}% used, ${resetText(five.resetsAt)}` : '5-hour: not reported yet',
@@ -79,28 +79,20 @@ export function usageItem() {
 
 /** The account panel. */
 export async function accountsDialog() {
-  const back = h('div.modal-back');
   const body = h('div.accounts-list');
-  const box = h('div.modal.accounts-modal',
+  const m = modal([
     h('div.modal-title', 'Claude accounts'),
     h('div.modal-detail.muted', 'New sessions use the selected account. Running sessions keep the account they started with. Each account is its own Claude login (CLAUDE_CONFIG_DIR).'),
     body,
     h('div.modal-buttons',
       h('button.btn', { onclick: addAccount }, icon('plus'), 'Add account…'),
-      h('button.btn.primary', { onclick: () => close() }, 'Done')));
-  back.append(box);
-  const key = e => { if (e.key === 'Escape' && isTopModal(back)) { e.preventDefault(); close(); } };
-  document.addEventListener('keydown', key, true);
-  back.addEventListener('mousedown', e => e.target === back && close());
-  function close() {
-    back.remove();
-    document.removeEventListener('keydown', key, true);
-  }
-  document.getElementById('overlay').append(back);
+      h('button.btn.primary', { onclick: () => m.close() }, 'Done')),
+  ]);
+  m.box.classList.add('accounts-modal');
 
   let status = {};
   const render = () => {
-    clear(body, (store.accounts || []).map(a => {
+    clear(body, store.accounts.map(a => {
       const st = status[a.id];
       const u = (store.usage || {})[a.id];
       const five = live(u && u.fiveHour);
@@ -142,7 +134,7 @@ export async function accountsDialog() {
   async function login(a) {
     if (!store.active) return toast('Open a worktree first — the sign-in runs in a tab there.', { kind: 'warn' });
     const s = await call('accounts.login', { id: a.id, worktreePath: store.active });
-    close();
+    m.close();
     const ws = window.skiffcode.workspaces.get(store.active);
     for (let i = 0; i < 40 && !store.sessions.some(x => x.id === s.id); i++) await new Promise(r => setTimeout(r, 50));
     if (ws) ws.openSession(s.id);
@@ -162,7 +154,7 @@ export async function accountsDialog() {
     render();
   }
   async function remove(a) {
-    const v = await confirmDialog({ title: `Remove “${a.name}” from SkiffCode?`, detail: `Its folder stays on disk: ${a.dir}`, buttons: [{ label: 'Remove', value: 'yes', danger: true }] });
+    const v = await confirmDialog({ title: `Remove “${a.name}” from SkiffCode?`, detail: 'It is signed out on this machine. Its conversations and settings are kept.', buttons: [{ label: 'Remove', value: 'yes', danger: true }] });
     if (v !== 'yes') return;
     try {
       await call('accounts.remove', { id: a.id });
@@ -175,7 +167,7 @@ export async function accountsDialog() {
     if (!name) return;
     try {
       const a = await call('accounts.add', { name, share: true });
-      for (let i = 0; i < 20 && !(store.accounts || []).some(x => x.id === a.id); i++) await new Promise(r => setTimeout(r, 50));
+      for (let i = 0; i < 20 && !store.accounts.some(x => x.id === a.id); i++) await new Promise(r => setTimeout(r, 50));
       status[a.id] = { loggedIn: false };
       render();
       await login(a);
@@ -184,6 +176,6 @@ export async function accountsDialog() {
     }
   }
   const off = on('state', () => setTimeout(render, 0));
-  const obs = new MutationObserver(() => { if (!back.isConnected) { off(); obs.disconnect(); } });
+  const obs = new MutationObserver(() => { if (!m.box.isConnected) { off(); obs.disconnect(); } });
   obs.observe(document.getElementById('overlay'), { childList: true });
 }

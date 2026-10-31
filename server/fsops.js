@@ -2,14 +2,57 @@
 // File tree, read/write and lightweight watching for the open worktree.
 const fs = require('fs');
 const path = require('path');
-const { run, within, safeToDelete } = require('./util');
+const { run, within, safeToDelete, realpath, isGitDir } = require('./util');
 
 const MAX_EDIT_SIZE = 8 * 1024 * 1024;
 const HIDDEN = new Set(['.git']);
 
-function guard(root, p) {
+let linkRoots = () => [];
+/** Where symlinks may lead: every repo and worktree SkiffCode knows (a function returning real paths). */
+function setLinkRoots(fn) {
+  linkRoots = fn;
+}
+
+/**
+ * Where a path really leads, even when its tail doesn't exist yet: the existing part is resolved,
+ * and dangling links are followed to the target they would create. null for a link loop.
+ */
+function realTarget(p) {
+  const rest = [];
+  let cur = p;
+  for (let hops = 0; hops < 40;) {
+    let st;
+    try {
+      st = fs.lstatSync(cur);
+    } catch {
+      const up = path.dirname(cur);
+      if (up === cur) return path.join(cur, ...rest);
+      rest.unshift(path.basename(cur));
+      cur = up;
+      continue;
+    }
+    try {
+      return path.join(fs.realpathSync(cur), ...rest);
+    } catch (e) {
+      if (!st.isSymbolicLink()) throw e;
+    }
+    cur = path.resolve(fs.realpathSync(path.dirname(cur)), fs.readlinkSync(cur));
+    hops++;
+  }
+  return null;
+}
+
+/** Does `abs` (inside `root`) really lead inside `root` or another known folder? noFollow: judge a link itself, not its target. */
+function realInside(root, abs, noFollow = false) {
+  const real = noFollow ? (r => r && path.join(r, path.basename(abs)))(realTarget(path.dirname(abs))) : realTarget(abs);
+  return !!real && [realpath(root), ...linkRoots()].some(r => within(r, real));
+}
+
+/** The path of `p` in `root`, as given (not resolved), so watch keys and change events match the client's paths. */
+function guard(root, p, { noFollow = false } = {}) {
   const abs = path.resolve(root, p);
   if (!within(root, abs)) throw new Error('Path is outside the worktree');
+  if (abs !== path.resolve(root) && !realInside(root, abs, noFollow)) throw new Error('That link leads outside the folders SkiffCode knows');
   return abs;
 }
 
@@ -30,15 +73,13 @@ async function list(root, rel = '') {
       }
       return { name: d.name, path: path.posix.join(rel.split(path.sep).join('/'), d.name), type };
     });
-  if (entries.length && fs.existsSync(path.join(root, '.git'))) {
-    try {
-      const out = await run('git', ['check-ignore', '--stdin', '-z'], {
-        cwd: root,
-        input: entries.map(e => (e.type === 'dir' ? e.path + '/' : e.path)).join('\0'),
-      }).catch(e => e.stdout || '');
-      const ignored = new Set(out.split('\0').filter(Boolean).map(p => p.replace(/\/$/, '')));
-      for (const e of entries) if (ignored.has(e.path)) e.ignored = true;
-    } catch { /* not a git dir */ }
+  if (entries.length && isGitDir(root)) {
+    const out = await run('git', ['check-ignore', '--stdin', '-z'], {
+      cwd: root,
+      input: entries.map(e => (e.type === 'dir' ? e.path + '/' : e.path)).join('\0'),
+    }).catch(e => e.stdout || '');
+    const ignored = new Set(out.split('\0').filter(Boolean).map(p => p.replace(/\/$/, '')));
+    for (const e of entries) if (ignored.has(e.path)) e.ignored = true;
   }
   entries.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }) : a.type === 'dir' ? -1 : 1));
   return entries;
@@ -47,6 +88,7 @@ async function list(root, rel = '') {
 async function read(root, rel) {
   const abs = guard(root, rel);
   const st = await fs.promises.stat(abs);
+  if (!st.isFile()) throw new Error(`Not a file: ${rel}`);
   if (st.size > MAX_EDIT_SIZE) return { tooLarge: true, size: st.size, mtime: st.mtimeMs };
   const buf = await fs.promises.readFile(abs);
   const binary = buf.subarray(0, 8000).includes(0);
@@ -84,8 +126,8 @@ async function create(root, rel, type) {
 }
 
 async function rename(root, from, to) {
-  const a = guard(root, from);
-  const b = guard(root, to);
+  const a = guard(root, from, { noFollow: true });
+  const b = guard(root, to, { noFollow: true });
   if (fs.existsSync(b)) throw new Error(`${to} already exists`);
   await fs.promises.mkdir(path.dirname(b), { recursive: true });
   await fs.promises.rename(a, b);
@@ -107,7 +149,7 @@ async function upload(root, rel, base64, replace) {
 }
 
 async function remove(root, rel) {
-  const abs = guard(root, rel);
+  const abs = guard(root, rel, { noFollow: true });
   if (abs === path.resolve(root) || !safeToDelete(abs)) throw new Error('Refusing to delete that');
   await fs.promises.rm(abs, { recursive: true, force: true });
 }
@@ -141,9 +183,6 @@ class Watcher {
     try { e.w.close(); } catch { /* ignore */ }
     this.watchers.delete(abs);
   }
-  closeAll() {
-    for (const k of [...this.watchers.keys()]) this.drop(k);
-  }
 }
 
-module.exports = { list, read, write, create, rename, remove, upload, guard, Watcher };
+module.exports = { list, read, write, create, rename, remove, upload, guard, realInside, setLinkRoots, Watcher, MAX_UPLOAD };

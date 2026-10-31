@@ -5,6 +5,7 @@ const { EventEmitter } = require('events');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
+const { TERM_SIZE } = require('./util');
 
 const HOST = path.join(__dirname, 'ptyhost.py');
 
@@ -16,36 +17,52 @@ function frame(kind, payload) {
   return Buffer.concat([head, body]);
 }
 
-function pidAlive(pid) {
+/** Is `pid` a ptyhost.py serving `sock`? (A pid in a stale .pid file may since belong to anything.) */
+function isHost(pid, sock) {
   try {
-    process.kill(pid, 0);
-  } catch (e) {
-    return e.code === 'EPERM';
-  }
-  // A killed host whose parent is gone can linger as a zombie: that's dead too.
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3) !== 'Z';
-  } catch {
-    return true;
-  }
-}
-
-/** Is a host serving this socket? */
-function hostAlive(sock) {
-  try {
-    const [hostPid] = fs.readFileSync(sock + '.pid', 'utf8').trim().split(/\s+/).map(Number);
-    return !!hostPid && pidAlive(hostPid) && fs.existsSync(sock);
+    const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+    const i = args.findIndex(a => path.basename(a) === 'ptyhost.py');
+    return i !== -1 && args[i + 1] === sock;
   } catch {
     return false;
   }
 }
 
+function parentOf(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * The pids in a socket's .pid file ("hostPid childPid"), each only if it checks out: the host must be
+ * a ptyhost.py for this socket, the child a process that host started. 0 for anything else.
+ */
+function hostPids(sock) {
+  let host = 0, child = 0;
+  try {
+    [host, child] = fs.readFileSync(sock + '.pid', 'utf8').trim().split(/\s+/).map(n => (/^\d+$/.test(n) ? Number(n) : 0));
+  } catch { /* no host */ }
+  if (!host || !isHost(host, sock)) return { host: 0, child: 0 };
+  return { host, child: child && parentOf(child) === host ? child : 0 };
+}
+
+/** Is a host serving this socket? */
+function hostAlive(sock) {
+  return !!hostPids(sock).host && fs.existsSync(sock);
+}
+
+// TIOCSWINSZ takes 16-bit sizes.
+const dim = n => Math.min(65535, Math.max(2, n | 0));
+
 /** Start a detached host; resolves once its socket exists. */
-async function spawnHost({ sock, cols = 120, rows = 30, cwd, command, env }) {
+async function spawnHost({ sock, cols = TERM_SIZE.cols, rows = TERM_SIZE.rows, cwd, command, env }) {
   for (const f of [sock, sock + '.pid', sock + '.exit']) fs.rmSync(f, { force: true });
   const python = process.env.SKIFFCODE_PYTHON || 'python3';
-  const child = spawn(python, [HOST, sock, String(cols), String(rows), cwd, '--', ...command], {
+  const child = spawn(python, [HOST, sock, String(dim(cols)), String(dim(rows)), cwd, '--', ...command], {
     detached: true,
     stdio: 'ignore',
     cwd,
@@ -107,7 +124,7 @@ class PtyClient extends EventEmitter {
     if (!this.closed) this.s.write(frame('i', data));
   }
   resize(cols, rows) {
-    if (!this.closed) this.s.write(frame('r', `${Math.max(2, cols | 0)},${Math.max(2, rows | 0)}`));
+    if (!this.closed) this.s.write(frame('r', `${dim(cols)},${dim(rows)}`));
   }
   kill() {
     if (!this.closed) this.s.write(frame('k', ''));
@@ -118,4 +135,4 @@ class PtyClient extends EventEmitter {
   }
 }
 
-module.exports = { spawnHost, hostAlive, PtyClient };
+module.exports = { spawnHost, hostAlive, hostPids, isHost, PtyClient };

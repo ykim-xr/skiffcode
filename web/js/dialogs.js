@@ -4,7 +4,7 @@ import { h, icon, fuzzy, highlight } from './util.js';
 const layer = () => document.getElementById('overlay');
 
 /** Dialogs stack (Settings → Sounds): only the top one reacts to Escape. */
-export function isTopModal(back) {
+function isTopModal(back) {
   const open = layer().querySelectorAll('.modal-back');
   return open[open.length - 1] === back;
 }
@@ -13,9 +13,14 @@ export function modal(content, { onClose, wide } = {}) {
   const back = h('div.modal-back');
   const box = h(`div.modal${wide ? '.wide' : ''}`, content);
   back.append(box);
+  const before = document.activeElement;
   const close = v => {
     back.remove();
     document.removeEventListener('keydown', key, true);
+    // Back to where focus was, unless onClose moved it. Later than this key press: Enter would click a button focused now.
+    setTimeout(() => {
+      if (before && before.isConnected && document.activeElement === document.body) before.focus({ preventScroll: true });
+    }, 0);
     onClose && onClose(v);
   };
   const key = e => {
@@ -35,10 +40,11 @@ export function modal(content, { onClose, wide } = {}) {
 export function confirmDialog({ title, detail, buttons, typed }) {
   return new Promise(resolve => {
     let input;
+    const cancel = h('button.btn', { onclick: () => m.close(undefined) }, 'Cancel');
     const btns = buttons.map(b =>
       h(`button.btn${b.danger ? '.danger' : b.primary ? '.primary' : ''}`, {
         onclick: () => {
-          if (typed && b.value && b.value !== 'cancel' && input.value !== typed) {
+          if (typed && b.value && input.value !== typed) {
             input.classList.add('invalid');
             input.focus();
             return;
@@ -51,10 +57,12 @@ export function confirmDialog({ title, detail, buttons, typed }) {
       h('div.modal-title', title),
       detail ? h('div.modal-detail', detail) : null,
       typed ? h('div.modal-typed', h('label', `Type `, h('b', typed), ' to confirm'), (input = h('input.input', { placeholder: typed, spellcheck: 'false' }))) : null,
-      h('div.modal-buttons', h('button.btn', { onclick: () => m.close(undefined) }, 'Cancel'), ...btns),
+      h('div.modal-buttons', cancel, ...btns),
     ];
     const m = modal(content, { onClose: resolve });
-    setTimeout(() => (input || btns[btns.length - 1]).focus({ preventScroll: true }), 0); // a long dialog stays at its top
+    // Enter takes the last button, so a destructive one is not the one to focus
+    const focus = input || (buttons[buttons.length - 1].danger ? cancel : btns[btns.length - 1]);
+    setTimeout(() => focus.focus({ preventScroll: true }), 0); // a long dialog stays at its top
     if (input) input.addEventListener('keydown', e => e.key === 'Enter' && btns[btns.length - 1].click());
   });
 }
@@ -115,10 +123,11 @@ export function quickPick(source, { placeholder = '', title, matchDescription = 
       const q = input.value;
       const my = ++token;
       if (typeof source === 'function') {
-        items = await source(q);
+        const got = await source(q);
         if (my !== token) return;
+        items = got;
       }
-      if (!q || typeof source === 'function' && source.prefiltered) {
+      if (!q) {
         shown = items.slice(0, 500);
       } else {
         const scored = [];
@@ -156,6 +165,7 @@ export function quickPick(source, { placeholder = '', title, matchDescription = 
 }
 
 let menuEl;
+let menuOff;
 /** Context menu at a mouse event: items {label, icon, action, danger, separator, disabled} */
 export function contextMenu(e, items) {
   e.preventDefault();
@@ -178,10 +188,22 @@ export function contextMenu(e, items) {
   menuEl.style.left = Math.min(e.clientX, innerWidth - r.width - 4) + 'px';
   menuEl.style.top = Math.min(e.clientY, innerHeight - r.height - 4) + 'px';
   setTimeout(() => document.addEventListener('mousedown', closeMenu, { once: true }), 0);
+  const onKey = ev => { if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); closeMenu(); } };
+  const onScroll = ev => { if (!menuEl.contains(ev.target)) closeMenu(); };
+  document.addEventListener('keydown', onKey, true);
+  window.addEventListener('scroll', onScroll, true);
+  window.addEventListener('blur', closeMenu);
+  menuOff = () => {
+    document.removeEventListener('keydown', onKey, true);
+    window.removeEventListener('scroll', onScroll, true);
+    window.removeEventListener('blur', closeMenu);
+  };
 }
 export function closeMenu() {
   if (menuEl) menuEl.remove();
   menuEl = undefined;
+  if (menuOff) menuOff();
+  menuOff = undefined;
 }
 
 /** toast(text, {kind:'info'|'error'|'warn', actions:[{label, action}], timeout}) */
@@ -195,7 +217,7 @@ export function dismissToast(key) {
 export function toast(text, { kind = 'info', actions = [], timeout = 6000, icon: ic, key } = {}) {
   const box = document.getElementById('toasts');
   if (key && keyed.has(key)) keyed.get(key).remove();
-  const el = h(`div.toast.${kind}`,
+  const el = h(`div.toast.${kind}${timeout ? '' : '.sticky'}`,
     ic ? icon(ic) : null,
     h('div.toast-text', text),
     ...actions.map(a => h('button.btn.small', { onclick: () => { el.remove(); a.action(); } }, a.label)),
@@ -207,7 +229,10 @@ export function toast(text, { kind = 'info', actions = [], timeout = 6000, icon:
     new MutationObserver((_m, obs) => { if (!el.isConnected) { forget(); obs.disconnect(); } }).observe(box, { childList: true });
   }
   if (timeout) setTimeout(() => el.remove(), timeout);
-  while (box.children.length > 4) box.firstChild.remove();
+  while (box.children.length > 4) {
+    const old = [...box.children].find(c => c !== el && !c.classList.contains('sticky')) || box.firstChild; // a sticky one goes only when nothing else can
+    old.remove();
+  }
   return el;
 }
 

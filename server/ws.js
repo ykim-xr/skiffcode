@@ -13,6 +13,7 @@ class WsConnection extends EventEmitter {
     this.socket = socket;
     this.buf = Buffer.alloc(0);
     this.fragments = [];
+    this.fragBytes = 0;
     this.fragOpcode = 0;
     this.open = true;
     socket.setNoDelay(true);
@@ -72,15 +73,19 @@ class WsConnection extends EventEmitter {
     if (opcode === 0x9) return this.sendFrame(0xa, payload);
     if (opcode === 0xa) return;
     if (opcode === 0x0) {
+      this.fragBytes += payload.length;
+      if (this.fragBytes > MAX_MESSAGE) return this.close(1009);
       this.fragments.push(payload);
       if (!fin) return;
       const whole = Buffer.concat(this.fragments);
       this.fragments = [];
+      this.fragBytes = 0;
       return this.deliver(this.fragOpcode, whole);
     }
     if (!fin) {
       this.fragOpcode = opcode;
       this.fragments = [payload];
+      this.fragBytes = payload.length;
       return;
     }
     this.deliver(opcode, payload);

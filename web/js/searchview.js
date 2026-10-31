@@ -6,9 +6,11 @@ export class SearchView {
   constructor(ws) {
     this.ws = ws;
     this.opts = { caseSensitive: false, word: false, regex: false };
-    this.input = h('input.input', { placeholder: 'Search', spellcheck: 'false', oninput: debounce(() => this.run(), 250), onkeydown: e => e.key === 'Enter' && this.run() });
-    this.include = h('input.input.small', { placeholder: 'files to include (e.g. *.py, src/**)', spellcheck: 'false', oninput: debounce(() => this.run(), 400) });
-    this.exclude = h('input.input.small', { placeholder: 'files to exclude', spellcheck: 'false', oninput: debounce(() => this.run(), 400) });
+    // run() cancels the typing delays, so Enter does not search a second time
+    this.delays = [debounce(() => this.run(), 250), debounce(() => this.run(), 400), debounce(() => this.run(), 400)];
+    this.input = h('input.input', { placeholder: 'Search', spellcheck: 'false', oninput: this.delays[0], onkeydown: e => e.key === 'Enter' && this.run() });
+    this.include = h('input.input.small', { placeholder: 'files to include (e.g. *.py, src/**)', spellcheck: 'false', oninput: this.delays[1] });
+    this.exclude = h('input.input.small', { placeholder: 'files to exclude', spellcheck: 'false', oninput: this.delays[2] });
     const toggle = (k, label, title) => {
       const b = h('button.toggle', { title, onclick: () => { this.opts[k] = !this.opts[k]; b.classList.toggle('on', this.opts[k]); this.run(); } }, label);
       return b;
@@ -27,9 +29,11 @@ export class SearchView {
   }
 
   async run() {
+    for (const d of this.delays) d.cancel();
     const q = this.input.value;
     const my = (this.seq = (this.seq || 0) + 1);
     if (!q) {
+      this.found = null;
       clear(this.results);
       clear(this.summary);
       return;
@@ -38,22 +42,32 @@ export class SearchView {
     try {
       const r = await call('search.text', { root: this.ws.root, query: q, ...this.opts, include: this.include.value, exclude: this.exclude.value });
       if (my !== this.seq) return;
-      clear(this.summary, r.count ? `${r.count}${r.truncated ? '+' : ''} result${r.count === 1 ? '' : 's'} in ${r.results.length} file${r.results.length === 1 ? '' : 's'}` : 'No results');
-      clear(this.results, r.results.map(f => {
-        const open = !this.collapsed.has(f.file);
-        return h('div.search-file',
-          h('div.search-file-head', { onclick: () => { if (open) this.collapsed.add(f.file); else this.collapsed.delete(f.file); this.run(); } },
-            icon(open ? 'chevronDown' : 'chevronRight', 'twisty'), icon('file', 'file-type'), h('span.scm-name', basename(f.file)), h('span.scm-dir', dirname(f.file)), h('span.count-badge', String(f.matches.length))),
-          open ? f.matches.map(m => {
-            const pre = m.text.slice(Math.max(0, m.col - 1 - 40), m.col - 1);
-            const hit = m.text.slice(m.col - 1, m.col - 1 + m.len);
-            const post = m.text.slice(m.col - 1 + m.len, m.col - 1 + m.len + 120);
-            return h('div.search-hit', { title: `${f.file}:${m.line}`, onclick: () => this.ws.openFile(f.file, { line: m.line, col: m.col, len: m.len, preview: true }) },
-              h('span.search-line', String(m.line)), h('span.search-text', (m.col > 41 ? '…' : '') + pre.trimStart(), h('mark', hit), post));
-          }) : null);
-      }));
+      this.found = r;
+      this.show();
     } catch (e) {
-      if (my === this.seq) clear(this.summary, h('span.error', e.message));
+      if (my !== this.seq) return;
+      this.found = null;
+      clear(this.summary, h('span.error', e.message));
     }
+  }
+
+  /** Draw the results found last; folding a file only redraws. */
+  show() {
+    const r = this.found;
+    if (!r) return;
+    clear(this.summary, r.count ? `${r.count}${r.truncated ? '+' : ''} result${r.count === 1 ? '' : 's'} in ${r.results.length} file${r.results.length === 1 ? '' : 's'}` : 'No results');
+    clear(this.results, r.results.map(f => {
+      const open = !this.collapsed.has(f.file);
+      return h('div.search-file',
+        h('div.search-file-head', { onclick: () => { if (open) this.collapsed.add(f.file); else this.collapsed.delete(f.file); this.show(); } },
+          icon(open ? 'chevronDown' : 'chevronRight', 'twisty'), icon('file', 'file-type'), h('span.scm-name', basename(f.file)), h('span.scm-dir', dirname(f.file)), h('span.count-badge', String(f.matches.length))),
+        open ? f.matches.map(m => {
+          const pre = m.text.slice(Math.max(0, m.col - 1 - 40), m.col - 1);
+          const hit = m.text.slice(m.col - 1, m.col - 1 + m.len);
+          const post = m.text.slice(m.col - 1 + m.len, m.col - 1 + m.len + 120);
+          return h('div.search-hit', { title: `${f.file}:${m.line}`, onclick: () => this.ws.openFile(f.file, { line: m.line, col: m.col, len: m.len, preview: true }) },
+            h('span.search-line', String(m.line)), h('span.search-text', (m.col > 41 ? '…' : '') + pre.trimStart(), h('mark', hit), post));
+        }) : null);
+    }));
   }
 }

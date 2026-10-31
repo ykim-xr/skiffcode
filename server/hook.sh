@@ -2,17 +2,18 @@
 # SkiffCode status hook for Claude Code (passed with `claude --settings`).
 # Records the session state in $SKIFFCODE_STATUS_DIR/$SKIFFCODE_SESSION_ID.json.
 # Usage: hook.sh <working|question|permission|idle|ended|edited|agent> [prompt|start]
-# Sessions started by Harbor (SkiffCode's old name) still carry the old variable names.
-: "${SKIFFCODE_SESSION_ID:=$HARBOR_SESSION_ID}" "${SKIFFCODE_STATUS_DIR:=$HARBOR_STATUS_DIR}"
 if [ -z "$SKIFFCODE_SESSION_ID" ] || [ -z "$SKIFFCODE_STATUS_DIR" ] || [ ! -d "$SKIFFCODE_STATUS_DIR" ]; then
   cat >/dev/null 2>&1; exit 0
 fi
 d="$SKIFFCODE_STATUS_DIR"; id="$SKIFFCODE_SESSION_ID"
 if [ "$1" = agent ]; then
   # Subagent events: keep the hook input (one line each) for SkiffCode's subagent list.
-  # One write per event (parallel subagents start at the same moment).
-  line=$(tr -d '\r\n' | { head -c 65536; cat >/dev/null; })
-  printf '%s\t%s\n' "$(date +%s)" "$line" >>"$d/$id.agents" 2>/dev/null
+  # Parallel subagents start at the same moment, and printf may write a long line in pieces:
+  # build the line in a file, then append it with a single write (cat, under its 128 KB buffer).
+  tmp="$d/.$id.agents.$$"
+  { printf '%s\t' "$(date +%s)"; tr -d '\r\n' | { head -c 65536; cat >/dev/null; }; printf '\n'; } >"$tmp" 2>/dev/null &&
+    cat "$tmp" >>"$d/$id.agents" 2>/dev/null
+  rm -f "$tmp"
   exit 0
 fi
 cat >/dev/null 2>&1

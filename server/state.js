@@ -18,14 +18,28 @@ class State extends EventEmitter {
   }
 
   load() {
+    let text;
     try {
-      const d = JSON.parse(fs.readFileSync(this.file, 'utf8'));
-      if (d && d.version === 3) return { ...EMPTY(), ...d };
-      if (d && d.version === 2) {
-        // SkiffCode 0.2 (VS Code extension): keep repos and groups.
-        return { ...EMPTY(), groups: d.groups || [], repos: (d.repos || []).map(r => ({ path: r.path, name: r.name, group: r.group })), worktrees: d.worktrees || {} };
-      }
-    } catch { /* new */ }
+      text = fs.readFileSync(this.file, 'utf8');
+    } catch (e) {
+      if (e.code === 'ENOENT') return EMPTY(); // a new install
+      throw e;
+    }
+    let d;
+    try { d = JSON.parse(text); } catch { /* kept aside below */ }
+    if (d && d.version === 3) return { ...EMPTY(), ...d };
+    if (d && d.version === 2) {
+      // SkiffCode 0.2 (VS Code extension): keep repos and groups.
+      return { ...EMPTY(), groups: d.groups || [], repos: (d.repos || []).map(r => ({ path: r.path, name: r.name, group: r.group })), worktrees: d.worktrees || {} };
+    }
+    if (d && typeof d.version === 'number' && d.version > 3) {
+      // Written by a newer SkiffCode: starting empty would overwrite it.
+      console.error(`skiffcode: ${this.file} is from a newer SkiffCode (version ${d.version}). Update with: skiffcode update. Nothing was changed.`);
+      process.exit(1);
+    }
+    const bad = `${this.file}.bad-${Date.now()}`;
+    fs.copyFileSync(this.file, bad);
+    console.error(`skiffcode: ${this.file} could not be read. It was kept as ${bad}; starting with an empty sidebar.`);
     return EMPTY();
   }
 

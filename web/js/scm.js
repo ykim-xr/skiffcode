@@ -1,7 +1,7 @@
 // Right panel: Source Control for this worktree — stage/unstage/discard,
 // commit, push/pull, changes vs base, commits on this branch, and the full
 // commit history of HEAD in a resizable pane below.
-import { h, icon, clear, basename, dirname, relTime, STATUS_LETTER, STATUS_LABEL } from './util.js';
+import { h, icon, clear, basename, dirname, relTime, readStored, dirtyCount, STATUS_LETTER, STATUS_LABEL } from './util.js';
 import { call, on } from './rpc.js';
 import { store, loadStatus } from './store.js';
 import { confirmDialog, toast, outputDialog, contextMenu } from './dialogs.js';
@@ -40,8 +40,8 @@ export class ScmView {
     this.el.append(
       h('div.view-toolbar',
         h('span.view-title', 'Source control'),
-        h('button.icon-btn', { title: 'Pull', onclick: () => this.sync('pull') }, icon('pull')),
-        h('button.icon-btn', { title: 'Push', onclick: () => this.sync('push') }, icon('push')),
+        h('button.icon-btn.scm-sync', { title: 'Pull', onclick: () => this.sync('pull') }, icon('pull')),
+        h('button.icon-btn.scm-sync', { title: 'Push', onclick: () => this.sync('push') }, icon('push')),
         h('button.icon-btn', { title: 'Refresh', onclick: () => this.refresh() }, icon('refresh'))),
       h('div.scm-top',
         this.header,
@@ -57,7 +57,7 @@ export class ScmView {
     this.historyFrac = savedHistoryFrac();
     this.historyEl.style.height = `${this.historyFrac * 100}%`;
     this.hist = { commits: [], more: false };
-    this.collapsed = new Set(JSON.parse(localStorage.getItem('skiffcode.scmCollapsed') || '[]'));
+    this.collapsed = new Set(readStored('skiffcode.scmCollapsed', [], v => { const a = JSON.parse(v); return Array.isArray(a) ? a : []; }));
     this.sel = { section: null, paths: new Set() }; // multi-select lives in one section
     this.anchor = null; // last row clicked without Shift: { section, path }
     this.sectionPaths = {}; // section id -> file paths in display order
@@ -71,7 +71,9 @@ export class ScmView {
     this.badge.classList.toggle('hidden', !n);
   }
 
+  /** Git changes are followed only while this view is on screen; showing it again refreshes. */
   refreshSoon() {
+    if (this.el.classList.contains('hidden') || this.ws.el.classList.contains('hidden')) return;
     clearTimeout(this.t);
     this.t = setTimeout(() => this.refresh(), 150);
   }
@@ -88,7 +90,7 @@ export class ScmView {
       ]);
       this.status = s;
       this.hist = hist;
-      this.setCount(s.staged.length + s.changes.length + s.untracked.length + s.conflicts.length);
+      this.setCount(dirtyCount(s));
       this.render(s, commits, st || store.status.get(root));
     } catch (e) {
       clear(this.body, h('div.error.pad', e.message));
@@ -213,7 +215,7 @@ export class ScmView {
     if (this.collapsed.has(id)) this.collapsed.delete(id);
     else this.collapsed.add(id);
     localStorage.setItem('skiffcode.scmCollapsed', JSON.stringify([...this.collapsed]));
-    this.refresh();
+    this.rerender();
   }
 
   section(id, title, files, kind, actions = []) {
@@ -242,7 +244,7 @@ export class ScmView {
     if (info.error) return [row, h('div.error.commit-file.pad-s', info.error)];
     if (!info.files.length) return [row, h('div.muted.commit-file.pad-s', 'No file changes.')];
     return [row, ...info.files.map(f => {
-      const letter = f.status === '?' ? 'U' : f.status;
+      const letter = STATUS_LETTER(f.status);
       return h(`div.scm-item.commit-file.g-${letter}`, {
         title: `${f.path}${f.oldPath ? ` (from ${f.oldPath})` : ''} — ${STATUS_LABEL[f.status] || f.status} in ${c.short}`,
         onclick: () => this.openCommitFile(c, info, f),
@@ -310,13 +312,13 @@ export class ScmView {
     } else {
       this.sel = { section: sectionId, paths: new Set([f.path]) };
       this.anchor = { section: sectionId, path: f.path };
-      this.openDiff(f, staged);
+      this.openDiff(f, staged, sectionId === 'conflicts');
     }
     this.rerender();
   }
 
   fileRow(f, kind, sectionId) {
-    const letter = f.status === '?' ? 'U' : f.status;
+    const letter = STATUS_LETTER(f.status);
     const staged = kind === 'staged';
     const conflict = kind === 'conflict'; // git restore refuses unmerged files, so no Discard
     const picked = this.sel.section === sectionId && this.sel.paths.has(f.path);
@@ -333,7 +335,7 @@ export class ScmView {
         const t = this.targets(sectionId, f);
         const many = t.length > 1 ? ` ${t.length} files` : '';
         contextMenu(e, [
-          { label: 'Open diff', icon: 'diff', action: () => this.openDiff(f, staged) },
+          { label: 'Open diff', icon: 'diff', action: () => this.openDiff(f, staged, conflict) },
           f.status !== 'D' ? { label: 'Open file', icon: 'file', action: () => this.ws.openFile(f.path) } : null,
           { separator: true },
           staged ? { label: `Unstage${many}`, action: () => this.run('git.unstage', t) } : { label: `Stage${many}`, action: () => this.stage(t, conflict) },
@@ -353,9 +355,11 @@ export class ScmView {
     h('span.git-letter', STATUS_LETTER(f.status)));
   }
 
-  /** Working changes: index ↔ your file (editable). Staged: HEAD ↔ index (read-only). */
-  openDiff(f, staged) {
-    if (staged) {
+  /** Working changes: index ↔ your file (editable). Staged: HEAD ↔ index (read-only). Conflicted: HEAD ↔ your file (the index has no stage 0 to compare). */
+  openDiff(f, staged, conflict = false) {
+    if (conflict) {
+      this.ws.openDiff({ path: f.path, left: { ref: 'HEAD' }, right: 'live', label: 'Conflict' });
+    } else if (staged) {
       this.ws.openDiff({ path: f.path, oldPath: f.oldPath, left: f.status === 'A' ? null : { ref: 'HEAD' }, right: f.status === 'D' ? null : { ref: ':0' }, label: 'Staged' });
     } else {
       const untracked = f.status === '?';

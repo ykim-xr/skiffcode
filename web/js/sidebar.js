@@ -6,21 +6,6 @@ import { contextMenu } from './dialogs.js';
 import { keyHint, withKey } from './keybindings.js';
 import { customizeDialog, entryIcon } from './customize-dialog.js';
 
-export const STATE_ICON = {
-  running: ['terminal', 'st-running'],
-  starting: ['sync', 'st-starting spin'],
-  working: ['sync', 'st-working spin'],
-  question: ['question', 'st-question'],
-  permission: ['shield', 'st-permission'],
-  idle: ['check', 'st-idle'],
-  ended: ['circle', 'st-ended'],
-};
-/** Claude sessions use the Claude mark, colored (and spinning while working) by state. */
-export function claudeIcon(state, extra = '') {
-  const [, cls] = STATE_ICON[state] || STATE_ICON.ended;
-  return icon('claude', `${cls} ${extra}`.trim());
-}
-
 /**
  * The icon for a session, everywhere (sidebar, Active panel, tabs, jump list).
  * Claude: waiting for you (? / shield) › working (orange, spinning) › a command it started
@@ -102,7 +87,7 @@ function render() {
 export function visibleAgents(s) {
   return (s.agents || []).filter(a => a.state === 'running');
 }
-const runningAgents = s => (s.agents || []).filter(a => a.state === 'running').length;
+const runningAgents = s => visibleAgents(s).length;
 
 function activePanel() {
   const active = store.sessions.filter(s => isClaude(s) && (needsYou(s.state) || s.state === 'working' || s.state === 'starting' || runningAgents(s) || (s.command && s.state !== 'ended')));
@@ -343,15 +328,15 @@ function sessionRow(s, depth, agentsKey) {
 function startDrag(e, item) {
   drag = item;
   e.dataTransfer.effectAllowed = 'move';
-  e.dataTransfer.setData('text/plain', JSON.stringify(item));
+  e.dataTransfer.setData('application/x-skiffcode-sidebar', JSON.stringify(item)); // not text/plain: a terminal would paste it
   e.stopPropagation();
 }
 
 function overRow(e, row, target) {
   if (!drag) return;
-  e.preventDefault();
   e.stopPropagation();
-  if (drag.kind === 'group' && target.kind !== 'group') return;
+  if (drag.kind === 'group' && target.kind !== 'group') return; // no drop here
+  e.preventDefault();
   const r = row.getBoundingClientRect();
   const y = e.clientY - r.top;
   const mode = target.kind === 'group' && drag.kind === 'repo' ? 'into' : y > r.height / 2 ? 'after' : 'before';

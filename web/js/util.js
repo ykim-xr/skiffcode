@@ -18,7 +18,6 @@ export function h(tag, attrs, ...children) {
     else if (k === 'class') el.className += ' ' + v;
     else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
     else if (k === 'dataset') Object.assign(el.dataset, v);
-    else if (k === 'html') el.innerHTML = v;
     else if (v === true) el.setAttribute(k, '');
     else el.setAttribute(k, v);
   }
@@ -93,10 +92,8 @@ const P = {
   unmute: 'M2.5 6h2.5L8.5 3v10L5 10H2.5zM11 5.5a3.5 3.5 0 0 1 0 5M12.5 3.5a6.5 6.5 0 0 1 0 9',
   split: 'M2 3h12v10H2zM8 3v10',
   splitDown: 'M2 3h12v10H2zM2 8h12',
-  panel: 'M2 3h12v10H2zM2 9.5h12',
   keyboard: 'M1.5 4h13v8h-13zM4 6.5h1M7.5 6.5h1M11 6.5h1M4.5 9.5h7',
   gear: 'M8 10.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4zM8 1.5l1 1.8 2-.4.5 2 1.8 1-.9 1.8.9 1.8-1.8 1-.5 2-2-.4-1 1.8-1-1.8-2 .4-.5-2-1.8-1 .9-1.8-.9-1.8 1.8-1 .5-2 2 .4z',
-  more: 'M3.5 8h.01M8 8h.01M12.5 8h.01',
   group: 'M1.5 3.5h4l1 1.5h8v8h-13zM1.5 6.5h13',
   stop: 'M4 4h8v8H4z',
   play: 'M5 3l8 5-8 5z',
@@ -105,7 +102,6 @@ const P = {
   pull: 'M8 2.5V11M4.5 7.5 8 11l3.5-3.5M3 13.5h10',
   dot: 'M8 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4z',
   link: 'M6.5 9.5l3-3M5 7.5 3.5 9a2 2 0 0 0 3 3L8 10.5M11 8.5 12.5 7a2 2 0 0 0-3-3L8 5.5',
-  window: 'M2 3h12v10H2zM2 5.5h12',
   image: 'M2 2.5h12v11H2zM2 11l3.5-3.5 3 3 2-2 3.5 3.5M10.5 6.2a1.2 1.2 0 1 0 0-.01',
   eye: 'M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8zM8 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4z',
   external: 'M9.5 2.5h4v4M13.5 2.5 8 8M12 9.5v4H2.5V4h4',
@@ -126,10 +122,12 @@ export function icon(name, cls = '') {
 
 export function debounce(fn, ms) {
   let t;
-  return (...a) => {
+  const wrapped = (...a) => {
     clearTimeout(t);
     t = setTimeout(() => fn(...a), ms);
   };
+  wrapped.cancel = () => clearTimeout(t);
+  return wrapped;
 }
 
 export function relTime(ts) {
@@ -212,6 +210,18 @@ export function languageOf(p) {
 export const STATUS_LABEL = { A: 'Added', M: 'Modified', D: 'Deleted', R: 'Renamed', C: 'Copied', T: 'Type changed', U: 'Conflict', '?': 'Untracked' };
 export const STATUS_LETTER = s => (s === '?' ? 'U' : s);
 
-export function isMac() {
-  return /Mac/.test(navigator.platform);
+/** Files with changes in a git status: a staged file edited again counts once (same as the server's `dirty`). */
+export const dirtyCount = s => new Set([...s.staged, ...s.changes, ...s.untracked, ...s.conflicts].map(f => f.path)).size;
+
+/** Size of a new terminal until its view reports the real one (the server uses the same). */
+export const TERM_SIZE = { cols: 120, rows: 32 };
+
+/** Reads a saved setting. Blocked storage, a missing key or a value `parse` rejects all give `fallback`. */
+export function readStored(key, fallback = null, parse = v => v) {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? fallback : parse(v);
+  } catch {
+    return fallback;
+  }
 }

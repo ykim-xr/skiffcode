@@ -74,6 +74,25 @@ const G = {};
   page.on('pageerror', e => errors.push(e.message));
   page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
   const shot = name => page.screenshot({ path: path.join(SHOTS, `${name}.png`) });
+  /** Records RPC calls in window.__sent; window.__drop(msg) holds one back, window.__rewrite(msg) replaces one. Lasts until a reload. */
+  const spySend = () => page.evaluate(() => {
+    if (window.__spy) return;
+    window.__spy = true;
+    window.__sent = [];
+    const send = WebSocket.prototype.send;
+    WebSocket.prototype.send = function (d) {
+      window.__ws = this;
+      if (typeof d === 'string') {
+        let m;
+        try { m = JSON.parse(d); } catch { return send.call(this, d); }
+        if (window.__drop && window.__drop(m)) return;
+        const r = window.__rewrite && window.__rewrite(m);
+        if (r) d = JSON.stringify(r);
+        window.__sent.push(m);
+      }
+      return send.call(this, d);
+    };
+  });
 
   await page.goto(`http://localhost:${PORT}/?tkn=${token}`);
   await page.waitForSelector('#sidebar .sidebar-title', { timeout: 15000 });
@@ -104,10 +123,190 @@ const G = {};
     assert.match(await page.evaluate(() => window.skiffcode.active.activeTab.entry.model.getValue()), /def greet/);
     await page.evaluate(() => window.skiffcode.active.activeTab.entry.model.setValue('def greet(name):\n    return f"hi {name}"\n'));
     await page.waitForSelector('.workspace:not(.hidden) .tab.dirty');
+    // save() is called directly: the stub editor can't route Monaco's Ctrl+S context keys. Check the real key in a real browser.
     await page.evaluate(() => window.skiffcode.active.activeTab.save());
     await page.waitForFunction(() => !document.querySelector('.workspace:not(.hidden) .tab.dirty'));
     assert.match(fs.readFileSync(path.join(repo, 'src/app.py'), 'utf8'), /hi \{name\}/);
     assert.ok(!(await page.locator('.workspace:not(.hidden) .tab.preview').count()), 'editing pins a preview tab');
+  });
+
+  await step('files panel: an expanded folder is watched once; collapsing unwatches it and stops listing it', async () => {
+    const W = '.workspace:not(.hidden)';
+    await page.evaluate(() => {
+      window.__rpc = [];
+      const send = WebSocket.prototype.send;
+      WebSocket.prototype.send = function (d) {
+        if (typeof d === 'string') { try { window.__rpc.push(JSON.parse(d)); } catch { /* not JSON */ } }
+        return send.call(this, d);
+      };
+    });
+    const sent = method => page.evaluate(m => window.__rpc.filter(r => r.method === m && (r.params.path === 'src' || r.params.dir === 'src')).length, method);
+    const file = n => path.join(repo, 'src', n);
+    fs.writeFileSync(file('touch1.txt'), '1');
+    await page.waitForSelector(`${W} .file-row[data-path="src/touch1.txt"]`);
+    assert.ok(await sent('fs.list'), 'a change reloads the folder');
+    assert.equal(await sent('fs.watch'), 0, 'src was already watched: reloading does not watch it again');
+    await page.click(`${W} .file-row[data-path="src"]`);
+    await page.waitForFunction(() => window.__rpc.some(r => r.method === 'fs.unwatch' && r.params.path === 'src'));
+    assert.equal(await page.evaluate(() => window.skiffcode.active.files.children.has('src')), false, 'a collapsed folder keeps no listing');
+    const lists = await sent('fs.list');
+    fs.writeFileSync(file('touch2.txt'), '2');
+    await sleep(700);
+    assert.equal(await sent('fs.list'), lists, 'a collapsed folder is not listed again');
+    await page.click(`${W} .file-row[data-path="src"]`);
+    await page.waitForSelector(`${W} .file-row[data-path="src/touch2.txt"]`);
+    assert.equal(await sent('fs.watch'), 1, 'expanding it watches it again');
+    fs.rmSync(file('touch1.txt'));
+    fs.rmSync(file('touch2.txt'));
+    await page.waitForFunction(() => !document.querySelector('.workspace:not(.hidden) .file-row[data-path="src/touch2.txt"]'));
+  });
+
+
+  await step('renaming an open file with unsaved edits moves its tab and keeps the edits', async () => {
+    const W = '.workspace:not(.hidden)';
+    fs.writeFileSync(path.join(repo, 'src/notes.txt'), 'first\n');
+    await page.waitForSelector(`${W} .file-row[data-path="src/notes.txt"]`);
+    await page.click(`${W} .file-row[data-path="src/notes.txt"]`);
+    await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; return t && t.path === 'src/notes.txt' && t.editor; });
+    await page.evaluate(() => window.skiffcode.active.activeTab.entry.model.setValue('first\nunsaved\n'));
+    await page.click(`${W} .file-row[data-path="src/notes.txt"]`, { button: 'right' });
+    await page.click('.menu-item >> text=Rename…');
+    await page.fill('.modal .input', 'src/renamed.txt');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => window.skiffcode.active.activeTab.path === 'src/renamed.txt', null, { timeout: 5000 });
+    await sleep(500); // the file watcher reports the rename
+    const t = await page.evaluate(() => {
+      const t = window.skiffcode.active.activeTab;
+      return { text: t.entry.model.getValue(), uri: t.editor.getModel().uri.path, dirty: t.dirty(), banner: !t.banner.classList.contains('hidden'), title: t.pane.bar.querySelector('.tab.active .tab-title').textContent };
+    });
+    assert.equal(t.text, 'first\nunsaved\n');
+    assert.match(t.uri, /\/src\/renamed\.txt$/);
+    assert.equal(t.dirty, true, 'still unsaved');
+    assert.equal(t.banner, false, 'no "deleted on disk" banner');
+    assert.equal(t.title, 'renamed.txt');
+    await page.evaluate(() => window.skiffcode.active.activeTab.save());
+    assert.equal(fs.readFileSync(path.join(repo, 'src/renamed.txt'), 'utf8'), 'first\nunsaved\n');
+    assert.equal(fs.existsSync(path.join(repo, 'src/notes.txt')), false, 'the old file is not recreated');
+  });
+
+  await step('typing while a save is on its way leaves the file unsaved', async () => {
+    const dirty = await page.evaluate(async () => {
+      const t = window.skiffcode.active.activeTab;
+      t.entry.model.setValue('saved\n');
+      const saving = t.save();
+      t.entry.model.setValue('saved\ntyped meanwhile\n');
+      await saving;
+      return t.dirty();
+    });
+    assert.equal(dirty, true);
+    assert.equal(fs.readFileSync(path.join(repo, 'src/renamed.txt'), 'utf8'), 'saved\n');
+  });
+
+  await step('typing updates the tab in place (the tab bar is not rebuilt)', async () => {
+    const r = await page.evaluate(async () => {
+      const t = window.skiffcode.active.activeTab;
+      await t.save();
+      const el = t.pane.bar.querySelector('.tab.active');
+      t.entry.model.setValue('saved\nagain\n');
+      return { same: el.isConnected, dirty: el.classList.contains('dirty') };
+    });
+    assert.deepEqual(r, { same: true, dirty: true });
+  });
+
+  await step('pressing an inactive tab activates it without replacing it, so a drag can start', async () => {
+    const r = await page.evaluate(() => {
+      const bar = window.skiffcode.active.activeTab.pane.bar;
+      const el = [...bar.querySelectorAll('.tab')].find(x => !x.classList.contains('active'));
+      el.dispatchEvent(new MouseEvent('mousedown', { button: 0, bubbles: true }));
+      return { same: el.isConnected, active: el.classList.contains('active') };
+    });
+    assert.deepEqual(r, { same: true, active: true });
+  });
+
+  await step('closing an unsaved file with Don’t save drops the edits without reading the file again', async () => {
+    const W = '.workspace:not(.hidden)';
+    await spySend();
+    await page.click(`${W} .tab:has-text("renamed.txt")`);
+    await page.evaluate(() => { window.__sent.length = 0; });
+    await page.click(`${W} .tab.active:has-text("renamed.txt") .tab-close`);
+    await page.waitForSelector('.modal-title >> text=Save changes to renamed.txt?');
+    await page.click('.modal-buttons .btn.danger');
+    await page.waitForFunction(() => !window.skiffcode.active.allTabs().some(t => t.path === 'src/renamed.txt'));
+    await sleep(300);
+    assert.equal(await page.evaluate(() => window.__sent.filter(m => m.method === 'fs.read' && m.params.path === 'src/renamed.txt').length), 0);
+    assert.equal(fs.readFileSync(path.join(repo, 'src/renamed.txt'), 'utf8'), 'saved\ntyped meanwhile\n', 'the last save stays on disk');
+    fs.rmSync(path.join(repo, 'src/renamed.txt'));
+  });
+
+  const EXT = 'src/ext.txt';
+  const extPath = path.join(repo, EXT);
+  const extTab = `window.skiffcode.active.allTabs().find(t => t.path === 'src/ext.txt')`;
+  const extState = () => page.evaluate(`(() => { const t = ${extTab}; return { text: t.entry.model.getValue(), dirty: t.dirty(), banner: !t.banner.classList.contains('hidden') }; })()`);
+  const openExt = async text => {
+    fs.writeFileSync(extPath, text);
+    await page.evaluate(p => window.skiffcode.active.openFile(p), EXT);
+    await page.waitForFunction(`(() => { const t = ${extTab}; return t && t.entry && t.entry.model && t.editor; })()`);
+  };
+  const editExt = text => page.evaluate(`${extTab}.entry.model.setValue(${JSON.stringify(text)})`);
+  const closeExt = async () => { await page.evaluate(`window.skiffcode.active.closeTab(${extTab})`); fs.rmSync(extPath, { force: true }); };
+
+  await step('a file changed on disk: a clean editor reloads it; an edited one shows the banner and keeps your text', async () => {
+    const W = '.workspace:not(.hidden)';
+    await openExt('one\n');
+    fs.writeFileSync(extPath, 'two\n');
+    await page.waitForFunction(`${extTab}.entry.model.getValue() === 'two\\n'`);
+    assert.deepEqual(await extState(), { text: 'two\n', dirty: false, banner: false }, 'reloaded without a question');
+    await editExt('mine\n');
+    fs.writeFileSync(extPath, 'theirs\n');
+    await page.waitForSelector(`${W} .editor-banner:not(.hidden) >> text=changed on disk`);
+    assert.deepEqual(await extState(), { text: 'mine\n', dirty: true, banner: true }, 'your edits stay');
+    await page.click(`${W} .editor-banner .btn >> text=Load their version`);
+    await page.waitForFunction(`${extTab}.banner.classList.contains('hidden')`);
+    assert.deepEqual(await extState(), { text: 'theirs\n', dirty: false, banner: false });
+    await closeExt();
+  });
+
+  await step('saving a file that changed on disk asks: Overwrite with mine, or Load their version', async () => {
+    const W = '.workspace:not(.hidden)';
+    await openExt('base\n');
+    const saveAfterChange = async (mine, theirs) => {
+      await editExt(mine);
+      fs.writeFileSync(extPath, theirs);
+      await page.waitForSelector(`${W} .editor-banner:not(.hidden)`); // the editor knows; its saved time is still the old one
+      await page.evaluate(`void ${extTab}.save()`);
+      await page.waitForSelector('.modal-title >> text=src/ext.txt changed on disk');
+    };
+    await saveAfterChange('mine\n', 'theirs\n');
+    await page.click('.modal-buttons .btn >> text=Overwrite with mine');
+    await page.waitForFunction(`!${extTab}.dirty()`);
+    assert.equal(fs.readFileSync(extPath, 'utf8'), 'mine\n', 'their file is replaced');
+    assert.equal((await extState()).banner, false);
+    await saveAfterChange('mine two\n', 'theirs two\n');
+    await page.click('.modal-buttons .btn >> text=Load their version');
+    await page.waitForFunction(`${extTab}.entry.model.getValue() === 'theirs two\\n'`);
+    assert.deepEqual(await extState(), { text: 'theirs two\n', dirty: false, banner: false });
+    assert.equal(fs.readFileSync(extPath, 'utf8'), 'theirs two\n', 'their file is kept');
+    await closeExt();
+  });
+
+  await step('closing a file with unsaved edits: Cancel keeps the tab, Save writes the file then closes', async () => {
+    const W = '.workspace:not(.hidden)';
+    await openExt('kept\n');
+    await editExt('edited\n');
+    const close = async () => {
+      await page.click(`${W} .tab.active:has-text("ext.txt") .tab-close`);
+      await page.waitForSelector('.modal-title >> text=Save changes to ext.txt?');
+    };
+    await close();
+    await page.click('.modal-buttons .btn >> text=Cancel');
+    await page.waitForSelector('.modal-back', { state: 'detached' });
+    assert.deepEqual(await extState(), { text: 'edited\n', dirty: true, banner: false }, 'the tab and its edits stay');
+    assert.equal(fs.readFileSync(extPath, 'utf8'), 'kept\n', 'nothing written');
+    await close();
+    await page.click('.modal-buttons .btn.primary');
+    await page.waitForFunction(`!${extTab}`);
+    assert.equal(fs.readFileSync(extPath, 'utf8'), 'edited\n', 'saved on close');
+    fs.rmSync(extPath);
   });
 
   await step('source control: change shows up, stage, commit through the UI', async () => {
@@ -193,6 +392,10 @@ const G = {};
     await page.locator(conf).nth(1).waitFor();
     assert.equal(await page.locator(`${conf} button[title="Discard changes"]`).count(), 0, 'no Discard button');
     assert.equal(await page.locator(`${conf} button[title=Stage]`).count(), 2);
+    // a conflicted file's diff has our version on the left, not an empty side
+    await page.click(`${conf}:has-text("c1.txt")`);
+    await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; return t && t.kind === 'diff' && t.spec.path === 'c1.txt' && t.view.entry; });
+    assert.equal(await page.evaluate(() => window.skiffcode.active.activeTab.view.editor.getModel().original.getValue()), 'ours');
     await page.click(`${conf}:has-text("c1.txt")`, { button: 'right' });
     await page.waitForSelector('.menu-item span:text-is("Stage")');
     assert.equal(await page.locator('.menu-item:has-text("Discard")').count(), 0, 'no Discard in the menu');
@@ -201,9 +404,12 @@ const G = {};
     assert.equal(await page.locator(`${conf}.selected`).count(), 2);
     await page.hover(`${conf}:has-text("c2.txt")`);
     await page.click(`${conf}:has-text("c2.txt") button[title=Stage]`);
+    await spySend();
+    await page.evaluate(() => { window.__sent.length = 0; });
     await page.waitForSelector('.modal-title >> text=Mark 2 files as resolved?');
     await page.click('.modal .btn >> text=Cancel');
-    await sleep(300);
+    await page.waitForSelector('.modal-back', { state: 'detached' }); // the answer is handled; a stage call would be sent by now
+    assert.equal(await page.evaluate(() => window.__sent.filter(m => m.method === 'git.stage').length), 0, 'cancel sends no stage call');
     assert.equal(await page.locator(conf).count(), 2, 'cancel stages nothing');
     // one file: a single click, as before
     await page.click(`${conf}:has-text("c2.txt")`, { modifiers: ['Control'] });
@@ -218,7 +424,52 @@ const G = {};
     await page.waitForSelector(`${W} .scm-section-title:text-is("Merge conflicts")`, { state: 'detached' });
   });
 
+  await step('source control: Discard asks first; Cancel keeps the change, Discard restores one file, or several selected files', async () => {
+    const W = '.workspace:not(.hidden)';
+    const item = n => `${W} .scm-item:has-text("${n}")`;
+    const discardBtn = n => `${item(n)} button[title="Discard changes"]`;
+    await spySend();
+    fs.writeFileSync(path.join(repo, 'README.md'), 'line1\nedited\n');
+    await page.waitForSelector(item('README.md'));
+    await page.hover(item('README.md'));
+    await page.click(discardBtn('README.md'));
+    await page.waitForSelector('.modal-title >> text=Discard changes to README.md?');
+    await page.evaluate(() => { window.__sent.length = 0; });
+    await page.click('.modal .btn >> text=Cancel');
+    await page.waitForSelector('.modal-back', { state: 'detached' });
+    assert.equal(await page.evaluate(() => window.__sent.filter(m => m.method === 'git.discard').length), 0, 'Cancel sends no discard');
+    assert.equal(fs.readFileSync(path.join(repo, 'README.md'), 'utf8'), 'line1\nedited\n');
+    await page.hover(item('README.md'));
+    await page.click(discardBtn('README.md'));
+    await page.waitForSelector('.modal-title >> text=Discard changes to README.md?');
+    await page.click('.modal .btn.danger');
+    await page.waitForSelector(item('README.md'), { state: 'detached' });
+    assert.equal(fs.readFileSync(path.join(repo, 'README.md'), 'utf8'), 'line1\nline2\n', 'the file is back to its committed text');
+    // several: a changed file, another changed file and an untracked one, selected together
+    fs.writeFileSync(path.join(repo, 'README.md'), 'line1\nedited\n');
+    fs.writeFileSync(path.join(repo, 'src/site.css'), 'body { color: blue; }\n');
+    fs.writeFileSync(path.join(repo, 'discard-new.txt'), 'new');
+    await page.waitForSelector(item('discard-new.txt'));
+    await page.waitForSelector(item('site.css'));
+    await page.click(item('README.md'), { modifiers: ['Control'] });
+    await page.click(item('site.css'), { modifiers: ['Control'] });
+    await page.click(item('discard-new.txt'), { modifiers: ['Control'] });
+    assert.equal(await page.locator(`${W} .scm-item.selected`).count(), 3);
+    await page.hover(item('site.css'));
+    await page.click(discardBtn('site.css'));
+    await page.waitForSelector('.modal-title >> text=Discard changes to 3 files?');
+    await page.waitForSelector('.modal-detail >> text=1 untracked file will be deleted');
+    await page.click('.modal .btn.danger');
+    await page.waitForSelector(item('discard-new.txt'), { state: 'detached' });
+    await page.waitForSelector(item('site.css'), { state: 'detached' });
+    assert.equal(fs.readFileSync(path.join(repo, 'README.md'), 'utf8'), 'line1\nline2\n');
+    assert.equal(fs.readFileSync(path.join(repo, 'src/site.css'), 'utf8'), 'body { color: red; }\n');
+    assert.equal(fs.existsSync(path.join(repo, 'discard-new.txt')), false, 'the untracked file is deleted');
+    assert.equal(sh('git status --porcelain', repo).trim(), '', 'nothing left to commit');
+  });
+
   await step('settings open at the top, with Save focused', async () => {
+    await page.setViewportSize({ width: 1500, height: 600 }); // short enough that the dialog must scroll
     await page.click('.sb-item[title="Settings"]');
     await page.waitForSelector('.modal-title:text-is("Settings")');
     await page.waitForFunction(() => document.activeElement && document.activeElement.textContent === 'Save');
@@ -227,6 +478,7 @@ const G = {};
     assert.equal(m.top, 0);
     await page.keyboard.press('Escape');
     await page.waitForSelector('.modal-back', { state: 'detached' });
+    await page.setViewportSize({ width: 1500, height: 900 });
   });
 
   const keyRow = id => `.keys-modal .keys-row[data-id="${id}"]`;
@@ -234,6 +486,27 @@ const G = {};
   const sidebarHidden = () => page.evaluate(() => document.body.classList.contains('no-sidebar'));
   const termKey = init => page.evaluate(i => window.skiffcode.terminalKey(new KeyboardEvent('keydown', i)), init);
   const jumpTitle = () => page.getAttribute('.sidebar-actions button[title^="Jump to"]', 'title');
+
+
+  await step('settings: 0 minutes stays 0, quoted arguments keep their spaces, font size applies to open editors', async () => {
+    await page.click('.sb-item[title="Settings"]');
+    await page.waitForSelector('.modal-title:text-is("Settings")');
+    await page.fill('[data-key="unloadAfterMinutes"]', '0');
+    await page.fill('[data-key="claudeArgs"]', '--append-system-prompt "a b"');
+    await page.fill('[data-key="fontSize"]', '16');
+    await page.click('.modal-buttons .btn.primary');
+    const s = await prefsWhen(p => p.fontSize === 16);
+    assert.equal(s.unloadAfterMinutes, 0);
+    assert.deepEqual(s.claudeArgs, ['--append-system-prompt', 'a b']);
+    await page.waitForFunction(() => window.skiffcode.active.allTabs().some(t => t.kind === 'file' && t.editor && t.editor._opts.fontSize === 16), null, { timeout: 3000 });
+    await page.click('.sb-item[title="Settings"]');
+    await page.waitForSelector('.modal-title:text-is("Settings")');
+    assert.equal(await page.inputValue('[data-key="claudeArgs"]'), '--append-system-prompt "a b"');
+    assert.equal(await page.inputValue('[data-key="unloadAfterMinutes"]'), '0');
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('.modal-back', { state: 'detached' });
+    await page.evaluate(() => import('/js/rpc.js').then(r => r.call('settings.set', { values: { unloadAfterMinutes: 30, claudeArgs: [], fontSize: 13 } })).then(v => import('/js/store.js').then(m => { m.store.settings = v; })));
+  });
 
   await step('keyboard shortcuts: record keys (plain and reserved keys refused), take one from another action, apply at once', async () => {
     await page.click('.sb-item[title="Settings"]');
@@ -276,8 +549,12 @@ const G = {};
     await page.keyboard.press('Control+Alt+b');
     assert.equal(await sidebarHidden(), false);
     await page.keyboard.press('Control+Alt+j');
-    await sleep(200);
+    // keys are handled in order: once the sidebar key has toggled, the Jump key was handled too
+    await page.keyboard.press('Control+Alt+b');
+    assert.equal(await sidebarHidden(), true);
     assert.equal(await page.locator('.qp-input').count(), 0, 'Jump lost its key');
+    await page.keyboard.press('Control+Alt+b');
+    assert.equal(await sidebarHidden(), false);
     assert.deepEqual((await prefsWhen(p => p.keybindings?.toggleSidebar)).keybindings, { toggleSidebar: 'ctrl+alt+b', jump: '' });
   });
 
@@ -477,6 +754,22 @@ const G = {};
     console.log(`      switch took ${switchMs} ms (incl. clicks)`);
   });
 
+
+  await step('a command picked after switching worktrees acts on the worktree now shown', async () => {
+    const feat = await page.evaluate(() => window.skiffcode.active.root);
+    await page.evaluate(() => { for (const ws of window.skiffcode.workspaces.values()) ws.showRight('files'); });
+    await page.keyboard.press('Control+Shift+P');
+    await page.waitForSelector('.qp-input');
+    await page.evaluate(p => window.skiffcode.openWorktree(p), repo);
+    await page.waitForSelector('.wt-row.active >> text=main');
+    await page.fill('.qp-input', 'Show source control');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => window.skiffcode.active.rightView === 'scm', null, { timeout: 3000 });
+    assert.equal(await page.evaluate(p => window.skiffcode.workspaces.get(p).rightView, feat), 'files', 'the hidden worktree is left alone');
+    await page.evaluate(p => window.skiffcode.openWorktree(p), feat);
+    await page.waitForSelector('.wt-row.active >> text=feat/login');
+  });
+
   await step('a new terminal gets the full width of its pane right away (not a default size)', async () => {
     await page.click('.workspace:not(.hidden) .row-top .tabbar-actions button[title^="New shell"]');
     await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; return t && t.kind === 'session' && t.attached && t.session && t.session.kind === 'shell'; });
@@ -505,14 +798,45 @@ const G = {};
     });
   });
 
+
+  await step('a dropped connection: calls wait for the reconnect, terminals reattach without an "ended" banner, open files are watched again', async () => {
+    await spySend();
+    await page.evaluate(async () => {
+      await window.skiffcode.active.openFile('src/site.css');
+      window.__term = window.skiffcode.active.allTabs().find(t => t.kind === 'session' && t.attached && t.session && t.session.kind === 'shell');
+    });
+    const r = await page.evaluate(async () => {
+      const rpc = await import('/js/rpc.js');
+      const Real = window.WebSocket;
+      let refused = 2; // the first attempts close before they open
+      window.WebSocket = class extends Real { constructor(url) { super(refused-- > 0 ? 'ws://127.0.0.1:9/' : url); } };
+      window.__drop = m => m.method === 'term.open';
+      const t = window.__term;
+      void t.attach(); // its term.open is held back, then fails with the connection
+      await new Promise(res => { const off = rpc.on('close', () => { off(); res(); }); window.__ws.close(); });
+      window.__drop = null;
+      window.__sent.length = 0;
+      const out = await Promise.race([rpc.call('hello').then(() => 'answered'), new Promise(res => setTimeout(() => res('hung'), 10000))]);
+      window.WebSocket = Real;
+      return { out, ended: !!t.ended, banner: !t.banner.classList.contains('hidden') };
+    });
+    assert.deepEqual(r, { out: 'answered', ended: false, banner: false });
+    for (let i = errors.length - 1; i >= 0; i--) if (errors[i].includes('ws://127.0.0.1:9/')) errors.splice(i, 1); // the refused attempts above
+    await page.waitForFunction(() => window.__term.attached && !window.__term.ended, null, { timeout: 5000 });
+    await page.waitForFunction(() => window.__sent.some(m => m.method === 'fs.watch' && m.params.path === 'src/site.css'), null, { timeout: 5000 });
+    await page.evaluate(() => { const ws = window.skiffcode.active; ws.closeTab(ws.find(t => t.kind === 'file' && t.path === 'src/site.css')); });
+  });
+
   await step('in a terminal Ctrl+W goes to the program; Alt+W still closes the tab', async () => {
     assert.equal(await termKey({ key: 'w', code: 'KeyW', ctrlKey: true }), true, 'terminalKey passes Ctrl+W');
     await page.click('.workspace:not(.hidden) .tabbar-actions button[title^="New shell"]');
     await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; return t && t.session && t.session.kind === 'shell' && t.attached; });
     const id = await page.evaluate(() => { const t = window.skiffcode.active.activeTab; t.term.focus(); return t.sessionId; });
     const open = () => page.evaluate(i => window.skiffcode.active.allTabs().some(t => t.sessionId === i), id);
+    // a bubbling listener runs after the app's own key handlers, so seeing the key means it was handled
+    await page.evaluate(() => { window.__keyed = 0; window.addEventListener('keydown', () => window.__keyed++, { once: true }); });
     await page.keyboard.press('Control+w');
-    await sleep(300);
+    await page.waitForFunction(() => window.__keyed === 1);
     assert.equal(await page.locator('.modal-back').count(), 0, 'no close question');
     assert.equal(await open(), true, 'Ctrl+W in a terminal keeps the tab');
     await page.keyboard.press('Alt+w');
@@ -722,6 +1046,30 @@ const G = {};
     assert.ok(await page.evaluate(() => import('/js/store.js').then(m => m.store.sessions.some(x => x.kind === 'claude' && x.state !== 'ended'))), 'Claude kept running');
   });
 
+
+  await step('an unloaded worktree stops following git changes', async () => {
+    const feat = await page.evaluate(() => window.skiffcode.active.root);
+    const unloaded = await page.evaluate(p => {
+      const app = window.skiffcode;
+      window.__leak = 0;
+      app.workspaces.get(p).scm.refresh = () => { window.__leak++; };
+      app.unloadIdle(true);
+      return !app.workspaces.has(p);
+    }, repo);
+    assert.ok(unloaded, 'main was unloaded');
+    const seen = page.evaluate(p => import('/js/rpc.js').then(rpc => new Promise(res => {
+      const off = rpc.on('git.changed', e => { if (e.root === p) { off(); res(true); } });
+      setTimeout(() => res(false), 5000);
+    })), repo);
+    await sleep(100);
+    sh('touch .git/HEAD', repo);
+    assert.ok(await seen, 'git reported a change');
+    await sleep(400);
+    assert.equal(await page.evaluate(() => window.__leak), 0);
+    await page.evaluate(async ([a, b]) => { await window.skiffcode.openWorktree(a); await window.skiffcode.openWorktree(b); }, [repo, feat]);
+    await page.waitForSelector('.wt-row.active >> text=feat/login');
+  });
+
   await step('adding a repo with earlier Claude conversations offers them; resume one as a SkiffCode session', async () => {
     const third = path.join(tmp, 'code', 'third');
     fs.mkdirSync(third);
@@ -782,6 +1130,110 @@ const G = {};
     assert.equal(sides.left, 'line1\nline2\n', 'left = base version');
     assert.equal(sides.live, true, 'right side is the real (editable) file');
     await shot('04-review');
+  });
+
+
+  await step('review: switching files with unsaved edits asks first; Cancel stays, Save writes the file', async () => {
+    const W = '.workspace:not(.hidden)';
+    const wt = await page.evaluate(() => window.skiffcode.active.root);
+    await page.evaluate(() => { // only the review holds the file (an open editor tab would keep the edits)
+      const ws = window.skiffcode.active;
+      const ed = ws.find(t => t.kind === 'file' && t.path === 'README.md');
+      if (ed) ws.hideTab(ed);
+      ws.activeTab.view.entry.model.setValue('line1\nline2 edited in review\n');
+    });
+    await page.click(`${W} .review-file >> text=new.css`);
+    await page.waitForSelector('.modal-title >> text=Save changes to README.md?');
+    await page.click('.modal-buttons .btn >> text=Cancel');
+    await page.waitForSelector('.modal-back', { state: 'detached' });
+    await sleep(200);
+    assert.equal(await page.evaluate(() => window.skiffcode.active.activeTab.view.path), 'README.md', 'Cancel keeps the file');
+    await page.click(`${W} .review-file >> text=new.css`);
+    await page.waitForSelector('.modal-title >> text=Save changes to README.md?');
+    await page.click('.modal-buttons .btn.primary');
+    await page.waitForFunction(() => window.skiffcode.active.activeTab.view.path === 'new.css');
+    assert.equal(fs.readFileSync(path.join(wt, 'README.md'), 'utf8'), 'line1\nline2 edited in review\n');
+  });
+
+  await step('review: git versions of files it no longer shows are freed', async () => {
+    const freed = await page.evaluate(() => {
+      const t = window.skiffcode.active.activeTab;
+      return monaco.editor.getModel(monaco.Uri.from({ scheme: 'skiffcode-git', path: `${t.ws.root}/README.md`, query: t.from })) === null;
+    });
+    assert.ok(freed);
+  });
+
+  await step('review: a background change keeps a file with unsaved edits shown, without asking', async () => {
+    const W = '.workspace:not(.hidden)';
+    const wt = await page.evaluate(() => window.skiffcode.active.root);
+    await page.evaluate(() => window.skiffcode.active.activeTab.view.entry.model.setValue('.x{color:red}\n'));
+    fs.rmSync(path.join(wt, 'new.css'));
+    await page.waitForSelector(`${W} .review-file >> text=new.css`, { state: 'detached' });
+    await sleep(500);
+    assert.equal(await page.locator('.modal-back').count(), 0, 'no question');
+    const r = await page.evaluate(() => { const v = window.skiffcode.active.activeTab.view; return { path: v.path, text: v.entry && v.entry.model.getValue() }; });
+    assert.deepEqual(r, { path: 'new.css', text: '.x{color:red}\n' });
+  });
+
+  await step('review: closing it with unsaved edits asks first', async () => {
+    const close = '.workspace:not(.hidden) .tab.active:has-text("Review changes") .tab-close';
+    await page.click(close);
+    await page.waitForSelector('.modal-title >> text=Save changes to new.css?');
+    await page.click('.modal-buttons .btn >> text=Cancel');
+    await page.waitForSelector('.modal-back', { state: 'detached' });
+    assert.ok(await page.evaluate(() => window.skiffcode.active.allTabs().some(t => t.kind === 'review')), 'Cancel keeps the tab');
+    await page.click(close);
+    await page.click('.modal-buttons .btn.danger');
+    await page.waitForFunction(() => !window.skiffcode.active.allTabs().some(t => t.kind === 'review'));
+  });
+
+  await step('review: closed while it loads, it lets go of what it was opening', async () => {
+    const held = await page.evaluate(async () => {
+      const ws = window.skiffcode.active;
+      const t = ws.openReview();
+      ws.hideTab(t);
+      await new Promise(res => setTimeout(res, 1500));
+      return { entry: !!t.view.entry, tmp: (t.view.tmpModels || []).filter(m => !m.isDisposed()).length };
+    });
+    assert.deepEqual(held, { entry: false, tmp: 0 });
+  });
+
+  await step('opening the same diff again keeps its unsaved edits', async () => {
+    const r = await page.evaluate(async () => {
+      const ws = window.skiffcode.active;
+      const spec = { path: 'README.md', left: { ref: ':0' }, right: 'live', label: 'Working tree' };
+      const t = ws.openDiff(spec);
+      await t.ready;
+      t.view.entry.model.setValue('line1\nunsaved in diff\n');
+      const again = ws.openDiff(spec);
+      await again.ready;
+      const out = { same: again === t, text: again.view.entry.model.getValue() };
+      ws.hideTab(again);
+      return out;
+    });
+    assert.deepEqual(r, { same: true, text: 'line1\nunsaved in diff\n' });
+  });
+
+  await step('a failed worktree list keeps that repo’s open worktrees', async () => {
+    await spySend();
+    const feat = await page.evaluate(() => window.skiffcode.active.root);
+    const third = path.join(tmp, 'code', 'third');
+    const r = await page.evaluate(async ([repoPath, thirdPath, featPath]) => {
+      const { store, loadWorktrees } = await import('/js/store.js');
+      window.__rewrite = m => (m.method === 'worktrees.list' && m.params.repo === repoPath ? { ...m, method: 'worktrees.broken' } : null);
+      await loadWorktrees(repoPath);
+      window.__rewrite = null;
+      const failed = !!store.worktrees.get(repoPath).error;
+      await window.skiffcode.openWorktree(thirdPath);
+      return { failed, kept: window.skiffcode.workspaces.has(featPath) && window.skiffcode.workspaces.has(repoPath) };
+    }, [repo, third, feat]);
+    assert.deepEqual(r, { failed: true, kept: true });
+    await page.evaluate(async ([repoPath, featPath]) => {
+      const { loadWorktrees } = await import('/js/store.js');
+      await loadWorktrees(repoPath);
+      await window.skiffcode.openWorktree(featPath);
+    }, [repo, feat]);
+    await page.waitForSelector('.wt-row.active >> text=feat/login');
   });
 
   await step('search panel and quick open', async () => {
@@ -901,8 +1353,7 @@ const G = {};
     await page.evaluate(() => { window.__opened = []; window.__realOpen = window.open; window.open = (u, n) => { const w = { opener: 1, location: { href: '' }, close() {} }; window.__opened.push(w); return w; }; });
     await act(report, { button: 2 });
     await page.evaluate(([u, i]) => import('/js/viewers.js').then(m => m.openLink(window.skiffcode, u, { button: 2 })), [`${web}/ok`, id]);
-    await sleep(300);
-    assert.equal(await page.evaluate(() => window.__opened.length), 0, 'right-click doesn’t open links');
+    assert.equal(await page.evaluate(() => window.__opened.length), 0, 'right-click doesn’t open links'); // both calls above are synchronous
     await act(report, { ctrlKey: false });
     await page.waitForFunction(() => window.__opened.length && window.__opened[0].location.href);
     const href = await page.evaluate(() => { window.open = window.__realOpen; return window.__opened[0].location.href; });
@@ -912,6 +1363,8 @@ const G = {};
     // Ctrl+click: a preview inside SkiffCode, its CSS loading from next to it
     await act(report, { ctrlKey: true });
     await page.waitForSelector('.workspace:not(.hidden) .row-top .tab.active >> text=Preview index.html');
+    // the right-click came first and opens go through the same server calls in order, so it has had its chance by now
+    assert.equal(await page.evaluate(() => window.__opened.length), 1, 'only the plain click opened a window');
     const fr = page.frameLocator('.workspace:not(.hidden) .row-top .tab-body:not(.hidden) .viewer-html iframe');
     await fr.locator('#r', { hasText: 'coverage 93%' }).waitFor();
     assert.equal(await fr.locator('#r').evaluate(e => getComputedStyle(e).color), 'rgb(4, 5, 6)');
@@ -1045,8 +1498,9 @@ const G = {};
     const before = await page.evaluate(() => document.querySelector('.tree').scrollTop);
     assert.ok(before > 0);
     const rows = page.locator('.tree .session-row, .tree .wt-row');
+    await page.evaluate(() => { document.querySelector('.tree').dataset.old = '1'; });
     await rows.nth((await rows.count()) - 1).click();
-    await sleep(800);
+    await page.waitForFunction(() => !document.querySelector('.tree').dataset.old); // the sidebar was rebuilt
     const after = await page.evaluate(() => document.querySelector('.tree').scrollTop);
     assert.ok(Math.abs(after - before) < 30, `scroll kept (${before} → ${after})`);
     await page.setViewportSize({ width: 1500, height: 900 });
@@ -1088,6 +1542,595 @@ const G = {};
     assert.match(played[0].src, /\/sounds\/marimba\.wav$/);
     assert.ok(Math.abs(played[0].volume - 0.4) < 0.01);
     assert.match(played[1].src, /\/custom-sounds\/bloop-[0-9a-f]{6}\.wav$/);
+  });
+
+  // ---- UI behaviour fixes (review pass): each step sets up what it needs and does not depend on the one before
+  const resetUi = () => page.evaluate(() => { document.getElementById('overlay').replaceChildren(); document.getElementById('toasts').replaceChildren(); });
+  /** The main worktree, with no tabs open. */
+  const freshMain = async () => {
+    await resetUi();
+    await page.evaluate(async p => {
+      await window.skiffcode.openWorktree(p);
+      const ws = window.skiffcode.active;
+      for (const t of [...ws.allTabs()]) ws.hideTab(t);
+      ws.panelHidden = false;
+    }, repo);
+    await page.waitForFunction(p => { const ws = window.skiffcode.active; return ws && ws.root === p && !ws.allTabs().length; }, repo);
+  };
+  /** Dispatches drag events on the first element matching sel. Resolves to whether the last one was default-prevented. */
+  const dnd = (sel, types, { data = {}, at = [0.5, 0.5] } = {}) => page.evaluate(({ sel, types, data, at }) => {
+    const el = document.querySelector(sel);
+    const dt = new DataTransfer();
+    for (const [k, v] of Object.entries(data)) dt.setData(k, v);
+    const r = el.getBoundingClientRect();
+    const p = { clientX: r.left + r.width * at[0], clientY: r.top + r.height * at[1] };
+    let prevented = false;
+    for (const type of types) {
+      const ev = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt, ...p });
+      el.dispatchEvent(ev);
+      prevented = ev.defaultPrevented;
+    }
+    return prevented;
+  }, { sel, types, data, at });
+  const INTERNAL = 'application/x-skiffcode-path';
+
+  await step('tabs: a drag that ends without a drop is forgotten, so a later file drop opens the file', async () => {
+    const W = '.workspace:not(.hidden)';
+    await freshMain();
+    await page.evaluate(async () => { const ws = window.skiffcode.active; await ws.openFile('README.md'); await ws.openFile('src/app.py'); });
+    await page.evaluate(() => {
+      const el = window.skiffcode.active.top.panes[0].tabs[0].tabEl;
+      const dt = new DataTransfer();
+      el.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+      el.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: dt }));
+    });
+    assert.equal(await page.evaluate(() => window.skiffcode.active.dragTab || null), null);
+    const root = await page.evaluate(() => window.skiffcode.active.root);
+    await dnd(`${W} .row-top .pane-body`, ['dragenter', 'dragover', 'drop'], { data: { [INTERNAL]: JSON.stringify({ root, path: 'src/site.css', type: 'file' }) }, at: [0.4, 0.4] });
+    await page.waitForSelector(`${W} .row-top .tab.active >> text=site.css`);
+  });
+
+  await step('tabs: dropping a tab before a later one in the same pane puts it right before that tab', async () => {
+    await freshMain();
+    await page.evaluate(async () => { const ws = window.skiffcode.active; for (const p of ['README.md', 'src/app.py', 'src/site.css']) await ws.openFile(p); });
+    const order = () => page.evaluate(() => window.skiffcode.active.top.panes[0].tabs.map(t => t.path));
+    assert.deepEqual(await order(), ['README.md', 'src/app.py', 'src/site.css']);
+    await page.evaluate(() => {
+      const [a, , c] = window.skiffcode.active.top.panes[0].tabs;
+      const dt = new DataTransfer();
+      a.tabEl.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+      c.tabEl.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
+      c.tabEl.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+    });
+    assert.deepEqual(await order(), ['src/app.py', 'README.md', 'src/site.css']);
+  });
+
+  await step('tabs: dropping a tab on the right edge of a pane moves it to a new pane beside it', async () => {
+    const W = '.workspace:not(.hidden)';
+    await freshMain();
+    await page.evaluate(async () => { const ws = window.skiffcode.active; for (const p of ['README.md', 'src/app.py']) await ws.openFile(p); });
+    await page.evaluate(() => {
+      const dt = new DataTransfer();
+      window.skiffcode.active.top.panes[0].tabs[1].tabEl.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+    });
+    await dnd(`${W} .row-top .pane-body`, ['dragenter', 'dragover', 'drop'], { at: [0.9, 0.4] });
+    const panes = () => page.evaluate(() => window.skiffcode.active.top.panes.map(p => p.tabs.map(t => t.path)));
+    assert.deepEqual(await panes(), [['README.md'], ['src/app.py']]);
+    assert.equal(await page.evaluate(() => window.skiffcode.active.dragTab || null), null, 'the drag is over');
+  });
+
+  await step('the first Ctrl+Shift+` with no bottom panel opens a shell', async () => {
+    await freshMain();
+    assert.equal(await page.evaluate(() => window.skiffcode.active.bottom.panes.length), 0);
+    await page.evaluate(() => document.activeElement && document.activeElement.blur());
+    await page.keyboard.press('Control+Shift+Backquote');
+    await page.waitForFunction(() => { const ws = window.skiffcode.active; return ws.bottom.panes.length === 1 && ws.bottom.panes[0].tabs.some(t => t.session && t.session.kind === 'shell'); });
+    assert.equal(await page.evaluate(() => window.skiffcode.active.panelHidden), false);
+  });
+
+  await step('layout: the active tab is saved and restored by what it is, even when a tab is not saved or a session is gone', async () => {
+    await freshMain();
+    const r = await page.evaluate(async () => {
+      const app = window.skiffcode;
+      const ws = app.active;
+      const { Workspace } = await import('/js/workspace.js');
+      const { store } = await import('/js/store.js');
+      const temp = () => { const w = new Workspace(app, { path: ws.root, repo: { path: ws.repoPath } }); w.saveSoon = () => {}; return w; };
+      const a = temp();
+      a.openWeb(''); // a blank web tab is not saved
+      await a.openFile('README.md');
+      await a.openFile('src/app.py');
+      a.saveLayout();
+      const saved = store.layouts[ws.root].top[0];
+      a.dispose();
+      store.layouts[ws.root] = { v: 2, top: [{ tabs: [{ kind: 'session', id: 'gone' }, { kind: 'file', path: 'README.md' }, { kind: 'file', path: 'src/app.py' }], active: 2 }], bottom: [], expanded: [] };
+      const b = temp();
+      b.restore();
+      const active = b.activeTab && b.activeTab.path;
+      b.dispose();
+      ws.saveLayout();
+      return { saved: saved.tabs[saved.active], active };
+    });
+    assert.deepEqual(r.saved, { kind: 'file', path: 'src/app.py' });
+    assert.equal(r.active, 'src/app.py');
+  });
+
+  await step('tabs: Close others asks about unsaved files one at a time', async () => {
+    const W = '.workspace:not(.hidden)';
+    await freshMain();
+    await page.evaluate(async () => {
+      const ws = window.skiffcode.active;
+      for (const p of ['README.md', 'src/app.py', 'src/site.css']) await ws.openFile(p);
+      for (const t of ws.allTabs().slice(0, 2)) t.entry.model.setValue('changed\n');
+    });
+    await page.waitForFunction(() => document.querySelectorAll('.workspace:not(.hidden) .tab.dirty').length === 2);
+    await page.click(`${W} .tab:has-text("site.css")`, { button: 'right' });
+    await page.click('.menu-item >> text=Close others');
+    await page.waitForSelector('.modal-title');
+    await sleep(300);
+    assert.equal(await page.locator('.modal-back').count(), 1, 'one question at a time');
+    await page.click('.modal .btn >> text=Don’t save');
+    await page.waitForFunction(() => document.querySelectorAll('.workspace:not(.hidden) .tab').length === 2);
+    await page.waitForSelector('.modal-title');
+    assert.equal(await page.locator('.modal-back').count(), 1);
+    await page.click('.modal .btn >> text=Don’t save');
+    await page.waitForFunction(() => document.querySelectorAll('.workspace:not(.hidden) .tab').length === 1);
+    assert.equal(await page.locator(`${W} .tab-title`).first().textContent(), 'site.css');
+  });
+
+  await step('dialogs: focus goes back to where it was when a dialog closes', async () => {
+    await freshMain();
+    await page.evaluate(async () => { await window.skiffcode.active.openFile('README.md'); });
+    await page.evaluate(() => document.querySelector('.workspace:not(.hidden) .stub-editor').focus());
+    await page.keyboard.press('Control+p');
+    await page.waitForSelector('.qp-input');
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('.qp-input', { state: 'detached' });
+    await page.waitForFunction(() => document.activeElement.className === 'stub-editor');
+  });
+
+  await step('dialogs: Cancel is focused when the default button is destructive, Save stays the default', async () => {
+    await resetUi();
+    const focused = await page.evaluate(async () => {
+      const { confirmDialog } = await import('/js/dialogs.js');
+      const out = {};
+      const cases = {
+        danger: [{ label: 'Delete', value: 'y', danger: true }],
+        save: [{ label: 'Don’t save', value: 'd', danger: true }, { label: 'Save', value: 's', primary: true }],
+      };
+      for (const [k, buttons] of Object.entries(cases)) {
+        const p = confirmDialog({ title: k, buttons });
+        await new Promise(r => setTimeout(r, 50));
+        out[k] = document.activeElement.textContent;
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        await p;
+      }
+      return out;
+    });
+    assert.deepEqual(focused, { danger: 'Cancel', save: 'Save' });
+  });
+
+  await step('dialogs: a full toast stack drops the oldest toast that goes away by itself, not a sticky one', async () => {
+    await resetUi();
+    const texts = await page.evaluate(async () => {
+      const { toast } = await import('/js/dialogs.js');
+      toast('sticky A', { timeout: 0 });
+      toast('sticky B', { timeout: 0 });
+      for (let i = 0; i < 5; i++) toast(`plain ${i}`, { timeout: 60000 });
+      return [...document.querySelectorAll('#toasts .toast-text')].map(e => e.textContent);
+    });
+    assert.deepEqual(texts, ['sticky A', 'sticky B', 'plain 3', 'plain 4']);
+    await resetUi();
+  });
+
+  await step('dialogs: a context menu closes on Escape, on scroll and when the window loses focus', async () => {
+    await resetUi();
+    const open = () => page.evaluate(async () => {
+      const { contextMenu } = await import('/js/dialogs.js');
+      contextMenu(new MouseEvent('contextmenu', { clientX: 200, clientY: 200 }), [{ label: 'One', action() {} }]);
+    });
+    await open();
+    await page.waitForSelector('.menu');
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('.menu', { state: 'detached' });
+    await open();
+    await page.evaluate(() => document.querySelector('.file-tree').dispatchEvent(new Event('scroll')));
+    await page.waitForSelector('.menu', { state: 'detached' });
+    await open();
+    await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+    await page.waitForSelector('.menu', { state: 'detached' });
+    await open();
+    await page.waitForSelector('.menu');
+    await sleep(100);
+    assert.equal(await page.locator('.menu').count(), 1, 'it stays open otherwise');
+    await page.evaluate(() => import('/js/dialogs.js').then(m => m.closeMenu()));
+  });
+
+  await step('terminal paths: an emoji before a path does not shift the link', async () => {
+    const W = '.workspace:not(.hidden)';
+    await freshMain();
+    await page.click(`${W} .empty-actions .btn >> text=New shell`);
+    await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; return t && t.session && t.session.kind === 'shell' && t.attached; });
+    const file = path.join(repo, 'README.md');
+    const link = await page.evaluate(async f => {
+      const t = window.skiffcode.active.activeTab;
+      t.term.reset();
+      t.term.write(`😀 ${f}\r\n`);
+      const b = t.term.buffer.active;
+      for (let y = 1; y <= b.length; y++) {
+        if (!b.getLine(y - 1).translateToString().startsWith('😀')) continue;
+        const l = (await t.term.links(y))[0];
+        return l && { text: l.text, sx: l.range.start.x, ex: l.range.end.x };
+      }
+      return null;
+    }, file);
+    assert.deepEqual(link, { text: file, sx: 4, ex: 3 + file.length });
+  });
+
+  await step('terminals: pasting, dropping or right-click pasting several lines asks first, unless bracketed paste is on', async () => {
+    const W = '.workspace:not(.hidden)';
+    await freshMain();
+    await page.click(`${W} .empty-actions .btn >> text=New shell`);
+    await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; return t && t.session && t.session.kind === 'shell' && t.attached; });
+    await page.evaluate(() => {
+      const t = window.skiffcode.active.activeTab;
+      window.__pasted = [];
+      const orig = t.term.paste.bind(t.term);
+      t.term.paste = s => { window.__pasted.push(s); orig(s); };
+      t.term.focus();
+    });
+    const pasted = () => page.evaluate(() => window.__pasted.length);
+    const paste = text => page.evaluate(text => {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', text);
+      window.skiffcode.active.activeTab.term.pre.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    }, text);
+    await paste('echo one');
+    await page.waitForFunction(() => window.__pasted.length === 1);
+    assert.equal(await page.locator('.modal-back').count(), 0, 'one line: no question');
+    await paste('echo a\necho b');
+    await page.waitForSelector('.modal-title >> text=Paste 2 lines?');
+    assert.equal(await pasted(), 1, 'nothing is pasted before the answer');
+    await page.click('.modal .btn >> text=Cancel');
+    await sleep(200);
+    assert.equal(await pasted(), 1, 'Cancel pastes nothing');
+    await paste('echo c\necho d');
+    await page.waitForSelector('.modal-title >> text=Paste 2 lines?');
+    await page.click('.modal .btn >> text=Paste');
+    await page.waitForFunction(() => window.__pasted.length === 2);
+    // a program that takes bracketed paste gets it without a question
+    await page.evaluate(() => window.skiffcode.active.activeTab.term.setBracketedPaste(true));
+    await paste('echo e\necho f');
+    await page.waitForFunction(() => window.__pasted.length === 3);
+    assert.equal(await page.locator('.modal-back').count(), 0);
+    await page.evaluate(() => window.skiffcode.active.activeTab.term.setBracketedPaste(false));
+    // dropped text and right-click paste ask the same way
+    await dnd(`${W} .row-bottom .term-body:not(.hidden)`, ['dragenter', 'dragover', 'drop'], { data: { 'text/plain': 'echo g\necho h' } });
+    await page.waitForSelector('.modal-title >> text=Paste 2 lines?');
+    await page.click('.modal .btn >> text=Cancel');
+    await page.evaluate(() => navigator.clipboard.writeText('echo i\necho j'));
+    await page.click(`${W} .row-bottom .term-host`, { button: 'right' });
+    await page.waitForSelector('.modal-title >> text=Paste 2 lines?');
+    await page.click('.modal .btn >> text=Cancel');
+    await sleep(200);
+    assert.equal(await pasted(), 3);
+  });
+
+  await step('sidebar: dragging a repo does not put text on the drag (a terminal would paste it)', async () => {
+    await resetUi();
+    const types = await page.evaluate(() => {
+      const el = document.querySelector('.repo-row');
+      const dt = new DataTransfer();
+      el.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+      el.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: dt }));
+      return [...dt.types];
+    });
+    assert.ok(types.length && !types.includes('text/plain'), JSON.stringify(types));
+  });
+
+  await step('files: the active file is highlighted as soon as its tab is', async () => {
+    await freshMain();
+    await page.evaluate(async () => {
+      const ws = window.skiffcode.active;
+      ws.showRight('files');
+      await ws.openFile('README.md');
+      await ws.openFile('src/app.py');
+      await ws.files.reveal('src/app.py');
+    });
+    const active = () => page.evaluate(() => [...document.querySelectorAll('.workspace:not(.hidden) .file-row.active')].map(r => r.dataset.path));
+    await page.waitForFunction(() => document.querySelector('.workspace:not(.hidden) .file-row.active[data-path="src/app.py"]'));
+    await page.evaluate(() => { const p = window.skiffcode.active.top.panes[0]; p.activate(p.tabs.find(t => t.path === 'README.md')); });
+    await page.waitForFunction(() => document.querySelector('.workspace:not(.hidden) .file-row.active[data-path="README.md"]'));
+    assert.deepEqual(await active(), ['README.md']);
+  });
+
+  await step('files: leaving a closed folder while dragging stops it from opening', async () => {
+    const W = '.workspace:not(.hidden)';
+    await freshMain();
+    await page.evaluate(async () => { const ws = window.skiffcode.active; ws.showRight('files'); await ws.files.reveal('src', true); if (ws.files.expanded.has('src')) ws.files.toggle('src'); });
+    await page.waitForFunction(() => !window.skiffcode.active.files.expanded.has('src'));
+    const data = { [INTERNAL]: JSON.stringify({ root: await page.evaluate(() => window.skiffcode.active.root), path: 'README.md', type: 'file' }) };
+    await dnd(`${W} .file-row[data-path="src"]`, ['dragenter', 'dragover'], { data });
+    await page.evaluate(() => document.querySelector('.workspace:not(.hidden) .file-tree').dispatchEvent(new DragEvent('dragleave', { bubbles: true, relatedTarget: document.body })));
+    await sleep(1000);
+    assert.equal(await page.evaluate(() => window.skiffcode.active.files.expanded.has('src')), false);
+    // still opens when the pointer stays
+    await dnd(`${W} .file-row[data-path="src"]`, ['dragenter', 'dragover'], { data });
+    await page.waitForFunction(() => window.skiffcode.active.files.expanded.has('src'), null, { timeout: 3000 });
+  });
+
+  await step('source control: Changes does not refresh while another view is shown, and refreshes when shown again', async () => {
+    await freshMain();
+    await page.evaluate(() => {
+      const ws = window.skiffcode.active;
+      window.__scm = 0;
+      const refresh = ws.scm.refresh.bind(ws.scm);
+      ws.scm.refresh = () => { window.__scm++; return refresh(); };
+      ws.showRight('files');
+      window.__scm = 0;
+    });
+    const seen = page.evaluate(p => import('/js/rpc.js').then(rpc => new Promise(res => {
+      const off = rpc.on('git.changed', e => { if (e.root === p) { off(); res(true); } });
+      setTimeout(() => res(false), 5000);
+    })), repo);
+    await sleep(100);
+    sh('touch .git/HEAD', repo);
+    assert.ok(await seen, 'git reported a change');
+    await sleep(500);
+    assert.equal(await page.evaluate(() => window.__scm), 0, 'hidden view: no refresh');
+    await page.evaluate(() => window.skiffcode.active.showRight('scm'));
+    assert.equal(await page.evaluate(() => window.__scm), 1, 'shown again: refreshes');
+    // folding a section shows the list already loaded
+    await page.waitForSelector('.workspace:not(.hidden) .scm-section-head');
+    await page.evaluate(() => { window.__scm = 0; });
+    await page.click('.workspace:not(.hidden) .scm-section-head >> nth=0');
+    await sleep(300);
+    assert.equal(await page.evaluate(() => window.__scm), 0, 'folding does not fetch again');
+    await page.click('.workspace:not(.hidden) .scm-section-head >> nth=0');
+  });
+
+  await step('sidebar: a group dragged over a repo row is not accepted as a drop', async () => {
+    await resetUi();
+    const g = await page.evaluate(() => import('/js/rpc.js').then(r => r.call('groups.create', { name: 'Drag test' })));
+    await page.waitForSelector('.group-row >> text=Drag test');
+    const accepted = await page.evaluate(() => {
+      const dt = new DataTransfer();
+      const group = [...document.querySelectorAll('.group-row')].find(r => r.textContent.includes('Drag test'));
+      group.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+      const repoRow = document.querySelector('.tree > .tree-item .repo-row');
+      const ev = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt });
+      repoRow.dispatchEvent(ev);
+      const over = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt });
+      group.dispatchEvent(over);
+      document.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: dt }));
+      return { repo: ev.defaultPrevented, group: over.defaultPrevented };
+    });
+    assert.deepEqual(accepted, { repo: false, group: true });
+    await page.evaluate(i => import('/js/rpc.js').then(r => r.call('groups.delete', { id: i.id || i })), g);
+    await page.waitForSelector('.group-row >> text=Drag test', { state: 'detached' });
+  });
+
+  await step('sounds: removing your own sound happens on Save, not on Cancel; a failed list shows a message', async () => {
+    const list = () => page.evaluate(() => import('/js/rpc.js').then(r => r.call('sounds.list')));
+    const open = async () => {
+      await page.click('.sb-item:has(.icon-unmute), .sb-item:has(.icon-mute)', { button: 'right' });
+      await page.waitForSelector('.sounds-modal');
+    };
+    assert.ok((await list()).custom.length >= 1, 'the earlier step left a sound');
+    await resetUi();
+    await open();
+    await page.click('.sounds-modal .sound-file button[title=Remove]');
+    await page.waitForSelector('.sounds-modal .sound-file', { state: 'detached' });
+    await page.click('.sounds-modal .btn >> text=Cancel');
+    await sleep(300);
+    assert.ok((await list()).custom.length >= 1, 'Cancel keeps it');
+    await open();
+    assert.ok(await page.locator('.sounds-modal .sound-file').count(), 'still listed after Cancel');
+    await page.click('.sounds-modal .sound-file button[title=Remove]');
+    await page.click('.sounds-modal .btn >> text=Save');
+    await page.waitForSelector('.sounds-modal', { state: 'detached' });
+    for (let i = 0; i < 40 && (await list()).custom.length; i++) await sleep(50);
+    assert.equal((await list()).custom.length, 0, 'Save removes it');
+    // the list cannot be read: a message, no dialog
+    await spySend();
+    await page.evaluate(() => { window.__rewrite = m => (m.method === 'sounds.list' ? { ...m, method: 'nope.nope' } : null); });
+    await page.click('.sb-item:has(.icon-unmute), .sb-item:has(.icon-mute)', { button: 'right' });
+    await page.waitForSelector('.toast.error');
+    assert.equal(await page.locator('.sounds-modal').count(), 0);
+    await page.evaluate(() => { window.__rewrite = null; });
+  });
+
+  await step('customize: the icon box keeps whole emoji (two at most)', async () => {
+    await resetUi();
+    await page.click('.repo-row >> nth=0', { button: 'right' });
+    await page.click('.menu-item >> text=Customize…');
+    await page.waitForSelector('.look-modal');
+    const family = '👨‍👩‍👧‍👦';
+    await page.fill('.look-emoji', family);
+    assert.equal(await page.inputValue('.look-emoji'), family);
+    await page.fill('.look-emoji', '😀😀😀');
+    assert.equal(await page.inputValue('.look-emoji'), '😀😀');
+    await page.click('.look-modal .btn >> text=Cancel');
+  });
+
+  await step('keys: AltGr does not trigger Ctrl+Alt shortcuts', async () => {
+    await resetUi();
+    const press = altGr => page.evaluate(g => document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', ctrlKey: true, altKey: true, modifierAltGraph: g, bubbles: true, cancelable: true })), altGr);
+    await press(true);
+    await sleep(300);
+    assert.equal(await page.locator('.modal-back').count(), 0, 'AltGr+J types a character');
+    await press(false);
+    await page.waitForSelector('.qp-input');
+    await page.keyboard.press('Escape');
+  });
+
+  await step('keys: the recorder takes an F-key without a modifier, except F12', async () => {
+    await resetUi();
+    await page.evaluate(() => import('/js/keybindings.js').then(m => m.keybindingsDialog()));
+    await page.waitForSelector('.keys-modal');
+    const key = '.keys-row[data-id="toggleSidebar"] .keys-key';
+    await page.click(key);
+    await page.keyboard.press('F12');
+    await page.waitForSelector('.keys-note.warn >> text=F12 is reserved');
+    await page.keyboard.press('F5');
+    await page.waitForFunction(k => document.querySelector(k).textContent === 'F5', key);
+    await page.click(key);
+    await page.keyboard.press('x');
+    await page.waitForSelector('.keys-note.warn >> text=Use Ctrl or Alt');
+    await page.keyboard.press('Escape');
+    await page.click('.keys-modal .btn >> text=Cancel');
+  });
+
+  await step('add repo: the Add button takes the row you picked; ticking hidden before the first listing is fine', async () => {
+    await resetUi();
+    const outer = path.join(tmp, 'nest', 'outer');
+    fs.mkdirSync(path.join(outer, 'inner'), { recursive: true });
+    sh('git init -q -b main', outer);
+    sh('git init -q -b main', path.join(outer, 'inner'));
+    await spySend();
+    // the listing is slow: the box is ticked before it arrives
+    await page.evaluate(() => { window.__drop = m => m.method === 'folders.browse'; });
+    const before = errors.length;
+    await page.evaluate(() => import('/js/add-repo-dialog.js').then(m => { window.__chosen = undefined; m.addRepoDialog().then(v => { window.__chosen = v || null; }); }));
+    await page.waitForSelector('.browse-modal');
+    await page.check('.browse-hidden input');
+    await sleep(200);
+    assert.deepEqual(errors.slice(before), [], 'no error');
+    await page.evaluate(() => { window.__drop = null; });
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => window.__chosen === null);
+    // a repo that holds another repo: picking the inner one adds the inner one
+    await page.evaluate(p => { localStorage.setItem('skiffcode.browseDir', p); window.__chosen = undefined; void import('/js/add-repo-dialog.js').then(m => m.addRepoDialog()).then(v => { window.__chosen = v || null; }); }, outer);
+    await page.waitForSelector('.browse-item.repo >> text=inner');
+    await page.click('.browse-item.repo:has-text("inner")');
+    await page.click('.browse-modal .btn.primary >> text=Add inner');
+    await page.waitForFunction(() => window.__chosen !== undefined);
+    assert.equal(await page.evaluate(() => window.__chosen), path.join(outer, 'inner'));
+  });
+
+  await step('new worktree: a failed branch list shows the error and closes', async () => {
+    await resetUi();
+    await spySend();
+    await page.evaluate(() => { window.__rewrite = m => (m.method === 'worktrees.branches' ? { ...m, method: 'nope.nope' } : null); });
+    const res = await page.evaluate(async p => {
+      const { newWorktreeDialog } = await import('/js/worktree-dialog.js');
+      const { store } = await import('/js/store.js');
+      const done = newWorktreeDialog(store.repos.find(r => r.path === p));
+      return Promise.race([done.then(() => 'closed'), new Promise(r => setTimeout(() => r('hangs'), 2000))]);
+    }, repo);
+    await page.evaluate(() => { window.__rewrite = null; });
+    assert.equal(res, 'closed');
+    await page.waitForSelector('.toast.error');
+  });
+
+  await step('web tab: an address the server refuses is not kept in the tab or its history', async () => {
+    await freshMain();
+    const r = await page.evaluate(async () => {
+      const t = window.skiffcode.active.openWeb('');
+      await t.navigate('ftp://example.com/x');
+      return { url: t.url || '', history: t.history.length, saved: t.serialize(), error: t.stage.textContent };
+    });
+    assert.deepEqual([r.url, r.history, r.saved], ['', 0, null]);
+    assert.match(r.error, /Only http and https/);
+  });
+
+  await step('alerts: a built-in sound id is encoded in its address', async () => {
+    const urls = await page.evaluate(() => import('/js/alerts.js').then(m => [m.soundUrl('chime'), m.soundUrl('a b/c')]));
+    assert.deepEqual(urls, ['/sounds/chime.wav', '/sounds/a%20b%2Fc.wav']);
+  });
+
+  await step('search: Enter searches once, and folding a file shows the results already found', async () => {
+    await freshMain();
+    await spySend();
+    await page.evaluate(() => { window.__sent.length = 0; window.skiffcode.active.showRight('search'); });
+    const searches = () => page.evaluate(() => window.__sent.filter(m => m.method === 'search.text').length);
+    await page.fill('.workspace:not(.hidden) .search-view .input >> nth=0', 'greet');
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('.workspace:not(.hidden) .search-file-head');
+    await sleep(700);
+    assert.equal(await searches(), 1, 'Enter and the typing delay make one search');
+    await page.click('.workspace:not(.hidden) .search-file-head >> nth=0');
+    await sleep(500);
+    assert.equal(await searches(), 1, 'folding does not search again');
+    assert.equal(await page.locator('.workspace:not(.hidden) .search-hit').count(), 0, 'the file is folded');
+    await page.click('.workspace:not(.hidden) .search-file-head >> nth=0');
+    await page.waitForSelector('.workspace:not(.hidden) .search-hit');
+    assert.equal(await searches(), 1);
+    await page.evaluate(() => window.skiffcode.active.showRight('files'));
+  });
+
+  await step('editors: dropping a file on an editor does not insert its path', async () => {
+    const o = await page.evaluate(() => import('/js/tabs.js').then(m => m.editorOptions()));
+    assert.deepEqual(o.dropIntoEditor, { enabled: false });
+  });
+
+  await step('panel widths: a saved width that is too big, too small or not a number is brought into range', async () => {
+    await freshMain();
+    const widths = await page.evaluate(async () => {
+      const app = window.skiffcode;
+      const ws = app.active;
+      const { Workspace } = await import('/js/workspace.js');
+      const out = [];
+      for (const v of ['99999', '5', 'abc']) {
+        localStorage.setItem('skiffcode.rightWidth', v);
+        const w = new Workspace(app, { path: ws.root, repo: { path: ws.repoPath } });
+        out.push(w.right.style.width);
+        w.dispose();
+      }
+      localStorage.removeItem('skiffcode.rightWidth');
+      return out;
+    });
+    assert.deepEqual(widths, [`${Math.round(1500 * 0.6)}px`, '200px', '320px']);
+    await page.evaluate(() => localStorage.setItem('skiffcode.sidebarWidth', '9999'));
+    await page.reload();
+    await page.waitForSelector('#sidebar .sidebar-title');
+    assert.equal(await page.evaluate(() => document.getElementById('sidebar').style.width), '560px');
+    await page.evaluate(() => localStorage.setItem('skiffcode.sidebarWidth', 'abc'));
+    await page.reload();
+    await page.waitForSelector('#sidebar .sidebar-title');
+    assert.equal(await page.evaluate(() => document.getElementById('sidebar').style.width), '300px');
+    await page.evaluate(() => localStorage.removeItem('skiffcode.sidebarWidth'));
+  });
+
+  await step('panel height: a saved height that is too big, too small or not a number is brought into range', async () => {
+    await freshMain();
+    const heights = await page.evaluate(async () => {
+      const app = window.skiffcode;
+      const ws = app.active;
+      const { store } = await import('/js/store.js');
+      const { Workspace } = await import('/js/workspace.js');
+      const saved = store.layouts[ws.root];
+      const out = [];
+      for (const v of [5, 0.001, 'abc', null, 0.5]) {
+        store.layouts[ws.root] = { v: 2, top: [], bottom: [], panelHeight: v };
+        const w = new Workspace(app, { path: ws.root, repo: { path: ws.repoPath } });
+        w.restore();
+        out.push(w.panelHeight);
+        w.dispose();
+      }
+      store.layouts[ws.root] = saved;
+      return out;
+    });
+    assert.deepEqual(heights, [0.8, 0.1, 0.34, 0.34, 0.5]);
+  });
+
+  await step('a corrupt saved list of collapsed Changes sections does not break the Changes view', async () => {
+    await freshMain();
+    const out = await page.evaluate(async () => {
+      const app = window.skiffcode;
+      const ws = app.active;
+      const { Workspace } = await import('/js/workspace.js');
+      const out = [];
+      for (const v of ['{oops', '5', '{"a":1}', '["changes"]']) {
+        localStorage.setItem('skiffcode.scmCollapsed', v);
+        const w = new Workspace(app, { path: ws.root, repo: { path: ws.repoPath } });
+        out.push([...w.scm.collapsed]);
+        w.dispose();
+      }
+      localStorage.removeItem('skiffcode.scmCollapsed');
+      return out;
+    });
+    assert.deepEqual(out, [[], [], [], ['changes']]);
   });
 
   await step('no JavaScript errors', async () => {

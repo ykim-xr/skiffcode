@@ -31,16 +31,17 @@
   <script src="/vendor/xterm/addon-unicode11.js"></script>
   <script src="/vendor/monaco/vs/loader.js"></script>
   <script>
-    // Monaco's AMD loader clashes with other UMD scripts unless they load first (they did above).
+    // Monaco's AMD loader clashes with other UMD scripts unless they load first, so the xterm scripts above come before it.
     (function () {
       const side = document.getElementById('sidebar');
-      const w = Number(localStorage.getItem('skiffcode.sidebarWidth') || 300);
-      side.style.width = w + 'px';
+      let w = 300;
+      try { w = Number(localStorage.getItem('skiffcode.sidebarWidth') || 300); } catch { /* storage blocked */ }
+      side.style.width = (isFinite(w) ? Math.max(200, Math.min(560, w)) : 300) + 'px'; // same range as the drag
       document.getElementById('sidebar-sash').addEventListener('mousedown', function (e) {
         e.preventDefault();
         const x0 = e.clientX, w0 = side.offsetWidth;
         function move(ev) { side.style.width = Math.max(200, Math.min(560, w0 + ev.clientX - x0)) + 'px'; window.dispatchEvent(new Event('resize')); }
-        function up() { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); localStorage.setItem('skiffcode.sidebarWidth', side.offsetWidth); }
+        function up() { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); try { localStorage.setItem('skiffcode.sidebarWidth', side.offsetWidth); } catch { /* storage blocked */ } }
         document.addEventListener('mousemove', move);
         document.addEventListener('mouseup', up);
       });

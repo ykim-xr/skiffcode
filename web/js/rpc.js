@@ -6,6 +6,8 @@ const pending = new Map();
 let ws;
 let seq = 0;
 let openPromise;
+let settle; // resolves openPromise
+let wasOpen = false;
 let backoff = 300;
 const enc = new TextEncoder();
 
@@ -27,50 +29,66 @@ function emit(event, data) {
 
 export function onTerminal(id, fn) {
   termHandlers.set(id, fn);
-  return () => termHandlers.delete(id);
+  return () => { if (termHandlers.get(id) === fn) termHandlers.delete(id); };
 }
 
 export function connect() {
   if (openPromise) return openPromise;
-  openPromise = new Promise(resolve => {
-    const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
-    ws = new WebSocket(url);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => {
-      backoff = 300;
-      emit('open');
-      resolve();
-    };
-    ws.onmessage = m => {
-      if (typeof m.data !== 'string') {
-        const b = new Uint8Array(m.data);
-        const id = new TextDecoder('latin1').decode(b.subarray(1, 37)).trim();
-        const h = termHandlers.get(id);
-        if (h) h(b[0], b.subarray(37));
-        return;
-      }
-      const msg = JSON.parse(m.data);
-      if (msg.id !== undefined) {
-        const p = pending.get(msg.id);
-        if (!p) return;
-        pending.delete(msg.id);
-        if (msg.error) {
-          const e = new Error(msg.error.message);
-          e.code = msg.error.code;
-          p.reject(e);
-        } else p.resolve(msg.result);
-      } else emit(msg.event, msg.data);
-    };
-    ws.onclose = () => {
-      for (const p of pending.values()) p.reject(new Error('Disconnected from SkiffCode'));
-      pending.clear();
+  openPromise = new Promise(resolve => { settle = resolve; });
+  open();
+  return openPromise;
+}
+
+// One socket. One that closes before it opens is tried again, so callers waiting on
+// connect() get through once the server answers.
+function open() {
+  const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+  const sock = (ws = new WebSocket(url));
+  let opened = false;
+  sock.binaryType = 'arraybuffer';
+  sock.onopen = () => {
+    opened = true;
+    backoff = 300;
+    emit('open');
+    settle();
+    if (wasOpen) emit('reconnect');
+    wasOpen = true;
+  };
+  sock.onmessage = m => {
+    if (typeof m.data !== 'string') {
+      const b = new Uint8Array(m.data);
+      const id = new TextDecoder('latin1').decode(b.subarray(1, 37)).trim();
+      const h = termHandlers.get(id);
+      if (h) h(b[0], b.subarray(37));
+      return;
+    }
+    let msg;
+    try {
+      msg = JSON.parse(m.data);
+    } catch {
+      return;
+    }
+    if (msg.id !== undefined) {
+      const p = pending.get(msg.id);
+      if (!p) return;
+      pending.delete(msg.id);
+      if (msg.error) {
+        const e = new Error(msg.error.message);
+        e.code = msg.error.code;
+        p.reject(e);
+      } else p.resolve(msg.result);
+    } else emit(msg.event, msg.data);
+  };
+  sock.onclose = () => {
+    for (const p of pending.values()) p.reject(new Error('Disconnected from SkiffCode'));
+    pending.clear();
+    if (opened) {
       openPromise = undefined;
       emit('close');
-      setTimeout(() => connect().then(() => emit('reconnect')), backoff);
-      backoff = Math.min(backoff * 2, 5000);
-    };
-  });
-  return openPromise;
+    }
+    setTimeout(opened ? connect : open, backoff);
+    backoff = Math.min(backoff * 2, 5000);
+  };
 }
 
 export async function call(method, params = {}) {

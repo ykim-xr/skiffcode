@@ -14,7 +14,8 @@ export function addRepoDialog() {
     const list = h('div.browse-list');
     const crumbs = h('div.browse-crumbs');
     const hidden = h('input', { type: 'checkbox' });
-    const add = h('button.btn.primary', { onclick: () => choose(cur && cur.repoRoot) }, 'Add');
+    let addPath = null; // what Add picks: set by render()
+    const add = h('button.btn.primary', { onclick: () => choose(addPath) }, 'Add');
     const m = modal([
       h('div.modal-title', 'Add a repository or folder'),
       h('div.modal-detail.muted', 'Git repositories are marked. Any other folder works too: open it and click “Add folder”.'),
@@ -64,21 +65,22 @@ export function addRepoDialog() {
       if (target) {
         add.disabled = false;
         add.textContent = `${target.added ? 'Show' : 'Add'} ${target.name}`;
-        add.onclick = () => choose(target.path);
+        addPath = target.path;
       } else if (cur.repoRoot) {
         add.disabled = false;
         add.textContent = `${cur.added ? 'Show' : 'Add'} ${cur.repoRoot.split('/').pop()}`;
-        add.onclick = () => choose(cur.repoRoot);
+        addPath = cur.repoRoot;
       } else if (cur.path !== '/' && cur.path !== cur.home) {
         // not a git repo: add the folder itself (Claude, shells, files and search; no git)
         const name = cur.path.split('/').pop();
         const already = (store.repos || []).some(r => r.path === cur.path);
         add.disabled = false;
         add.textContent = `${already ? 'Show' : 'Add'} folder ${name}`;
-        add.onclick = () => choose(cur.path);
+        addPath = cur.path;
       } else {
         add.disabled = true;
         add.textContent = 'Add';
+        addPath = null;
       }
     }
 
@@ -99,7 +101,7 @@ export function addRepoDialog() {
       }
     }
 
-    hidden.addEventListener('change', render);
+    hidden.addEventListener('change', () => { if (cur) render(); }); // nothing listed yet
     input.addEventListener('keydown', e => {
       if (e.key !== 'Enter') return;
       e.preventDefault();
@@ -107,7 +109,6 @@ export function addRepoDialog() {
       if (cur && tildify(cur.path, store.home) === v && cur.repoRoot) return choose(cur.repoRoot);
       void go(v);
     });
-    list.addEventListener('keydown', () => {});
     let start = '~';
     try { start = localStorage.getItem(LAST) || '~'; } catch { /* fine */ }
     void go(start).then(() => { if (!cur) void go('~'); });

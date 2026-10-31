@@ -5,5 +5,6 @@
   "description": "SkiffCode: repos, worktrees, Claude Code sessions, editor and git in one browser app.",
   "license": "MIT",
   "main": "server/main.js",
+  "engines": { "node": ">=18" },
   "scripts": { "start": "node server/main.js", "test": "node test/run.js" }
 }

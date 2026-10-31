@@ -1,9 +1,8 @@
 // SkiffCode app: wires the sidebar, workspaces, palettes, shortcuts and alerts.
-import { h, icon, clear, basename, dirname, tildify, languageOf } from './util.js';
+import { h, icon, clear, basename, dirname, tildify, languageOf, readStored, TERM_SIZE } from './util.js';
 import { call, connect, on, connected } from './rpc.js';
-import { store, applySnapshot, loadAll, loadWorktrees, loadStatus, allWorktrees, worktree, sessionsIn, session, needsYou, subscribe } from './store.js';
-import { initSidebar, STATE_ICON, stateLabel, claudeIcon, sessionIcon } from './sidebar.js';
-import { notify as sidebarRefresh } from './store.js';
+import { store, applySnapshot, loadAll, loadWorktrees, loadStatus, allWorktrees, worktree, sessionsIn, session, needsYou, subscribe, notify as sidebarRefresh } from './store.js';
+import { initSidebar, stateLabel, sessionIcon } from './sidebar.js';
 import { Workspace } from './workspace.js';
 import { quickPick, promptDialog, confirmDialog, toast, contextMenu } from './dialogs.js';
 import { handleAlert, updateTitle, askNotifications, notificationsAllowed, playSound } from './alerts.js';
@@ -46,7 +45,7 @@ async function loadMonaco() {
       if (!ws) return [];
       const fromFile = model.uri.path.slice(ws.root.length + 1);
       const res = await call('search.definition', { root: ws.root, symbol: word.word, lang: model.getLanguageId(), fromFile }).catch(() => []);
-      return res.map(r => ({ uri: monaco.Uri.from({ scheme: 'file', path: `${ws.root}/${r.file}` }), range: new monaco.Range(r.line, r.col, r.line, r.col + word.word.length) }));
+      return res.map(r => ({ uri: models.fileUri(ws.root, r.file), range: new monaco.Range(r.line, r.col, r.line, r.col + word.word.length) }));
     },
   });
   // Shift+F12-ish: find all references of the word (plain text search, whole word).
@@ -56,7 +55,7 @@ async function loadMonaco() {
       const ws = word && workspaceForUri(model.uri);
       if (!ws) return [];
       const r = await call('search.text', { root: ws.root, query: word.word, word: true, caseSensitive: true }).catch(() => ({ results: [] }));
-      return r.results.flatMap(f => f.matches.map(m => ({ uri: monaco.Uri.from({ scheme: 'file', path: `${ws.root}/${f.file}` }), range: new monaco.Range(m.line, m.col, m.line, m.col + m.len) })));
+      return r.results.flatMap(f => f.matches.map(m => ({ uri: models.fileUri(ws.root, f.file), range: new monaco.Range(m.line, m.col, m.line, m.col + m.len) })));
     },
   });
   // Ctrl+click on a link in the editor: a SkiffCode tab (or the browser, per settings)
@@ -102,7 +101,7 @@ async function boot() {
   document.getElementById('boot').remove();
   initSidebar(document.getElementById('sidebar'), actions);
   await loadAll();
-  const last = new URLSearchParams(location.search).get('folder') || localStorage.getItem('skiffcode.active');
+  const last = new URLSearchParams(location.search).get('folder') || readStored('skiffcode.active');
   const wt = last && (worktree(last) || allWorktrees().find(w => w.path === last));
   if (wt) await openWorktree(wt.path);
   else if (allWorktrees().length) await openWorktree(allWorktrees()[0].path);
@@ -147,11 +146,13 @@ async function openWorktree(p) {
   reportView();
   updateStatusBar();
   maybeOfferPast(wt.repo);
-  // forget workspaces of worktrees that no longer exist
-  for (const [k, w] of app.workspaces) if (!worktree(k)) { w.dispose(); app.workspaces.delete(k); }
+  // forget workspaces of worktrees that no longer exist (not of repos whose list just failed)
+  for (const [k, w] of app.workspaces) if (!worktree(k) && !listFailed(w.repoPath)) { w.dispose(); app.workspaces.delete(k); }
   return ws;
 }
 app.openWorktree = openWorktree;
+
+const listFailed = repoPath => store.repos.some(r => r.path === repoPath) && !!(store.worktrees.get(repoPath) || {}).error;
 
 /** A repo you just added (from the app or `skiffcode <dir>`) may already have Claude conversations: say so once. */
 const offered = new Set();
@@ -171,7 +172,7 @@ function maybeOfferPast(repo) {
  * rebuilds it from its saved layout. Worktrees with unsaved files are kept.
  */
 function unloadIdle(force = false) {
-  const mins = Number(store.settings.unloadAfterMinutes ?? 30);
+  const mins = Number(store.settings.unloadAfterMinutes);
   if (!force && !(mins > 0)) return 0;
   let n = 0;
   for (const [p, ws] of app.workspaces) {
@@ -211,7 +212,7 @@ function memoryItem() {
   const total = memory.server + memory.page + sum(ids);
   const loaded = app.workspaces.size;
   const all = allWorktrees().length;
-  const mins = Number(store.settings.unloadAfterMinutes ?? 30);
+  const mins = Number(store.settings.unloadAfterMinutes);
   const top = claude.sort((a, b) => per[b] - per[a]).slice(0, 5).map(id => `   ${mb(per[id])}  ${(session(id) || {}).name}`);
   const tip = [
     `SkiffCode + sessions: ${mb(total)}`,
@@ -250,8 +251,6 @@ function orderedWorktrees() {
 
 // ------------------------------------------------------------------ actions
 
-const sizeHint = () => ({ cols: 120, rows: 32 });
-
 /** Wait until the server's state push includes a just-created session. */
 async function waitForSession(id) {
   for (let i = 0; i < 40 && !session(id); i++) await new Promise(r => setTimeout(r, 50));
@@ -264,6 +263,14 @@ async function purgeCheckbox(folders) {
   if (!n) return null;
   const input = h('input', { type: 'checkbox' });
   return { input, el: h('label.purge-check', input, ` Also delete Claude’s saved conversations for it (${n}), so they’re gone from /resume`) };
+}
+
+/** Closes the tab of a session in every workspace. */
+function hideSessionTabs(id) {
+  for (const ws of app.workspaces.values()) {
+    const t = ws.find(x => x.kind === 'session' && x.sessionId === id);
+    if (t) ws.hideTab(t);
+  }
 }
 
 const actions = {
@@ -370,7 +377,7 @@ const actions = {
     if (!params) return;
     const t = toast(`Creating worktree ${params.newBranch || params.branch}…`, { timeout: 0, icon: 'branch' });
     try {
-      const res = await call('worktrees.create', { repo: r.path, ...params, ...sizeHint() });
+      const res = await call('worktrees.create', { repo: r.path, ...params, ...TERM_SIZE });
       await loadWorktrees(r.path);
       if (res.session) await waitForSession(res.session);
       const ws = await openWorktree(res.path);
@@ -411,7 +418,7 @@ const actions = {
       if (res.branch === 'unmerged') {
         const f = await confirmDialog({ title: `Branch ${res.branchName} isn’t merged`, detail: 'Delete it anyway? Its unmerged commits will be lost.', buttons: [{ label: 'Delete branch', value: 'yes', danger: true }] });
         if (f === 'yes') await call('branches.delete', { repo: r.path, branch: res.branchName, force: true });
-      }
+      } else if (res.branch === 'error') toast(`Couldn’t delete branch ${res.branchName}: ${res.branchError}`, { kind: 'error' });
     } catch (e) {
       toast(e.message, { kind: 'error' });
     } finally {
@@ -422,7 +429,7 @@ const actions = {
   async newSession(worktreePath, kind = 'claude', { pane, name } = {}) {
     const p = worktreePath || store.active;
     if (!p) return toast('Open a worktree first.');
-    if (kind === 'claude' && name === undefined && store.settings.askSessionName !== false) {
+    if (kind === 'claude' && name === undefined && store.settings.askSessionName) {
       // Name it now (Enter keeps the suggestion); Claude gets the same name
       const wt = worktree(p);
       const base = (wt && wt.branch) || basename(p);
@@ -431,7 +438,7 @@ const actions = {
       if (!name) return;
     }
     try {
-      const s = await call('sessions.create', { kind, worktreePath: p, name, ...sizeHint() });
+      const s = await call('sessions.create', { kind, worktreePath: p, name, ...TERM_SIZE });
       await waitForSession(s.id);
       const ws = await openWorktree(p);
       if (ws) ws.openSession(s.id, { pane });
@@ -450,7 +457,7 @@ const actions = {
   async resumeSession(id) {
     const s = session(id);
     if (!s) return;
-    await call('sessions.resume', { id, ...sizeHint() });
+    await call('sessions.resume', { id, ...TERM_SIZE });
     const ws = await openWorktree(s.worktreePath);
     if (ws) {
       const t = ws.openSession(id);
@@ -474,10 +481,7 @@ const actions = {
   /** Close from the sidebar: stops it, removes it, and closes its tab. */
   async closeSession(s) {
     if (!(await actions.confirmCloseSession(s))) return;
-    for (const ws of app.workspaces.values()) {
-      const t = ws.find(x => x.kind === 'session' && x.sessionId === s.id);
-      if (t) ws.hideTab(t);
-    }
+    hideSessionTabs(s.id);
     await call('sessions.forget', { id: s.id });
   },
   /** Delete a session completely: also Claude's saved conversation (gone from /resume). */
@@ -492,19 +496,13 @@ const actions = {
       buttons: [{ label: claude ? 'Delete session and conversation' : 'Delete', value: 'yes', danger: true }],
     });
     if (v !== 'yes') return;
-    for (const ws of app.workspaces.values()) {
-      const t = ws.find(x => x.kind === 'session' && x.sessionId === s.id);
-      if (t) ws.hideTab(t);
-    }
+    hideSessionTabs(s.id);
     try {
       await call('sessions.purge', { id: s.id });
       toast(claude ? `Deleted “${s.name}” and its conversation.` : `Deleted “${s.name}”.`, { icon: 'trash', timeout: 3000 });
     } catch (e) {
       toast(e.message, { kind: 'error' });
     }
-  },
-  forgetSession(s) {
-    return actions.closeSession(s);
   },
   async renameSession(s) {
     const name = await promptDialog({ title: 'Rename session', value: s.name, okLabel: 'Rename' });
@@ -520,11 +518,14 @@ const actions = {
   reviewChanges: async p => { const ws = await openWorktree(p); if (ws) ws.openReview(); },
 
   async quickOpen() {
-    const ws = app.active;
-    if (!ws) return;
-    const files = await call('search.files', { root: ws.root });
-    const v = await quickPick(files.map(f => ({ label: basename(f), description: dirname(f), value: f, icon: 'file' })), { placeholder: `Open a file in ${basename(ws.root)}` });
-    if (v) ws.openFile(v);
+    const root = app.active && app.active.root;
+    if (!root) return;
+    const files = await call('search.files', { root });
+    const v = await quickPick(files.map(f => ({ label: basename(f), description: dirname(f), value: f, icon: 'file' })), { placeholder: `Open a file in ${basename(root)}` });
+    if (!v) return;
+    // The list is of that worktree: open it there, even if another one is shown (or it was unloaded) by now.
+    const ws = app.active && app.active.root === root ? app.active : await openWorktree(root);
+    if (ws) ws.openFile(v);
   },
 
   async jump() {
@@ -533,7 +534,6 @@ const actions = {
     const list = [...store.sessions].sort((a, b) => Number(!!b.unread) - Number(!!a.unread) || order[a.state] - order[b.state] || b.createdAt - a.createdAt);
     if (list.length) items.push({ separator: true, label: 'Sessions' });
     for (const s of list) {
-      const [ic, cls] = STATE_ICON[s.state] || STATE_ICON.ended;
       const repo = (store.repos.find(r => r.path === s.repoPath) || {}).name || '';
       const acct = (store.accounts || []).length > 1 && s.kind === 'claude' ? ` · ${accountName(s.account)}` : '';
       items.push({ label: `${s.unread ? '● ' : ''}${s.name}`, description: `${repo}${s.branch ? ` / ${s.branch}` : ''}${acct}`, detail: s.kind === 'shell' ? 'shell' : stateLabel(s), icon: sessionIcon(s), value: { session: s.id } });
@@ -559,36 +559,34 @@ const actions = {
     if (url && url.trim()) ws.openWeb(url.trim());
   },
   async commands() {
-    const ws = app.active;
-    const k = keyHint;
     const cmds = [
-      ['Jump to session or worktree', k('jump'), () => actions.jump()],
-      ['Go to next session that needs you', k('nextNeedsYou'), () => actions.nextNeedsYou()],
-      ['Open file…', k('quickOpen'), () => actions.quickOpen()],
-      ['New Claude session', k('newClaude'), () => actions.newSession(null, 'claude')],
-      ['New shell', k('newShell'), () => actions.newSession(null, 'shell')],
-      ['Review changes vs base', k('review'), () => ws && ws.openReview()],
-      ['Search in worktree', k('search'), () => ws && ws.showRight('search')],
-      ['Show files', k('files'), () => ws && ws.showRight('files')],
-      ['Show source control', k('scm'), () => ws && ws.showRight('scm')],
+      ['Jump to session or worktree', keyHint('jump'), () => actions.jump()],
+      ['Go to next session that needs you', keyHint('nextNeedsYou'), () => actions.nextNeedsYou()],
+      ['Open file…', keyHint('quickOpen'), () => actions.quickOpen()],
+      ['New Claude session', keyHint('newClaude'), () => actions.newSession(null, 'claude')],
+      ['New shell', keyHint('newShell'), () => actions.newSession(null, 'shell')],
+      ['Review changes vs base', keyHint('review'), () => app.active && app.active.openReview()],
+      ['Search in worktree', keyHint('search'), () => app.active && app.active.showRight('search')],
+      ['Show files', keyHint('files'), () => app.active && app.active.showRight('files')],
+      ['Show source control', keyHint('scm'), () => app.active && app.active.showRight('scm')],
       ['Add repository or folder…', '', () => actions.addRepo()],
       ['New group…', '', () => actions.newGroup()],
-      ['Next worktree', k('nextWorktree'), () => stepWorktree(1)],
-      ['Previous worktree', k('prevWorktree'), () => stepWorktree(-1)],
-      ['Split right', '', () => ws && ws.activeTab && ws.splitRight(ws.activeTab)],
-      ['Split down (move to bottom panel)', '', () => ws && ws.activeTab && ws.splitDown(ws.activeTab)],
-      ['Toggle bottom panel', k('togglePanel'), () => ws && ws.togglePanel()],
+      ['Next worktree', keyHint('nextWorktree'), () => stepWorktree(1)],
+      ['Previous worktree', keyHint('prevWorktree'), () => stepWorktree(-1)],
+      ['Split right', '', () => { const ws = app.active; if (ws && ws.activeTab) ws.splitRight(ws.activeTab); }],
+      ['Split down (move to bottom panel)', '', () => { const ws = app.active; if (ws && ws.activeTab) ws.splitDown(ws.activeTab); }],
+      ['Toggle bottom panel', keyHint('togglePanel'), () => app.active && app.active.togglePanel()],
       [store.prefs.muted ? 'Unmute sounds' : 'Mute sounds', '', () => toggleMute()],
       ['Test alert sound', '', () => playSound('question')],
       ['Sounds…', '', () => soundsDialog()],
-      ['Settings…', k('settings'), () => openSettings()],
+      ['Settings…', keyHint('settings'), () => openSettings()],
       ['Keyboard shortcuts…', '', () => keybindingsDialog()],
       [shortcutsOn() ? 'Turn shortcuts off' : 'Turn shortcuts on', '', () => setShortcutsOn(!shortcutsOn())],
       ['Claude accounts & usage…', '', () => accountsDialog()],
       ['Resume a Claude conversation…', '', () => actions.resumeConversation()],
       ['Open web page or file…', '', () => actions.openWebPage()],
       ['Panel colors…', '', () => colorsDialog()],
-      ['Toggle sidebar', k('toggleSidebar'), () => KEY_RUN.toggleSidebar()],
+      ['Toggle sidebar', keyHint('toggleSidebar'), () => KEY_RUN.toggleSidebar()],
     ];
     const v = await quickPick(cmds.map(([label, key, fn], i) => ({ label, description: key, value: i })), { placeholder: 'Run a command', matchDescription: false });
     if (v !== undefined) cmds[v][2]();
@@ -607,8 +605,9 @@ function toggleMute() {
 async function openSettings() {
   const s = { ...store.settings };
   const field = (label, input, hint) => h('label.setting', h('span.setting-label', label), input, hint ? h('span.setting-hint', hint) : null);
-  const text = (k, ph) => h('input.input', { value: Array.isArray(s[k]) ? s[k].join(' ') : s[k] || '', placeholder: ph || '', 'data-key': k });
-  const check = k => h('input', { type: 'checkbox', checked: s[k] !== false ? true : undefined, 'data-key': k, 'data-type': 'bool' });
+  const text = (k, ph) => h('input.input', { value: Array.isArray(s[k]) ? joinArgs(s[k]) : s[k] || '', placeholder: ph || '', 'data-key': k });
+  const num = (k, def, min, max) => h('input.input', { type: 'number', min: String(min), max: String(max), value: String(s[k] ?? def), 'data-key': k, 'data-type': 'num', 'data-default': String(def) });
+  const check = k => h('input', { type: 'checkbox', checked: s[k] ? true : undefined, 'data-key': k, 'data-type': 'bool' });
   const select = (k, opts) => h('select.input', { 'data-key': k }, opts.map(([v, l]) => h('option', { value: v, selected: s[k] === v ? true : undefined }, l)));
   const form = h('div.settings',
     h('div.setting', h('span.setting-label', 'Panel colors'), h('button.btn', { type: 'button', onclick: () => colorsDialog() }, icon('palette'), 'Choose…'), h('span.setting-hint', 'Background of the sidebar, editor & terminals, bottom panel and right panel.')),
@@ -620,11 +619,11 @@ async function openSettings() {
     field('Start Claude in new worktrees', check('startClaudeOnCreate')),
     field('Ask for a name for new Claude sessions', check('askSessionName'), 'Off: new sessions are named after the branch.'),
     field('Restart after a reboot', check('autoResume'), 'Sessions and shells that a reboot stopped restart when you open their worktree.'),
-    field('Unload idle worktrees after (minutes)', h('input.input', { type: 'number', min: '0', max: '1440', value: String(s.unloadAfterMinutes ?? 30), 'data-key': 'unloadAfterMinutes', 'data-type': 'num' }), 'Frees the editor and terminal views of worktrees you haven’t opened for this long. Claude keeps running; clicking the worktree brings it back. 0 = never.'),
+    field('Unload idle worktrees after (minutes)', num('unloadAfterMinutes', 30, 0, 1440), 'Frees the editor and terminal views of worktrees you haven’t opened for this long. Claude keeps running; clicking the worktree brings it back. 0 = never.'),
     field('Shells open in the bottom panel', check('shellsInPanel')),
     h('h3', 'Worktrees'),
     field('Folder', text('worktreesDir', 'next to the repo: <repo>.worktrees/<branch>'), 'Empty = next to each repo.'),
-    field('Copy into new worktrees', text('copyToWorktree', '.env .env.local'), 'Untracked files from the main checkout, space separated.'),
+    field('Copy into new worktrees', text('copyToWorktree', '.env .env.local'), 'Untracked files from the main checkout, space separated. Quote names with spaces.'),
     field('Setup command', text('setupCommand', 'npm ci'), 'Runs in a shell in each new worktree.'),
     h('h3', 'Alerts'),
     field('Alert me', select('alerts', [['all', 'When a session asks, needs permission, or finishes'], ['needsYou', 'Only when a session asks or needs permission'], ['off', 'Never']])),
@@ -632,24 +631,77 @@ async function openSettings() {
     h('div.setting', h('span.setting-label', 'Alert sounds'), h('button.btn', { type: 'button', onclick: () => soundsDialog() }, icon('unmute'), 'Choose sounds & volume…'), h('span.setting-hint', 'A sound for each alert (or your own file), and the volume.')),
     field('Desktop notifications', check('desktopNotifications'), notificationsAllowed() ? 'Allowed in this browser.' : h('button.btn.small', { onclick: async e => { e.preventDefault(); const r = await askNotifications(); toast(r === 'granted' ? 'Notifications allowed.' : 'Notifications are blocked in this browser’s site settings.'); } }, 'Allow in this browser')),
     h('h3', 'Editor'),
-    field('Font size', h('input.input', { type: 'number', min: '9', max: '24', value: String(s.fontSize || 13), 'data-key': 'fontSize', 'data-type': 'num' })));
+    field('Font size', num('fontSize', 13, 9, 24)));
   const v = await confirmDialog({ title: 'Settings', detail: form, buttons: [{ label: 'Save', value: 'save', primary: true }] });
   if (v !== 'save') return;
   const values = {};
   for (const el of form.querySelectorAll('[data-key]')) {
     const k = el.dataset.key;
     if (el.dataset.type === 'bool') values[k] = el.checked;
-    else if (el.dataset.type === 'num') values[k] = Number(el.value) || 13;
-    else if (k === 'claudeArgs' || k === 'copyToWorktree') values[k] = el.value.split(/\s+/).filter(Boolean);
+    else if (el.dataset.type === 'num') {
+      const n = Math.round(Number(el.value));
+      values[k] = el.value.trim() === '' || !Number.isFinite(n) ? Number(el.dataset.default) : Math.min(Number(el.max), Math.max(Number(el.min), n));
+    } else if (k === 'claudeArgs' || k === 'copyToWorktree') values[k] = splitArgs(el.value);
     else values[k] = el.value.trim();
   }
+  const oldSize = store.settings.fontSize || 13;
   store.settings = await call('settings.set', { values });
+  if (store.settings.fontSize !== oldSize) applyFontSize(store.settings.fontSize);
   toast('Settings saved.', { timeout: 2000 });
 }
 
+/** Split like a shell: quotes keep spaces ("a b" or 'a b'), a backslash escapes the next character. */
+function splitArgs(str) {
+  const out = [];
+  let cur = '';
+  let has = false; // an empty quoted value ("") still counts
+  let quote = '';
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (quote === "'") {
+      if (c === "'") quote = '';
+      else cur += c;
+    } else if (quote === '"') {
+      if (c === '"') quote = '';
+      else if (c === '\\' && (str[i + 1] === '"' || str[i + 1] === '\\')) cur += str[++i];
+      else cur += c;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      has = true;
+    } else if (c === '\\' && i + 1 < str.length) {
+      cur += str[++i];
+      has = true;
+    } else if (/\s/.test(c)) {
+      if (has || cur) out.push(cur);
+      cur = '';
+      has = false;
+    } else cur += c;
+  }
+  if (has || cur) out.push(cur);
+  return out;
+}
+
+/** The reverse of splitArgs: quote the values that need it. */
+function joinArgs(list) {
+  return list.map(a => (/^[\w@%+=:,./~-]+$/.test(a) ? a : `"${a.replace(/["\\]/g, '\\$&')}"`)).join(' ');
+}
+
+function applyFontSize(n) {
+  for (const ws of app.workspaces.values()) {
+    for (const t of ws.allTabs()) {
+      const ed = t.editor || (t.view && t.view.editor);
+      if (ed) ed.updateOptions({ fontSize: n });
+      if (t.term) {
+        t.term.options.fontSize = n;
+        t.layout();
+      }
+    }
+  }
+}
+
 function maybeAskNotifications() {
-  if (!('Notification' in window) || Notification.permission !== 'default' || localStorage.getItem('skiffcode.askedNotify')) return;
-  localStorage.setItem('skiffcode.askedNotify', '1');
+  if (!('Notification' in window) || Notification.permission !== 'default' || readStored('skiffcode.askedNotify')) return;
+  try { localStorage.setItem('skiffcode.askedNotify', '1'); } catch { /* storage unavailable: ask again next time */ }
   toast('Get a desktop notification when Claude needs you?', { timeout: 0, icon: 'bell', actions: [{ label: 'Allow notifications', action: () => askNotifications() }] });
 }
 
@@ -679,19 +731,27 @@ function updateStatusBar() {
         unread ? [' ', h('span.unread-dot'), String(unread)] : null),
       memoryItem()),
     h('div.sb-right',
-      pos ? h('span.sb-item', pos) : null,
+      pos ? h('span.sb-item.sb-pos', pos) : null,
       tab && tab.kind === 'file' ? h('span.sb-item', languageOf(tab.path)) : null,
       st && st.dirty ? h('span.sb-item.click', { onclick: () => ws.showRight('scm') }, `${st.dirty} uncommitted`) : null,
       st && st.base ? h('span.sb-item', { title: `Compared with ${st.base}` }, `${st.ahead}↑ ${st.behind}↓ vs ${st.base}`) : null,
       wt ? h('span.sb-item', { title: ws.root }, icon(wt.folder ? 'folder' : wt.isMain ? 'home' : 'branch'), wt.folder ? wt.repo.name : `${wt.repo.name} / ${wt.branch || basename(ws.root)}`) : null,
       h(`span.sb-item${connected() ? '' : '.error'}`, { title: connected() ? 'Connected to the SkiffCode server' : 'Reconnecting…' }, icon(connected() ? 'link' : 'close')),
-      h('span.sb-item.click', { title: `${store.prefs.muted ? 'Sounds off — click to turn on' : `Sounds on (${store.settings.volume ?? 70}%) — click to mute`}\nRight-click: choose sounds & volume`, onclick: toggleMute, oncontextmenu: e => { e.preventDefault(); void soundsDialog(); } }, icon(store.prefs.muted ? 'mute' : 'unmute')),
+      h('span.sb-item.click', { title: `${store.prefs.muted ? 'Sounds off — click to turn on' : `Sounds on (${store.settings.volume}%) — click to mute`}\nRight-click: choose sounds & volume`, onclick: toggleMute, oncontextmenu: e => { e.preventDefault(); void soundsDialog(); } }, icon(store.prefs.muted ? 'mute' : 'unmute')),
       h('span.sb-item.click', { title: 'Panel colors', onclick: () => colorsDialog() }, icon('palette')),
       h('span.sb-item.click', { title: 'Settings', onclick: openSettings }, icon('gear'))));
   document.body.classList.toggle('attention', need > 0);
   updateTitle(wt ? (wt.folder ? wt.repo.name : `${wt.repo.name} / ${wt.branch || basename(ws.root)}`) : '');
 }
 app.updateStatusBar = updateStatusBar;
+/** Cursor moves (every keystroke): update just the position. */
+app.updateCursor = () => {
+  const el = document.querySelector('#statusbar .sb-pos');
+  const tab = app.active && app.active.activeTab;
+  const p = tab && tab.kind === 'file' && tab.editor && tab.editor.getPosition();
+  if (el && p) el.textContent = `Ln ${p.lineNumber}, Col ${p.column}`;
+  else updateStatusBar();
+};
 subscribe(() => { applyColors(); document.body.classList.toggle('density-compact', store.settings.density === 'compact'); });
 setInterval(updateStatusBar, 30_000); // keeps the usage reset countdown current
 
@@ -713,6 +773,7 @@ document.addEventListener('visibilitychange', () => { lastView = ''; reportView(
 // ------------------------------------------------------------------ keyboard
 
 function isKey(e, spec) {
+  if (e.getModifierState && e.getModifierState('AltGraph')) return false; // AltGr reports Ctrl+Alt but types a character
   const parts = spec.toLowerCase().split('+');
   const key = parts.pop();
   const want = { ctrl: parts.includes('ctrl'), alt: parts.includes('alt'), shift: parts.includes('shift') };
@@ -824,9 +885,17 @@ on('open.worktree', async ({ path: p, session: id }) => {
 on('toast', t => toast(t.text, { kind: t.kind }));
 on('close', () => updateStatusBar());
 on('reconnect', async () => {
-  const hello = await call('hello');
-  applySnapshot(hello);
-  await loadAll();
+  // A failed call here must not leave terminals detached: retry a few times, then attach anyway.
+  for (let i = 0; i < 5 && connected(); i++) {
+    try {
+      applySnapshot(await call('hello'));
+      await loadAll();
+      break;
+    } catch {
+      await new Promise(r => setTimeout(r, 500 * (i + 1)));
+    }
+  }
+  if (!connected()) return; // dropped again: the next reconnect does this
   for (const ws of app.workspaces.values()) for (const t of ws.allTabs()) if (t.kind === 'session') { t.attached = false; t.attach(); }
   updateStatusBar();
 });
