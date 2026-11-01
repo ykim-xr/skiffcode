@@ -418,7 +418,7 @@ export class TerminalTab extends Tab {
     try {
       if (window.WebglAddon) this.term.loadAddon(new WebglAddon.WebglAddon());
     } catch { /* canvas fallback */ }
-    this.term.onData(d => sendInput(this.sessionId, d));
+    this.term.onData(d => { if (!this.replaying) sendInput(this.sessionId, d); });
     this.term.attachCustomKeyEventHandler(e => this.ws.app.terminalKey(e, this));
     // Ctrl+V reaches xterm as a paste event: take it here so several lines can be confirmed first
     this.host.addEventListener('paste', e => {
@@ -473,7 +473,9 @@ export class TerminalTab extends Tab {
     this.offTerm = onTerminal(sessionId, (type, bytes) => {
       if (type === 1) {
         this.term.reset();
-        this.term.write(bytes);
+        // Saved output still holds old queries (cursor position…): xterm would answer them again, and the shell would get the answers as typed text.
+        this.replaying = true;
+        this.term.write(bytes, () => { this.replaying = false; });
         this.ended = false;
         this.updateBanner();
       } else if (type === 2) this.term.write(bytes);

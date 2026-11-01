@@ -6,7 +6,14 @@ window.Terminal = class {
     // like xterm's textarea: a paste event goes to the terminal as text
     this.pre.addEventListener('paste', e => { const t = e.clipboardData && e.clipboardData.getData('text/plain'); if (t) { e.preventDefault(); this.paste(t); } });
     this.pre.addEventListener('keydown', e => { if (this.kh && this.kh(e) === false) return; if (e.key.length === 1) this._d && this._d(e.key); else if (e.key === 'Enter') this._d && this._d('\r'); e.preventDefault(); }); }
-  write(d) { this.text += typeof d === 'string' ? d : this.dec.decode(d, { stream: true }); this.pre.textContent = this.text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').slice(-20000); }
+  write(d, cb) {
+    const s = typeof d === 'string' ? d : this.dec.decode(d, { stream: true });
+    this.text += s;
+    this.pre.textContent = this.text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').slice(-20000);
+    // like xterm: a cursor-position query is answered while the data is parsed
+    for (let i = s.indexOf('\x1b[6n'); i !== -1 && this._d; i = s.indexOf('\x1b[6n', i + 1)) this._d('\x1b[1;1R');
+    if (cb) cb();
+  }
   reset() { this.text = ''; }
   onData(fn) { this._d = fn; return { dispose() {} }; }
   attachCustomKeyEventHandler(fn) { this.kh = fn; }

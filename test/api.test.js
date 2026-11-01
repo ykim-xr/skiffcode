@@ -70,7 +70,7 @@ sh(`git init -q -b main && git config user.email t@t && git config user.name t &
 let server;
 function startServer() {
   server = spawn('node', [path.join(APP, 'server', 'main.js')], {
-    env: { ...process.env, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT), SHELL: '/bin/bash', SKIFFCODE_ALERT_LOG: path.join(tmp, 'alerts.jsonl'), CLAUDE_CONFIG_DIR: CLAUDE_HOME, SKIFFCODE_STALL_MS: '2500', SKIFFCODE_USAGE_URL: `http://127.0.0.1:${USAGE_PORT}/usage` },
+    env: { ...process.env, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT), SHELL: '/bin/bash', SKIFFCODE_ALERT_LOG: path.join(tmp, 'alerts.jsonl'), CLAUDE_CONFIG_DIR: CLAUDE_HOME, SKIFFCODE_STALL_MS: '2500', SKIFFCODE_USAGE_URL: `http://127.0.0.1:${USAGE_PORT}/usage`, CLAUDE_CODE_CHILD_SESSION: '1', CLAUDE_CODE_MESSAGING_TOKEN: 'leak' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stderr.on('data', d => process.stderr.write(`[server] ${d}`));
@@ -140,8 +140,10 @@ function startServer() {
     const shell = await c.call('sessions.create', { kind: 'shell', worktreePath: wt, cols: 90, rows: 25 });
     await c.call('term.open', { id: shell.id, cols: 90, rows: 25 });
     await sleep(400);
-    c.input(shell.id, 'echo "sum=$((20+22))"; stty size\r');
+    c.input(shell.id, 'echo "sum=$((20+22))"; stty size; echo "child=${CLAUDE_CODE_CHILD_SESSION:-none} tok=${CLAUDE_CODE_MESSAGING_TOKEN:-none}"\r');
     await until(() => /sum=42/.test(c.term.get(shell.id) || '') && /25 90/.test(c.term.get(shell.id) || ''), 'shell output');
+    // the server was started with a Claude Code session's variables: its terminals don't get them
+    await until(() => /child=none tok=none/.test(c.term.get(shell.id) || ''), 'no inherited Claude session variables');
     c.input(shell.id, 'export KEEP=still-here\r');
     await sleep(500); // let the shell run the export before the server is killed
     // restart the server: the shell (and Claude) keep running
@@ -261,6 +263,19 @@ function startServer() {
     assert.deepEqual([after.model, after.contextPct], ['Sonnet', 33], 'status line read at startup');
     assert.equal(after.unread, undefined, 'a restart marks nothing unread');
     assert.equal(after.name, 'mine', 'the SkiffCode rename not yet handed over is kept');
+    await c.call('sessions.forget', { id: s.id });
+  });
+
+  await step('restart: a subagent that finished before stays finished (the log is read again at startup)', async () => {
+    plan('SessionStart,UserPromptSubmit,Agent:Explore:Find auth code,sleep:300,Stop,hang');
+    const s = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, cols: 80, rows: 24 });
+    const agentState = async () => (((await c.call('hello')).sessions.find(x => x.id === s.id) || {}).agents || [])[0]?.state;
+    await until(async () => (await agentState()) === 'done', 'done when Claude stops');
+    server.kill('SIGTERM');
+    await sleep(300);
+    await startServer();
+    c = await new Client(PORT, token).connect();
+    assert.equal(await agentState(), 'done', 'still done after the restart');
     await c.call('sessions.forget', { id: s.id });
   });
 
@@ -474,6 +489,9 @@ function startServer() {
     assert.deepEqual([p2.commits.map(x => x.subject), p2.more], [['init'], false]);
     const files = await c.call('git.commitFiles', { root: wt, sha: cm.commits[0].sha });
     assert.deepEqual(files.files.map(f => f.path), ['src/app.py']);
+    // lines added and deleted per file, as git counts them
+    const [added, deleted] = sh(`git show --numstat --format= ${cm.commits[0].sha}`, wt).trim().split('\t').map(Number);
+    assert.deepEqual(files.files.map(f => [f.added, f.deleted]), [[added, deleted]]);
     const stt = await c.call('worktrees.status', { path: wt, fresh: true });
     assert.equal(stt.ahead, 1);
     assert.equal(stt.dirty, 1);

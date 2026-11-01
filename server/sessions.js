@@ -281,7 +281,11 @@ class Sessions extends EventEmitter {
     const l = this.live.get(id);
     if (!l) return;
     if (local) l.localAt = Date.now();
-    if (l.state === state) return;
+    if (l.state === state) {
+      // The same report again still settles subagents (ones read back from the log at startup, after poll set the state)
+      if (!local && this.settleAgents(id, state)) this.emit('change');
+      return;
+    }
     // Claude also sends a "permission" notification for its question dialog: it's still a question.
     if (l.state === 'question' && state === 'permission' && !local) return;
     const from = l.state;
@@ -584,14 +588,17 @@ class Sessions extends EventEmitter {
   /** When Claude stops, its foreground subagents are done; when the session ends, all are. */
   settleAgents(id, state) {
     const a = this.agents.get(id);
-    if (!a) return;
+    if (!a) return false;
+    let changed = false;
     for (const x of a.list) {
       if (x.state !== 'running') continue;
       if (state === 'ended' || (state === 'idle' && !x.background)) {
         x.state = state === 'ended' ? 'stopped' : 'done';
         x.endedAt = Date.now();
+        changed = true;
       }
     }
+    return changed;
   }
 
   /** Hooks go in a file passed with `claude --settings`; your ~/.claude/settings.json is never edited. */

@@ -2320,6 +2320,35 @@ const G = {};
     assert.deepEqual(out, [[], [], [], ['changes']]);
   });
 
+  await step('terminals: saved output is shown without answering its old cursor queries again', async () => {
+    const W = '.workspace:not(.hidden)';
+    await freshMain();
+    await page.click(`${W} .empty-actions .btn >> text=New shell`);
+    await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; return t && t.session && t.session.kind === 'shell' && t.attached; });
+    const id = await page.evaluate(() => window.skiffcode.active.activeTab.sessionId);
+    await page.evaluate(i => import('/js/rpc.js').then(r => r.sendInput(i, "printf 'q\\033[6n'; echo; echo asked-q\r")), id);
+    await page.waitForFunction(() => /asked-q/.test(window.skiffcode.active.activeTab.term.text || ''));
+    await sleep(300);
+    const replies = await page.evaluate(async i => {
+      const sent = [];
+      const send = WebSocket.prototype.send;
+      WebSocket.prototype.send = function (d) {
+        if (typeof d !== 'string') { const b = new Uint8Array(d.buffer || d); if (b[0] === 1) sent.push(new TextDecoder().decode(b.subarray(37))); }
+        return send.call(this, d);
+      };
+      const { call } = await import('/js/rpc.js');
+      const t = window.skiffcode.active.activeTab;
+      await call('term.close', { id: i });
+      t.attached = false;
+      await t.attach(); // the server sends the saved output again
+      await new Promise(r => setTimeout(r, 500));
+      WebSocket.prototype.send = send;
+      return sent.filter(x => /\x1b\[\d+;\d+R/.test(x));
+    }, id);
+    assert.deepEqual(replies, [], 'no answers sent for queries in the saved output');
+    await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.forget', { id: i })), id);
+  });
+
   await step('no JavaScript errors', async () => {
     const real = errors.filter(e => !/favicon|ResizeObserver loop/.test(e));
     assert.deepEqual(real, []);

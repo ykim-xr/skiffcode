@@ -22,6 +22,11 @@ const { run, shq, skiffcodeHome, privateDir, realpath, isGitDir, TERM_SIZE, with
 
 const VERSION = require('../package.json').version;
 const VIEW_SANDBOX = 'allow-scripts allow-forms allow-popups allow-modals allow-downloads'; // what a previewed page may do: its own origin, no SkiffCode access
+// Started from inside Claude Code (its shell, or a terminal that inherited it), the server would hand that Claude's
+// session variables to every terminal and session: Claude then treats them as its children (no transcripts) and
+// they could message it. Your own settings come back from your shell profile in each terminal.
+for (const k of ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SSE_PORT', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN']) delete process.env[k];
+
 const HOME = skiffcodeHome();
 const PORT = Number(process.env.SKIFFCODE_PORT || 3417);
 const HOSTNAME = process.env.SKIFFCODE_BIND || '127.0.0.1';

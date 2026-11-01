@@ -256,6 +256,7 @@ export class ScmView {
       icon('file', 'file-type'),
       h('span.scm-name', basename(f.path)),
       h('span.scm-dir', dirname(f.path)),
+      typeof f.added === 'number' ? h('span.commit-stat', h('span.add', `+${f.added}`), ' ', h('span.del', `−${f.deleted}`)) : null,
       h('span.git-letter', STATUS_LETTER(f.status)));
     })];
   }

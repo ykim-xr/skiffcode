@@ -216,7 +216,28 @@ async function history(dir, skip = 0, max = 50) {
 }
 
 async function commitFiles(dir, sha) {
-  return parseNameStatus(await git(dir, ['show', '--name-status', '-z', '-M', '--format=', safeRef(sha)]).catch(() => ''));
+  const ref = safeRef(sha);
+  const [names, nums] = await Promise.all([
+    git(dir, ['show', '--name-status', '-z', '-M', '--format=', ref]).catch(() => ''),
+    git(dir, ['show', '--numstat', '-z', '-M', '--format=', ref]).catch(() => ''),
+  ]);
+  const counts = parseNumstat(nums);
+  return parseNameStatus(names).map(f => ({ ...f, ...counts.get(f.path) }));
+}
+
+/** `git … --numstat -z`: path -> { added, deleted } lines (null for a binary file). A rename's paths follow its counts. */
+function parseNumstat(out) {
+  const map = new Map();
+  const parts = out.split('\0');
+  const num = v => (v === '-' ? null : Number(v));
+  for (let i = 0; i < parts.length; i++) {
+    const m = /^\n?(-|\d+)\t(-|\d+)\t([\s\S]*)$/.exec(parts[i]);
+    if (!m) continue;
+    let p = m[3];
+    if (p === '') { p = parts[i + 2]; i += 2; }
+    if (p) map.set(p, { added: num(m[1]), deleted: num(m[2]) });
+  }
+  return map;
 }
 
 async function parentOf(dir, sha) {
