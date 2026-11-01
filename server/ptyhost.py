@@ -15,6 +15,7 @@ import errno
 import fcntl
 import os
 import pty
+import re
 import selectors
 import signal
 import socket
@@ -51,6 +52,18 @@ def clean_cut(buf, cut):
     return cut
 
 
+# Replayed old output must not make the browser terminal answer: the reply would reach the new program's tty
+# before it is in raw mode and show up as typed text. Turning on focus reporting counts: xterm reports focus at once.
+TERMINAL_QUERIES = re.compile(
+    rb"\x1b\[(?:\?1004h|[>=]?[0-9;]*c|\??[0-9;]*n|>[0-9;]*q|\?u|\??[0-9;]*\$p|(?:1[13-9]|2[01])t)"
+    rb"|\x1b\][0-9;]*\?(?:\x07|\x1b\\)"
+    rb"|\x1bP(?:\$q|\+q)[^\x1b]*\x1b\\"
+)
+# Replayed output may leave these modes on; the new program turns on what it needs, and until then
+# the terminal's reports (focus, paste, mouse) would reach the tty as typed text.
+MODE_RESETS = b"\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
+
+
 def main():
     sep = sys.argv.index("--")
     sock_path, cols, rows, cwd = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
@@ -64,8 +77,10 @@ def main():
             with open(preload_path, "rb") as f:
                 preload = f.read()
             preload = preload[clean_cut(preload, max(0, len(preload) - HISTORY_LIMIT // 2)):]
+            preload = TERMINAL_QUERIES.sub(b"", preload)
             if preload:
                 preload += b"\r\n\x1b[2m\xe2\x94\x80\xe2\x94\x80 restarted \xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n\r\n"
+                preload += MODE_RESETS
         except OSError:
             preload = b""
 

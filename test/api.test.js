@@ -144,6 +144,9 @@ function startServer() {
     await until(() => /sum=42/.test(c.term.get(shell.id) || '') && /25 90/.test(c.term.get(shell.id) || ''), 'shell output');
     // the server was started with a Claude Code session's variables: its terminals don't get them
     await until(() => /child=none tok=none/.test(c.term.get(shell.id) || ''), 'no inherited Claude session variables');
+    // output with terminal queries and a mode left on, to check what a restart replays
+    c.input(shell.id, "printf 'qtext\\033[c\\033[>0q\\033]7501;?\\007\\033[?1004h-qend\\n'\r");
+    await until(() => /-qend\r\n/.test(c.term.get(shell.id) || ''), 'query output');
     c.input(shell.id, 'export KEEP=still-here\r');
     await sleep(500); // let the shell run the export before the server is killed
     // restart the server: the shell (and Claude) keep running
@@ -168,6 +171,10 @@ function startServer() {
     await c.call('term.close', { id: shell.id });
     await c.call('term.open', { id: shell.id, cols: 90, rows: 25 });
     await until(() => /sum=42[\s\S]*restarted/.test(c.term.get(shell.id) || ''), 'old output shown above the restarted shell');
+    const replayed = c.term.get(shell.id);
+    assert.match(replayed, /qtext-qend\r\n/, 'normal text replayed');
+    assert.ok(!/\x1b\[c|\x1b\[>0q|\x1b\]7501;\?\x07|\x1b\[\?1004h/.test(replayed), 'nothing replayed makes the terminal answer');
+    assert.match(replayed, /restarted[\s\S]*\x1b\[\?1004l/, 'modes reset after the restarted line');
     c.input(shell.id, 'echo "again=$((1+1))"\r');
     await until(() => /again=2/.test(c.term.get(shell.id) || ''), 'restarted shell works');
     await c.call('sessions.forget', { id: shell.id });
