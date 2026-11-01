@@ -56,7 +56,8 @@ status_json() {
       .then(r => (r.ok ? r.text() : "")).then(t => process.stdout.write(t)).catch(() => {});
   ' "$PORT"
 }
-port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
+# Time-limited: under WSL mirrored networking a closed loopback port can stay silent, and a plain connect then waits about 2 minutes.
+port_busy() { timeout --foreground 1 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0"' "$PORT" 2>/dev/null; }
 port_owner() { command -v ss >/dev/null && ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'users:(([^)]*' | sed 's/users:((//' | head -1; }
 running() { [[ -n "$(status_json 2>/dev/null || true)" ]]; }
 
