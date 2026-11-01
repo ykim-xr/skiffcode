@@ -51,6 +51,11 @@ function live(w) {
   return w && (!w.resetsAt || w.resetsAt > Date.now()) ? w : undefined;
 }
 
+/** Claude reports weekly usage but no 5-hour window: the plan has no 5-hour limit. */
+function noFiveHour(u) {
+  return !!(u && u.weekly && !u.fiveHour);
+}
+
 function level(pct) {
   return pct >= 90 ? 'hot' : pct >= 70 ? 'warm' : 'ok';
 }
@@ -71,7 +76,7 @@ export function usageItem() {
   const label = a ? a.name : cur ? cur.email : '';
   const tip = [
     `Claude login: ${a ? a.name : cur ? whoText(cur) || 'signed in' : 'not signed in'}`,
-    five ? `5-hour: ${Math.round(five.used)}% used, ${resetText(five.resetsAt)}` : '5-hour: not reported yet',
+    five ? `5-hour: ${Math.round(five.used)}% used, ${resetText(five.resetsAt)}` : noFiveHour(u) ? '5-hour: no limit reported' : '5-hour: not reported yet',
     week ? `Weekly: ${Math.round(week.used)}% used, ${resetText(week.resetsAt)}` : 'Weekly: not reported yet',
     u ? `Updated ${timeText(u.at)} (Claude reports usage while a session is working)` : 'Usage appears once a Claude session talks to Claude (Pro/Max logins).',
     'Click to switch account or refresh usage',
@@ -79,7 +84,7 @@ export function usageItem() {
   return h('span.sb-item.click.usage', { title: tip, onclick: () => accountsDialog() },
     icon('claude', 'st-claude'),
     store.accounts.length && label ? h('span.usage-acct', label) : null,
-    meter('5h', five),
+    noFiveHour(u) ? null : meter('5h', five),
     five && five.resetsAt ? h('span.usage-reset', `↻ ${untilText(five.resetsAt)}`) : null,
     meter('wk', week),
     week && week.resetsAt ? h('span.usage-reset', `↻ ${untilText(week.resetsAt)}`) : null);
@@ -115,7 +120,7 @@ export async function accountsDialog() {
         h('div.account-main',
           h('div.account-name', a.name, a.inUse ? h('span.account-tag', 'in use') : null),
           h('div.account-who', whoText(a) || 'Saved login'),
-          h('div.account-usage', meter('5h', five), five ? h('span.muted', ` ${resetText(five.resetsAt)}`) : null),
+          noFiveHour(u) ? null : h('div.account-usage', meter('5h', five), five ? h('span.muted', ` ${resetText(five.resetsAt)}`) : null),
           h('div.account-usage', meter('wk', week), week ? h('span.muted', ` ${resetText(week.resetsAt)}`) : null),
           u ? h('div.account-updated', `Updated ${timeText(u.at)}`) : null),
         h('div.account-actions',

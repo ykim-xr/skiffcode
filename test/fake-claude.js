@@ -69,11 +69,11 @@ const keys = { n: 0, wake: () => {} };
   for (const step of plan.split(/[,\n]/).map(s => s.trim()).filter(Boolean)) {
     if (step.startsWith('sleep:')) await new Promise(r => setTimeout(r, Number(step.slice(6))));
     else if (step.startsWith('Status:')) {
-      // Status:<5h%>:<weekly%> — run the statusLine command like Claude does after a response
+      // Status:<5h%>:<weekly%> — run the statusLine command like Claude does after a response; a 5h of "-" sends no 5-hour window
       const [, five, week] = step.split(':').map(Number);
       const named = step.split(':')[3]; // Status:5h:wk:<session name, as /rename would set it>
       const now = Math.floor(Date.now() / 1000);
-      const input = { session_id: sessionId, ...(named ? { session_name: named } : {}), model: { display_name: 'Opus' }, context_window: { used_percentage: 12 }, rate_limits: { five_hour: { used_percentage: five, resets_at: now + 7200 }, seven_day: { used_percentage: week, resets_at: now + 3 * 86400 } } };
+      const input = { session_id: sessionId, ...(named ? { session_name: named } : {}), model: { display_name: 'Opus' }, context_window: { used_percentage: 12 }, rate_limits: { ...(Number.isNaN(five) ? {} : { five_hour: { used_percentage: five, resets_at: now + 7200 } }), seven_day: { used_percentage: week, resets_at: now + 3 * 86400 } } };
       const out = execSync(settings.statusLine.command, { shell: '/bin/sh', input: JSON.stringify(input) }).toString();
       if (out.trim()) fs.appendFileSync(process.env.FAKE_LOG + '.status', out);
     } else if (/^Agent(Bg|Async)?:/.test(step)) {

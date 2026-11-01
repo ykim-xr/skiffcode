@@ -1016,6 +1016,15 @@ const G = {};
     assert.deepEqual(st.prefs.accounts.map(a => a.name), ['Work', 'Home']);
   });
 
+  await step('usage: a plan with no 5-hour limit shows only the weekly meter', async () => {
+    plan('SessionStart,UserPromptSubmit,Status:-:40,Stop,hang');
+    const s = await page.evaluate(() => import('/js/store.js').then(m => m.store.sessions.find(x => x.kind === 'claude')));
+    await page.evaluate(id => import('/js/rpc.js').then(r => r.call('sessions.stop', { id }).then(() => r.call('sessions.resume', { id }))), s.id);
+    await page.waitForSelector('.sb-item.usage .usage-meter.ok:has-text("40%")', { timeout: 10000 });
+    assert.deepEqual(await page.locator('.sb-item.usage .usage-meter').allTextContents(), ['wk  40%']);
+    assert.match(await page.getAttribute('.sb-item.usage', 'title'), /5-hour: no limit reported/);
+  });
+
   await step('Active panel (needs you + working, by repo) and subagents in the sidebar; collapsible; click opens', async () => {
     await page.click('.wt-row >> text=main');
     await page.waitForSelector('.wt-row.active >> text=main');
@@ -1863,6 +1872,62 @@ const G = {};
     await page.click('.modal .btn >> text=Don’t save');
     await page.waitForFunction(() => document.querySelectorAll('.workspace:not(.hidden) .tab').length === 1);
     assert.equal(await page.locator(`${W} .tab-title`).first().textContent(), 'site.css');
+  });
+
+  await step('tabs: Close to the right keeps the tab and the ones before it', async () => {
+    const W = '.workspace:not(.hidden)';
+    await freshMain();
+    await page.evaluate(async () => {
+      const ws = window.skiffcode.active;
+      for (const p of ['README.md', 'src/app.py', 'src/site.css']) await ws.openFile(p);
+    });
+    await page.waitForFunction(() => document.querySelectorAll('.workspace:not(.hidden) .tab').length === 3);
+    await page.click(`${W} .tab:has-text("site.css")`, { button: 'right' });
+    assert.equal(await page.locator('.menu-item >> text=Close to the right').count(), 0, 'not offered on the last tab');
+    await page.keyboard.press('Escape');
+    await page.click(`${W} .tab:has-text("README.md")`, { button: 'right' });
+    await page.click('.menu-item >> text=Close to the right');
+    await page.waitForFunction(() => document.querySelectorAll('.workspace:not(.hidden) .tab').length === 1);
+    assert.equal(await page.locator(`${W} .tab-title`).first().textContent(), 'README.md');
+  });
+
+  await step('tabs: Pin moves a tab first, Close others keeps it, a reload keeps it pinned, Unpin brings back the close button', async () => {
+    const W = '.workspace:not(.hidden)';
+    const titles = () => page.$$eval(`${W} .tab-title`, els => els.map(e => e.textContent));
+    await freshMain();
+    await page.evaluate(async () => {
+      const ws = window.skiffcode.active;
+      for (const p of ['README.md', 'src/app.py', 'src/site.css']) await ws.openFile(p);
+    });
+    await page.waitForFunction(() => document.querySelectorAll('.workspace:not(.hidden) .tab').length === 3);
+    await page.click(`${W} .tab:has-text("site.css")`, { button: 'right' });
+    await page.click('.menu-item >> text=Pin');
+    assert.deepEqual(await titles(), ['site.css', 'README.md', 'app.py'], 'the pinned tab goes first');
+    assert.equal(await page.locator(`${W} .tab.sticky`).count(), 1);
+    assert.equal(await page.locator(`${W} .tab.sticky .tab-close .icon-pin`).count(), 1, 'the pin shows in place of the close button');
+    assert.equal(await page.locator(`${W} .tab.sticky .tab-close`).evaluate(el => getComputedStyle(el).opacity), '1', 'visible without hover');
+    await page.click(`${W} .tab:has-text("README.md")`, { button: 'right' });
+    await page.click('.menu-item >> text=Close others');
+    await page.waitForFunction(() => document.querySelectorAll('.workspace:not(.hidden) .tab').length === 2);
+    assert.deepEqual(await titles(), ['site.css', 'README.md'], 'Close others keeps the pinned tab');
+    const r = await page.evaluate(async () => {
+      const app = window.skiffcode;
+      const ws = app.active;
+      const { Workspace } = await import('/js/workspace.js');
+      const { store } = await import('/js/store.js');
+      ws.saveLayout();
+      const w = new Workspace(app, { path: ws.root, repo: { path: ws.repoPath } });
+      w.saveSoon = () => {};
+      w.restore();
+      const out = { saved: store.layouts[ws.root].top[0].tabs.map(t => !!t.sticky), restored: w.top.panes[0].tabs.map(t => !!t.sticky) };
+      w.dispose();
+      return out;
+    });
+    assert.deepEqual(r.saved, [true, false]);
+    assert.deepEqual(r.restored, [true, false], 'pinned state survives a restore');
+    await page.click(`${W} .tab.sticky .tab-close`);
+    assert.equal(await page.locator(`${W} .tab.sticky`).count(), 0);
+    assert.equal(await page.locator(`${W} .tab .tab-close .icon-close`).count(), 2, 'Unpin brings back the close button');
   });
 
   await step('dialogs: focus goes back to where it was when a dialog closes', async () => {

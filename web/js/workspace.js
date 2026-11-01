@@ -33,6 +33,11 @@ class Pane {
     this.bar = h('div.tabbar', {
       ondragover: e => { if (ws.dragTab) e.preventDefault(); },
       ondrop: e => { e.preventDefault(); ws.dropTab(this, null, 'center'); },
+      onwheel: e => {
+        if (!e.deltaY || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+        e.preventDefault();
+        this.bar.scrollLeft += e.deltaY;
+      },
       // Handled here, not per tab: a click re-renders the tabs, so the two
       // clicks of a double-click land on different elements.
       ondblclick: e => {
@@ -109,10 +114,26 @@ class Pane {
       const at = this.active ? this.tabs.indexOf(this.active) + 1 : this.tabs.length;
       this.tabs.splice(at, 0, tab);
     } else this.tabs.splice(Math.min(index, this.tabs.length), 0, tab);
+    this.keepPinnedLeft();
     this.body.append(tab.el);
     tab.el.classList.add('hidden');
     if (activate || !this.active) this.activate(tab);
     else this.renderBar();
+  }
+
+  /** A stable reorder: pinned tabs first, every group keeps its order. */
+  keepPinnedLeft() {
+    this.tabs = [...this.tabs.filter(t => t.sticky), ...this.tabs.filter(t => !t.sticky)];
+  }
+
+  /** Pinning also makes a preview tab permanent. The tab goes to the border between the two groups either way. */
+  setSticky(tab, on) {
+    tab.sticky = on;
+    if (on) tab.pinned = true;
+    this.tabs.splice(this.tabs.indexOf(tab), 1);
+    this.tabs.splice(this.tabs.filter(t => t.sticky).length, 0, tab);
+    this.renderBar();
+    this.ws.changed();
   }
 
   /** `rebuild: false` marks the tab in place, so the element under the pointer survives and a drag can start on it. */
@@ -131,6 +152,7 @@ class Pane {
     requestAnimationFrame(() => tab.layout());
     if (rebuild) this.renderBar();
     else this.markActive();
+    if (tab.tabEl) tab.tabEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     this.ws.changed();
   }
 
@@ -159,7 +181,7 @@ class Pane {
     const ws = this.ws;
     const bottom = this.row.kind === 'bottom';
     clear(this.bar, this.tabs.map(t => {
-      const el = h(`div.tab${t === this.active ? '.active' : ''}${t.pinned === false ? '.preview' : ''}${t.dirty() ? '.dirty' : ''}`, {
+      const el = h(`div.tab${t === this.active ? '.active' : ''}${t.sticky ? '.sticky' : ''}${t.pinned === false ? '.preview' : ''}${t.dirty() ? '.dirty' : ''}`, {
         title: t.tooltip(),
         draggable: 'true',
         onmousedown: e => {
@@ -173,9 +195,11 @@ class Pane {
           contextMenu(e, [
             { label: t.kind === 'session' ? 'Close session' : 'Close', action: () => ws.closeTab(t), hint: keyHint('closeTab') || keyHint('closeTabOutsideTerminals') },
             t.kind === 'session' && t.session && t.session.kind === 'claude' && t.session.state !== 'ended' ? { label: 'Hide tab (keeps running)', action: () => ws.hideTab(t) } : null,
+            { label: t.sticky ? 'Unpin' : 'Pin', icon: 'pin', action: () => this.setSticky(t, !t.sticky) },
             t.kind === 'session' && t.session ? { label: 'Rename…', icon: 'edit', action: () => ws.app.actions.renameSession(t.session) } : null,
             t.kind === 'session' && t.session && t.session.kind === 'claude' ? { label: 'Delete session and conversation…', icon: 'trash', danger: true, action: () => ws.app.actions.purgeSession(t.session) } : null,
-            { label: 'Close others', action: async () => { for (const x of this.tabs.filter(y => y !== t)) await ws.closeTab(x); } }, // one question at a time
+            { label: 'Close others', action: async () => { for (const x of this.tabs.filter(y => y !== t && !y.sticky)) await ws.closeTab(x); } }, // one question at a time
+            this.tabs.indexOf(t) < this.tabs.length - 1 ? { label: 'Close to the right', action: async () => { for (const x of this.tabs.slice(this.tabs.indexOf(t) + 1).filter(y => !y.sticky)) await ws.closeTab(x); } } : null,
             { separator: true },
             this.tabs.length > 1 ? { label: 'Split right', icon: 'split', action: () => ws.split(t, 'right') } : null,
             !bottom && this.tabs.length > 1 ? { label: 'Split down', icon: 'splitDown', action: () => ws.split(t, 'down') } : null,
@@ -200,10 +224,10 @@ class Pane {
       h('span.tab-title', t.title()),
       t.unread && t.unread() ? h('span.unread-dot') : null,
       h('button.tab-close', {
-        title: t.kind === 'session' ? 'Close session' : 'Close',
+        title: t.sticky ? 'Unpin' : t.kind === 'session' ? 'Close session' : 'Close',
         onmousedown: e => e.stopPropagation(),
-        onclick: e => { e.stopPropagation(); ws.closeTab(t); },
-      }, icon('close')));
+        onclick: e => { e.stopPropagation(); if (t.sticky) this.setSticky(t, false); else ws.closeTab(t); },
+      }, icon(t.sticky ? 'pin' : 'close')));
       t.tabEl = el;
       return el;
     }),
@@ -915,7 +939,7 @@ export class Workspace {
   saveLayout() {
     const paneSpec = p => {
       const saved = p.tabs.filter(t => t.pinned !== false && t.serialize()); // blank web tabs have nothing to save
-      return { tabs: saved.map(t => t.serialize()), active: Math.max(0, saved.indexOf(p.active)) };
+      return { tabs: saved.map(t => (t.sticky ? { ...t.serialize(), sticky: true } : t.serialize())), active: Math.max(0, saved.indexOf(p.active)) };
     };
     // `top` stays the flat list of main-area panes that older builds read; `main` adds the tree and its sizes.
     const layout = {
@@ -943,6 +967,7 @@ export class Workspace {
         const made = (ps && Array.isArray(ps.tabs) ? ps.tabs : []).map(spec => {
           const t = tabFromSpec(this, spec); // null for a session that is gone
           if (!t) return null;
+          if (spec.sticky) t.sticky = true;
           if (t.kind === 'session') open.add(t.sessionId);
           pane.add(t, { activate: false, index: pane.tabs.length }); // in saved order
           return t;
