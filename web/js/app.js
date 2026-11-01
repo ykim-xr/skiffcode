@@ -8,7 +8,7 @@ import { quickPick, promptDialog, confirmDialog, toast, contextMenu } from './di
 import { handleAlert, updateTitle, askNotifications, notificationsAllowed, playSound } from './alerts.js';
 import * as models from './models.js';
 import { newWorktreeDialog } from './worktree-dialog.js';
-import { usageItem, accountsDialog, accountName } from './accounts.js';
+import { usageItem, accountsDialog } from './accounts.js';
 import { resumeDialog, offerPastConversations } from './resume-dialog.js';
 import { applyColors, colorsDialog, defineEditorTheme } from './colors.js';
 import { addRepoDialog } from './add-repo-dialog.js';
@@ -535,8 +535,7 @@ const actions = {
     if (list.length) items.push({ separator: true, label: 'Sessions' });
     for (const s of list) {
       const repo = (store.repos.find(r => r.path === s.repoPath) || {}).name || '';
-      const acct = (store.accounts || []).length > 1 && s.kind === 'claude' ? ` · ${accountName(s.account)}` : '';
-      items.push({ label: `${s.unread ? '● ' : ''}${s.name}`, description: `${repo}${s.branch ? ` / ${s.branch}` : ''}${acct}`, detail: s.kind === 'shell' ? 'shell' : stateLabel(s), icon: sessionIcon(s), value: { session: s.id } });
+      items.push({ label: `${s.unread ? '● ' : ''}${s.name}`, description: `${repo}${s.branch ? ` / ${s.branch}` : ''}`, detail: s.kind === 'shell' ? 'shell' : stateLabel(s), icon: sessionIcon(s), value: { session: s.id } });
     }
     items.push({ separator: true, label: 'Worktrees' });
     for (const w of orderedWorktrees()) items.push({ label: w.branch || basename(w.path), description: w.repo.name, detail: w.path === store.active ? 'open' : '', icon: w.isMain ? 'home' : 'branch', value: { wt: w.path } });
@@ -573,8 +572,9 @@ const actions = {
       ['New group…', '', () => actions.newGroup()],
       ['Next worktree', keyHint('nextWorktree'), () => stepWorktree(1)],
       ['Previous worktree', keyHint('prevWorktree'), () => stepWorktree(-1)],
-      ['Split right', '', () => { const ws = app.active; if (ws && ws.activeTab) ws.splitRight(ws.activeTab); }],
-      ['Split down (move to bottom panel)', '', () => { const ws = app.active; if (ws && ws.activeTab) ws.splitDown(ws.activeTab); }],
+      ['Split right', '', () => { const ws = app.active; if (ws && ws.activeTab) ws.split(ws.activeTab, 'right'); }],
+      ['Split down', '', () => { const ws = app.active; if (ws && ws.activeTab) ws.split(ws.activeTab, 'down'); }],
+      ['Move to bottom panel', '', () => { const ws = app.active; if (ws && ws.activeTab) ws.moveToPanel(ws.activeTab); }],
       ['Toggle bottom panel', keyHint('togglePanel'), () => app.active && app.active.togglePanel()],
       [store.prefs.muted ? 'Unmute sounds' : 'Mute sounds', '', () => toggleMute()],
       ['Test alert sound', '', () => playSound('question')],

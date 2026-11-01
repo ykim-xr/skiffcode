@@ -11,20 +11,39 @@ const fs = require('fs');
 const { execSync } = require('child_process');
 const path = require('path');
 const args = process.argv.slice(2);
-// `claude auth login|logout|status`: a pretend login stored in the config dir
+// `claude auth login|logout|status`: a pretend claude.ai login in the config dir, laid out like Claude's
+// (.credentials.json, and oauthAccount in .claude.json); CLAUDE_CONFIG_DIR is required. Who signs in: $FAKE_LOGIN_AS, else the text of
+// $FAKE_SCRIPT_FILE.login, else the folder name, so two scratch logins differ.
 if (args[0] === 'auth') {
-  const dir = process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME, '.claude');
-  const f = path.join(dir, 'fake-login.json');
+  // Never fall back to ~/.claude: a test must not touch the real login
+  if (!process.env.CLAUDE_CONFIG_DIR) {
+    console.error('fake claude: auth needs CLAUDE_CONFIG_DIR');
+    process.exit(1);
+  }
+  const dir = process.env.CLAUDE_CONFIG_DIR;
+  const cred = path.join(dir, '.credentials.json');
+  const global = path.join(dir, '.claude.json');
+  const read = f => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
   if (args[1] === 'login') {
+    const asFile = `${process.env.FAKE_SCRIPT_FILE || ''}.login`;
+    const who = process.env.FAKE_LOGIN_AS || (fs.existsSync(asFile) ? fs.readFileSync(asFile, 'utf8').trim() : '') || path.basename(dir);
+    const now = Date.now();
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(f, JSON.stringify({ email: `me@${path.basename(dir)}.test`, orgName: `Org ${path.basename(dir)}` }));
-    console.log('Login successful.');
+    fs.writeFileSync(cred, JSON.stringify({ claudeAiOauth: { accessToken: `at-${who}-${now}`, refreshToken: `rt-${who}-${now}`, expiresAt: now + 3600e3, refreshTokenExpiresAt: now + 30 * 86400e3, scopes: ['user:inference'], subscriptionType: 'max' } }), { mode: 0o600 });
+    // Claude writes .claude.json a moment later: whoever waits for the login must wait for both
+    setTimeout(() => {
+      const g = read(global) || {};
+      g.oauthAccount = { accountUuid: `acct-${who}`, emailAddress: `${who}@example.test`, organizationUuid: `org-${who}`, organizationName: `Org ${who}` };
+      fs.writeFileSync(global, JSON.stringify(g));
+      console.log('Login successful.');
+    }, 300);
   } else if (args[1] === 'logout') {
-    fs.rmSync(f, { force: true });
+    fs.rmSync(cred, { force: true });
   } else {
-    const who = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null;
-    console.log(JSON.stringify(who ? { loggedIn: true, authMethod: 'claude.ai', ...who, subscriptionType: 'max' } : { loggedIn: false, authMethod: 'none' }));
-    process.exitCode = who ? 0 : 1;
+    const c = read(cred);
+    const a = (read(global) || {}).oauthAccount;
+    console.log(JSON.stringify(c && a ? { loggedIn: true, authMethod: 'claude.ai', email: a.emailAddress, orgName: a.organizationName, subscriptionType: c.claudeAiOauth.subscriptionType } : { loggedIn: false, authMethod: 'none' }));
+    process.exitCode = c ? 0 : 1;
   }
   return;
 }

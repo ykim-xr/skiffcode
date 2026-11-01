@@ -8,6 +8,7 @@ const net = require('net');
 const os = require('os');
 const path = require('path');
 const assert = require('assert/strict');
+const crypto = require('crypto');
 const { Client } = require('./client');
 
 const APP = path.resolve(__dirname, '..');
@@ -38,6 +39,30 @@ const CLAUDE_HOME = path.join(tmp, 'claude-home');
 fs.mkdirSync(CLAUDE_HOME, { recursive: true });
 fs.writeFileSync(path.join(CLAUDE_HOME, 'settings.json'), JSON.stringify({ statusLine: { type: 'command', command: 'echo user-line', padding: 1 } }));
 
+// The shared Claude login, laid out as Claude keeps it: .credentials.json, and oauthAccount in .claude.json
+const SHARED_CRED = path.join(CLAUDE_HOME, '.credentials.json');
+const SHARED_GLOBAL = path.join(CLAUDE_HOME, '.claude.json');
+const login = who => ({ claudeAiOauth: { accessToken: `at-${who}`, refreshToken: `rt-${who}`, expiresAt: Date.now() + 3600e3, refreshTokenExpiresAt: Date.now() + 30 * 86400e3, scopes: ['user:inference'], subscriptionType: 'pro' } });
+const oauthOf = who => ({ accountUuid: `acct-${who}`, emailAddress: `${who}@example.test`, organizationUuid: `org-${who}`, organizationName: `Org ${who}` });
+const readJ = f => JSON.parse(fs.readFileSync(f, 'utf8'));
+const fmode = p => fs.statSync(p).mode & 0o777;
+const slot = id => path.join(HOME, 'accounts', id);
+/** A saved login's backups (credentials.prev-<ms>.json), oldest first. */
+const backupsIn = dir => fs.readdirSync(dir).map(n => /^credentials\.prev-(\d+)\.json$/.exec(n)).filter(Boolean)
+  .sort((a, b) => Number(a[1]) - Number(b[1])).map(m => path.join(dir, m[0]));
+
+// A stand-in for Anthropic's usage endpoint (SKIFFCODE_USAGE_URL): no test talks to the real one
+const usageReqs = [];
+let usageStatus = 200;
+const USAGE_PORT = PORT + 50;
+http.createServer((req, res) => {
+  usageReqs.push({ url: req.url, headers: req.headers });
+  res.writeHead(usageStatus, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(usageStatus === 200
+    ? { five_hour: { utilization: 69, resets_at: new Date(Date.now() + 3600e3).toISOString(), used_dollars: null }, seven_day: { utilization: 20, resets_at: new Date(Date.now() + 4 * 86400e3).toISOString() }, seven_day_opus: null }
+    : { error: { type: 'authentication_error' } }));
+}).listen(USAGE_PORT, '127.0.0.1').unref();
+
 const repo = path.join(tmp, 'code', 'myapp');
 fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
 sh(`git init -q -b main && git config user.email t@t && git config user.name t && printf 'line1\\nline2\\n' > README.md && printf 'def greet(name):\\n    return name\\n' > src/app.py && printf '.btn-primary { color: red; }\\n' > src/site.css && echo .env > .gitignore && git add . && git commit -qm init && echo SECRET=1 > .env`, repo);
@@ -45,7 +70,7 @@ sh(`git init -q -b main && git config user.email t@t && git config user.name t &
 let server;
 function startServer() {
   server = spawn('node', [path.join(APP, 'server', 'main.js')], {
-    env: { ...process.env, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT), SHELL: '/bin/bash', SKIFFCODE_ALERT_LOG: path.join(tmp, 'alerts.jsonl'), CLAUDE_CONFIG_DIR: CLAUDE_HOME, SKIFFCODE_STALL_MS: '2500' },
+    env: { ...process.env, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT), SHELL: '/bin/bash', SKIFFCODE_ALERT_LOG: path.join(tmp, 'alerts.jsonl'), CLAUDE_CONFIG_DIR: CLAUDE_HOME, SKIFFCODE_STALL_MS: '2500', SKIFFCODE_USAGE_URL: `http://127.0.0.1:${USAGE_PORT}/usage` },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stderr.on('data', d => process.stderr.write(`[server] ${d}`));
@@ -717,90 +742,366 @@ function startServer() {
     for (const l of lines) assert.match(JSON.parse(l.slice(l.indexOf('\t') + 1)).agent_id, /^r\d-\d$/);
   });
 
-  await step('accounts: add, sign in, per-account config, usage from the status line, sign out', async () => {
-    let st = await c.call('accounts.status', { fresh: true });
-    assert.equal(st.length, 1);
-    assert.equal(st[0].loggedIn, false);
-    const a = await c.call('accounts.add', { name: 'Client X', share: true });
-    assert.equal(a.dir, path.join(HOME, 'accounts', 'client-x'));
-    assert.equal(fs.readlinkSync(path.join(a.dir, 'settings.json')), path.join(CLAUDE_HOME, 'settings.json'), 'settings shared');
-    await c.call('accounts.setActive', { id: a.id });
-    assert.equal((await c.call('hello')).activeAccount, a.id);
-    // sign in: a shell tab runs `claude auth login` with that account's config folder
-    const login = await c.call('accounts.login', { id: a.id, worktreePath: wt });
-    assert.equal(login.kind, 'shell');
-    assert.match(login.name, /sign in · Client X/);
-    await until(() => fs.existsSync(path.join(a.dir, 'fake-login.json')), 'login wrote to the account folder');
-    st = await c.call('accounts.status', { fresh: true });
-    const mine = st.find(x => x.id === a.id);
-    assert.equal(mine.loggedIn, true);
-    assert.equal(mine.email, 'me@client-x.test');
-    assert.equal(mine.org, 'Org client-x');
-    assert.equal(st.find(x => x.id === 'default').loggedIn, false);
-    // a new Claude session uses the active account, and reports usage through the status line
+  /** Add account through its sign-in tab (the fake `claude auth login` signs in as `who`); resolves once the login is saved. */
+  const addAccount = async (name, who) => {
+    fs.writeFileSync(`${process.env.FAKE_SCRIPT_FILE}.login`, who);
+    const session = await c.call('accounts.add', { name, worktreePath: wt });
+    assert.equal(session.kind, 'shell');
+    assert.equal(session.name, `sign in · ${name}`);
+    const m = /^CLAUDE_CONFIG_DIR=(\S+) (.+) auth login$/.exec(session.command);
+    assert.ok(m, session.command);
+    assert.equal(path.dirname(m[1]), path.join(HOME, 'accounts'));
+    assert.match(path.basename(m[1]), /^\.login-[0-9a-f-]{36}$/);
+    await until(() => !fs.existsSync(m[1]), 'sign-in folder saved and removed', 10000);
+    await c.call('sessions.forget', { id: session.id });
+    return { session };
+  };
+
+  await step('accounts: Add account signs in from a private folder and saves the login; the same login again updates it', async () => {
+    fs.writeFileSync(SHARED_CRED, JSON.stringify(login('x')), { mode: 0o600 });
+    fs.writeFileSync(SHARED_GLOBAL, JSON.stringify({ numStartups: 5, oauthAccount: oauthOf('x') }));
+    fs.chmodSync(SHARED_GLOBAL, 0o644);
+    const sharedBefore = [fs.readFileSync(SHARED_CRED, 'utf8'), fs.readFileSync(SHARED_GLOBAL, 'utf8')];
+    let h = await c.call('hello');
+    assert.deepEqual(h.accounts, []);
+    assert.equal(h.activeAccount, undefined);
+    assert.deepEqual(h.currentLogin, { email: 'x@example.test', org: 'Org x', plan: 'pro', saved: false, expired: false });
+    await addAccount('Client A', 'alpha');
+    h = await c.call('hello');
+    assert.equal(h.accounts.length, 1);
+    const A = h.accounts[0];
+    assert.match(A.id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    assert.deepEqual({ ...A, id: undefined }, { id: undefined, name: 'Client A', email: 'alpha@example.test', org: 'Org alpha', plan: 'max', inUse: false });
+    assert.equal(c.last('toast')?.data.text, 'Saved Client A');
+    assert.equal(fmode(slot(A.id)), 0o700);
+    for (const f of ['credentials.json', 'account.json']) assert.equal(fmode(path.join(slot(A.id), f)), 0o600, f);
+    assert.deepEqual(readJ(path.join(slot(A.id), 'account.json')), oauthOf('alpha'));
+    assert.match(readJ(path.join(slot(A.id), 'credentials.json')).claudeAiOauth.refreshToken, /^rt-alpha-/);
+    assert.deepEqual([fs.readFileSync(SHARED_CRED, 'utf8'), fs.readFileSync(SHARED_GLOBAL, 'utf8')], sharedBefore, 'the login in use is untouched');
+    const firstToken = readJ(path.join(slot(A.id), 'credentials.json')).claudeAiOauth.accessToken;
+    await sleep(5);
+    await addAccount('Alpha again', 'alpha');
+    h = await c.call('hello');
+    assert.deepEqual(h.accounts.map(a => a.name), ['Client A'], 'the same login updates its account');
+    assert.notEqual(readJ(path.join(slot(A.id), 'credentials.json')).claudeAiOauth.accessToken, firstToken);
+    assert.equal(readJ(backupsIn(slot(A.id)).at(-1)).claudeAiOauth.accessToken, firstToken, 'the previous one is kept');
+    await addAccount('Client B', 'beta');
+    assert.deepEqual((await c.call('hello')).accounts.map(a => a.name), ['Client A', 'Client B']);
+  });
+
+  await step('accounts: a switch saves the login in use first, then swaps the shared files under Claude’s lock', async () => {
+    const sharedX = readJ(SHARED_CRED);
+    let h = await c.call('hello');
+    const [A, B] = h.accounts.map(a => a.id);
+    await c.call('accounts.use', { id: A });
+    h = await c.call('hello');
+    const X = h.accounts.find(a => a.email === 'x@example.test');
+    assert.ok(X, 'the unsaved login in use was saved first');
+    assert.equal(X.name, 'Org x');
+    assert.deepEqual(readJ(path.join(slot(X.id), 'credentials.json')), sharedX);
+    assert.deepEqual(h.accounts.filter(a => a.inUse).map(a => a.id), [A]);
+    assert.deepEqual(h.currentLogin, { email: 'alpha@example.test', org: 'Org alpha', plan: 'max', saved: true, expired: false });
+    assert.equal(fs.readFileSync(SHARED_CRED, 'utf8'), fs.readFileSync(path.join(slot(A), 'credentials.json'), 'utf8'));
+    assert.equal(fmode(SHARED_CRED), 0o600);
+    const g = readJ(SHARED_GLOBAL);
+    assert.equal(g.numStartups, 5, 'other keys kept');
+    assert.deepEqual(g.oauthAccount, oauthOf('alpha'));
+    assert.equal(fmode(SHARED_GLOBAL), 0o644, 'its mode kept');
+    assert.ok(!fs.existsSync(`${SHARED_GLOBAL}.lock`), 'the lock is released');
+    // Claude refreshes A's token; switching away saves the fresh one, the old one is kept aside
+    const oldA = readJ(path.join(slot(A), 'credentials.json'));
+    const refreshed = login('alpha-2');
+    fs.writeFileSync(SHARED_CRED, JSON.stringify(refreshed));
+    await c.call('accounts.use', { id: X.id });
+    assert.deepEqual(readJ(path.join(slot(A), 'credentials.json')), refreshed);
+    assert.deepEqual(readJ(backupsIn(slot(A)).at(-1)), oldA);
+    assert.deepEqual(readJ(SHARED_CRED), sharedX);
+    assert.deepEqual(readJ(SHARED_GLOBAL).oauthAccount, oauthOf('x'));
+    // the tokens SkiffCode wrote last belong to that account, whatever oauthAccount says
+    await c.call('accounts.use', { id: A });
+    fs.writeFileSync(SHARED_GLOBAL, JSON.stringify({ ...readJ(SHARED_GLOBAL), oauthAccount: oauthOf('beta') }));
+    const bBefore = [fs.readFileSync(path.join(slot(B), 'credentials.json'), 'utf8'), fs.readFileSync(path.join(slot(B), 'account.json'), 'utf8')];
+    assert.equal((await c.call('hello')).accounts.find(a => a.inUse).id, A);
+    await c.call('accounts.use', { id: X.id });
+    assert.deepEqual([fs.readFileSync(path.join(slot(B), 'credentials.json'), 'utf8'), fs.readFileSync(path.join(slot(B), 'account.json'), 'utf8')], bBefore, 'B is untouched');
+    assert.deepEqual(readJ(path.join(slot(A), 'credentials.json')), refreshed);
+    assert.deepEqual(readJ(path.join(slot(A), 'account.json')), oauthOf('alpha'), 'A keeps its identity');
+  });
+
+  await step('accounts: refused switches change nothing; a broken shared file is never saved over a login', async () => {
+    const h = await c.call('hello');
+    const ids = h.accounts.map(a => a.id);
+    const [A, B] = ids;
+    const credB = path.join(slot(B), 'credentials.json');
+    const files = () => ({
+      shared: [SHARED_CRED, SHARED_GLOBAL].map(f => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : null)),
+      saved: ids.map(id => { try { return fs.readFileSync(path.join(slot(id), 'credentials.json'), 'utf8'); } catch { return null; } }),
+    });
+    const cases = [
+      { name: 'unknown id', id: crypto.randomUUID(), err: /Unknown account/ },
+      { name: 'not an id', id: '../accounts', err: /Unknown account/ },
+      { name: 'no account details', id: B, setup: () => fs.renameSync(path.join(slot(B), 'account.json'), path.join(slot(B), 'account.bak')), undo: () => fs.renameSync(path.join(slot(B), 'account.bak'), path.join(slot(B), 'account.json')), err: /That saved login has no account details\. Add it again\./ },
+      { name: 'no saved login', id: B, setup: () => fs.renameSync(credB, `${credB}.bak`), undo: () => fs.renameSync(`${credB}.bak`, credB), err: /Add it again/ },
+      { name: 'expired refresh token', id: B, setup: () => { const j = readJ(credB); j.claudeAiOauth.refreshTokenExpiresAt = Date.now() - 1000; fs.writeFileSync(`${credB}.keep`, fs.readFileSync(credB)); fs.writeFileSync(credB, JSON.stringify(j)); }, undo: () => fs.renameSync(`${credB}.keep`, credB), err: /That saved login has expired\. Add it again\./ },
+      { name: 'Claude holds its lock', id: B, setup: () => fs.mkdirSync(`${SHARED_GLOBAL}.lock`), undo: () => fs.rmdirSync(`${SHARED_GLOBAL}.lock`), err: /busy/ },
+      { name: 'shared credentials missing', id: B, setup: () => fs.rmSync(SHARED_CRED), wrote: B },
+      { name: 'shared credentials unreadable', id: A, setup: () => fs.writeFileSync(SHARED_CRED, 'not json{'), wrote: A },
+      { name: 'stale lock', id: B, setup: () => { fs.mkdirSync(`${SHARED_GLOBAL}.lock`); const t = new Date(Date.now() - 20e3); fs.utimesSync(`${SHARED_GLOBAL}.lock`, t, t); }, wrote: B },
+    ];
+    for (const t of cases) {
+      if (t.setup) t.setup();
+      const before = files();
+      try {
+        if (t.err) {
+          await assert.rejects(c.call('accounts.use', { id: t.id }), t.err, t.name);
+          assert.deepEqual(files(), before, `${t.name}: nothing written`);
+        } else {
+          await c.call('accounts.use', { id: t.id });
+          assert.deepEqual(files().saved, before.saved, `${t.name}: no saved login overwritten`);
+          assert.equal(fs.readFileSync(SHARED_CRED, 'utf8'), fs.readFileSync(path.join(slot(t.wrote), 'credentials.json'), 'utf8'), t.name);
+          assert.deepEqual(fs.readdirSync(CLAUDE_HOME).filter(n => n.includes('.lock')), [], `${t.name}: no lock left, nor a claimed stale one`);
+        }
+      } finally {
+        if (t.undo) t.undo();
+      }
+    }
+    // .claude.json that isn't JSON: left alone; the credentials still switch
+    fs.writeFileSync(SHARED_GLOBAL, 'garbage{');
+    await c.call('accounts.use', { id: A });
+    assert.equal(fs.readFileSync(SHARED_GLOBAL, 'utf8'), 'garbage{');
+    assert.equal(fs.readFileSync(SHARED_CRED, 'utf8'), fs.readFileSync(path.join(slot(A), 'credentials.json'), 'utf8'));
+    fs.writeFileSync(SHARED_GLOBAL, JSON.stringify({ numStartups: 5, oauthAccount: oauthOf('alpha') }));
+  });
+
+  await step('accounts: a refreshed login is saved into its own account; the shared file keeps its other keys', async () => {
+    const h = await c.call('hello');
+    const A = h.accounts.find(a => a.name === 'Client A').id;
+    const B = h.accounts.find(a => a.name === 'Client B').id;
+    const mcp = { 'srv|1': { accessToken: 'mcp-at' } };
+    const sharedOauth = () => readJ(SHARED_CRED).claudeAiOauth;
+    const refresh = who => fs.writeFileSync(SHARED_CRED, JSON.stringify({ ...readJ(SHARED_CRED), claudeAiOauth: login(who).claudeAiOauth }));
+    fs.writeFileSync(SHARED_CRED, JSON.stringify({ ...readJ(SHARED_CRED), mcpOAuth: mcp }));
+    await c.call('accounts.use', { id: B });
+    assert.deepEqual(readJ(SHARED_CRED).mcpOAuth, mcp, 'other keys kept through a switch');
+    assert.deepEqual(sharedOauth(), readJ(path.join(slot(B), 'credentials.json')).claudeAiOauth);
+    for (const id of [A, B]) assert.deepEqual(Object.keys(readJ(path.join(slot(id), 'credentials.json'))), ['claudeAiOauth'], 'a saved login holds only claudeAiOauth');
+    // Claude refreshes B's tokens; oauthAccount still says B
+    refresh('beta-r1');
+    await c.call('accounts.use', { id: B });
+    assert.equal(sharedOauth().refreshToken, 'rt-beta-r1', 'switching to the login in use keeps its newest token');
+    assert.equal(readJ(path.join(slot(B), 'credentials.json')).claudeAiOauth.refreshToken, 'rt-beta-r1');
+    refresh('beta-r2');
+    await c.call('accounts.use', { id: A });
+    assert.equal(readJ(path.join(slot(B), 'credentials.json')).claudeAiOauth.refreshToken, 'rt-beta-r2', 'the refreshed tokens are saved into B');
+    assert.deepEqual(readJ(SHARED_CRED).mcpOAuth, mcp);
+    assert.deepEqual(readJ(SHARED_GLOBAL).oauthAccount, oauthOf('alpha'));
+  });
+
+  await step('accounts: last-switch.json names the new login before .claude.json is written; five backups per login', async () => {
+    const { Accounts } = require('../server/accounts');
+    const h = path.join(tmp, 'h-acc');
+    const cfg = path.join(tmp, 'claude-acc');
+    fs.mkdirSync(path.join(h, 'accounts'), { recursive: true });
+    fs.mkdirSync(cfg);
+    const data = { prefs: {}, sessions: [] };
+    const st = { data, get prefs() { return data.prefs; }, get sessions() { return data.sessions; }, update(fn) { fn(data); } };
+    const envDir = process.env.CLAUDE_CONFIG_DIR;
+    const rename = fs.renameSync;
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    try {
+      const acc = new Accounts(st, h);
+      for (const [saves, kept] of [[3, 3], [7, 5]]) {
+        const base = login(`bk${saves}`).claudeAiOauth;
+        const { id } = acc.saveLogin(base, oauthOf(`bk${saves}`));
+        for (let i = 1; i <= saves; i++) acc.saveLogin({ ...base, accessToken: `at-${i}` }, undefined, { id });
+        acc.saveLogin({ ...base, accessToken: `at-${saves}` }, undefined, { id });
+        const files = backupsIn(path.join(h, 'accounts', id));
+        // backup i holds the token before save i; the oldest beyond five are dropped
+        const want = [base.accessToken, ...Array.from({ length: saves - 1 }, (_, i) => `at-${i + 1}`)].slice(-kept);
+        assert.deepEqual(files.map(f => readJ(f).claudeAiOauth.accessToken), want, `${saves} saves`);
+        for (const f of files) assert.equal(fmode(f), 0o600);
+      }
+      acc.saveLogin(login('p').claudeAiOauth, oauthOf('p'));
+      const Q = acc.saveLogin(login('q').claudeAiOauth, oauthOf('q')).id;
+      fs.writeFileSync(path.join(cfg, '.credentials.json'), JSON.stringify(login('p')));
+      fs.writeFileSync(path.join(cfg, '.claude.json'), JSON.stringify({ oauthAccount: oauthOf('p') }));
+      fs.renameSync = (from, to) => {
+        if (to === path.join(cfg, '.claude.json')) throw Object.assign(new Error('EACCES: test'), { code: 'EACCES' });
+        return rename(from, to);
+      };
+      await assert.rejects(acc.use(Q), /EACCES/);
+      fs.renameSync = rename;
+      assert.deepEqual(readJ(path.join(h, 'accounts', 'last-switch.json')), { id: Q, sha: crypto.createHash('sha256').update('rt-q').digest('hex'), identity: 'acct-q/org-q' });
+      assert.equal(readJ(path.join(cfg, '.credentials.json')).claudeAiOauth.refreshToken, 'rt-q');
+      assert.deepEqual(readJ(path.join(cfg, '.claude.json')).oauthAccount, oauthOf('p'), 'the failed write changed nothing');
+      assert.deepEqual(fs.readdirSync(cfg).sort(), ['.claude.json', '.credentials.json'], 'no temp file or lock left');
+    } finally {
+      fs.renameSync = rename;
+      if (envDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = envDir;
+    }
+  });
+
+  await step('fake claude: auth without CLAUDE_CONFIG_DIR fails and writes nothing', async () => {
+    const home = path.join(tmp, 'fake-home');
+    fs.mkdirSync(home);
+    const env = { ...process.env, HOME: home };
+    delete env.CLAUDE_CONFIG_DIR;
+    const r = spawnSync('node', [path.join(__dirname, 'fake-claude.js'), 'auth', 'login'], { env, encoding: 'utf8', timeout: 5000 });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /CLAUDE_CONFIG_DIR/);
+    assert.deepEqual(fs.readdirSync(home), []);
+  });
+
+  await step('accounts: remove deletes only that saved login', async () => {
+    const h = await c.call('hello');
+    const X = h.accounts.find(a => a.email === 'x@example.test');
+    const shared = [fs.readFileSync(SHARED_CRED, 'utf8'), fs.readFileSync(SHARED_GLOBAL, 'utf8')];
+    await assert.rejects(c.call('accounts.remove', { id: '../accounts' }), /Unknown account/);
+    await c.call('accounts.remove', { id: X.id });
+    assert.ok(!fs.existsSync(slot(X.id)));
+    const rest = (await c.call('hello')).accounts;
+    assert.deepEqual(rest.map(a => a.name), ['Client A', 'Client B']);
+    for (const a of rest) assert.ok(fs.existsSync(path.join(slot(a.id), 'credentials.json')), a.name);
+    assert.deepEqual([fs.readFileSync(SHARED_CRED, 'utf8'), fs.readFileSync(SHARED_GLOBAL, 'utf8')], shared, 'the shared folder is untouched');
+  });
+
+  await step('accounts: usage refresh reads Anthropic’s usage endpoint with the saved token, never refreshing it', async () => {
+    const { usageUrl } = require('../server/accounts');
+    const REAL = 'https://api.anthropic.com/api/oauth/usage';
+    for (const [v, want] of [
+      [undefined, REAL], ['http://127.0.0.1:9/usage', 'http://127.0.0.1:9/usage'], ['http://localhost:9/u', 'http://localhost:9/u'], ['http://[::1]:9/u', 'http://[::1]:9/u'],
+      ['https://evil.example/usage', REAL], ['http://10.0.0.1/usage', REAL], ['file:///etc/passwd', REAL], ['http://127.0.0.1@evil.example/', REAL], ['https://127.0.0.1/u', REAL],
+    ]) assert.equal(usageUrl({ SKIFFCODE_USAGE_URL: v }), want, String(v));
+    const h = await c.call('hello');
+    const A = h.accounts.find(a => a.inUse).id;
+    const B = h.accounts.find(a => !a.inUse).id;
+    const credB = path.join(slot(B), 'credentials.json');
+    usageReqs.length = 0;
+    await c.call('accounts.refreshUsage', { id: B });
+    assert.equal(usageReqs.length, 1);
+    assert.equal(usageReqs[0].headers.authorization, `Bearer ${readJ(credB).claudeAiOauth.accessToken}`);
+    assert.equal(usageReqs[0].headers['anthropic-beta'], 'oauth-2025-04-20');
+    const u = await until(() => c.last('usage')?.data[B], 'usage event');
+    assert.equal(u.fiveHour.used, 69);
+    assert.equal(u.weekly.used, 20);
+    assert.ok(Math.abs(u.fiveHour.resetsAt - (Date.now() + 3600e3)) < 60e3);
+    assert.equal(readJ(path.join(HOME, 'usage.json'))[B].weekly.used, 20);
+    // the account in use: the shared token, the freshest one
+    const cur = readJ(SHARED_CRED);
+    cur.claudeAiOauth.accessToken = 'at-fresh';
+    fs.writeFileSync(SHARED_CRED, JSON.stringify(cur));
+    await c.call('accounts.refreshUsage', { id: A });
+    assert.equal(usageReqs.at(-1).headers.authorization, 'Bearer at-fresh');
+    // an expired token: refused, nothing sent
+    const keep = fs.readFileSync(credB);
+    const j = readJ(credB);
+    j.claudeAiOauth.expiresAt = Date.now() - 1000;
+    fs.writeFileSync(credB, JSON.stringify(j));
+    const n = usageReqs.length;
+    await assert.rejects(c.call('accounts.refreshUsage', { id: B }), /The sign-in token has expired\. Use this account in a session to refresh it\./);
+    assert.equal(usageReqs.length, n, 'no request');
+    fs.writeFileSync(credB, keep);
+    // an error never carries the token
+    usageStatus = 401;
+    try {
+      await assert.rejects(c.call('accounts.refreshUsage', { id: B }), e => e.message === 'Couldn’t read usage (HTTP 401).' && !e.message.includes(j.claudeAiOauth.accessToken));
+    } finally {
+      usageStatus = 200;
+    }
+    assert.equal(fs.readFileSync(credB, 'utf8'), keep.toString(), 'the saved token is never written');
+  });
+
+  await step('accounts: sessions run on the shared folder and report usage for the account in use', async () => {
+    const A = (await c.call('hello')).accounts.find(a => a.inUse).id;
     plan('SessionStart,UserPromptSubmit,Status:42.4:17,Stop,hang');
     const before = calls().length;
     const s2 = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, cols: 80, rows: 24 });
     await until(() => calls().length > before, 'claude launched');
     const call2 = calls().at(-1);
-    assert.equal(call2.configDir, a.dir);
+    assert.equal(call2.configDir, CLAUDE_HOME, 'the shared config folder');
     assert.equal(call2.userStatusLine, 'echo user-line', "user's own status line still runs");
     const { claudeBin } = require('../server/accounts');
     assert.equal(claudeBin('claude --dangerously-skip-permissions'), 'claude');
     assert.equal(claudeBin('node /x/claude.js --flag'), 'node /x/claude.js');
-    const u = await until(() => c.last('usage')?.data[a.id], 'usage event');
-    assert.equal(u.fiveHour.used, 42.4);
+    const u = await until(() => c.last('usage')?.data[A]?.fiveHour?.used === 42.4 && c.last('usage').data[A], 'usage event');
     assert.equal(u.weekly.used, 17);
-    assert.ok(Math.abs(u.fiveHour.resetsAt - (Date.now() + 7200e3)) < 60e3);
     await until(() => /user-line/.test(fs.readFileSync(process.env.FAKE_LOG + '.status', 'utf8')), 'user status line output');
-    assert.equal(JSON.parse(fs.readFileSync(path.join(HOME, 'usage.json'), 'utf8'))[a.id].weekly.used, 17);
     const snap = await until(async () => (await c.call('hello')).sessions.find(x => x.id === s2.id && x.model), 'model info');
     assert.equal(snap.model, 'Opus');
-    assert.equal(snap.contextPct, 12);
-    assert.equal(snap.account, a.id);
-    // can't remove an account that running sessions use
-    await assert.rejects(c.call('accounts.remove', { id: a.id }), /Close the sessions/);
-    await c.call('accounts.rename', { id: a.id, name: 'Client Y' });
-    assert.equal((await c.call('hello')).accounts.find(x => x.id === a.id).name, 'Client Y');
-    await c.call('accounts.logout', { id: a.id });
-    assert.equal((await c.call('accounts.status', { fresh: true })).find(x => x.id === a.id).loggedIn, false);
-    // tidy up: back to the default account, sessions closed, account removed
-    await c.call('accounts.setActive', { id: 'default' });
-    // ended sessions still use it: they are named
-    await c.call('sessions.stop', { id: s2.id });
-    await c.call('sessions.stop', { id: login.id });
-    await assert.rejects(c.call('accounts.remove', { id: a.id }), /Close the sessions.*sign in · Client X/);
+    assert.equal(snap.account, undefined);
     await c.call('sessions.forget', { id: s2.id });
-    await c.call('sessions.forget', { id: login.id });
-    // removing signs it out (its credentials go); shared settings and its other files stay
-    const cred = path.join(a.dir, '.credentials.json');
-    fs.writeFileSync(cred, '{}');
-    const shared = fs.readFileSync(path.join(CLAUDE_HOME, 'settings.json'), 'utf8');
-    await c.call('accounts.remove', { id: a.id });
-    assert.ok(!fs.existsSync(cred), 'credentials removed');
-    assert.ok(fs.lstatSync(path.join(a.dir, 'settings.json')).isSymbolicLink(), 'the settings link is kept');
-    assert.equal(fs.readFileSync(path.join(CLAUDE_HOME, 'settings.json'), 'utf8'), shared, 'shared settings untouched');
-    const h2 = await c.call('hello');
-    assert.deepEqual(h2.accounts.map(x => x.id), ['default']);
-    assert.equal(h2.activeAccount, 'default');
-    assert.equal(calls()[0].configDir, CLAUDE_HOME, 'default account keeps your CLAUDE_CONFIG_DIR');
+    assert.equal(calls()[0].configDir, CLAUDE_HOME, 'your CLAUDE_CONFIG_DIR is kept');
   });
 
-  await step('a Claude command whose path has spaces starts Claude and checks sign-in', async () => {
+  await step('Add account runs a Claude command whose path has spaces', async () => {
     const dir = path.join(tmp, 'my tools');
     fs.mkdirSync(dir);
     fs.symlinkSync(path.join(__dirname, 'fake-claude.js'), path.join(dir, 'claude'));
     await c.call('settings.set', { values: { claudeCommand: path.join(dir, 'claude') } });
     try {
-      plan('SessionStart,hang');
-      const before = calls().length;
-      const s = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, cols: 80, rows: 24 });
-      await until(() => calls().length > before, 'claude launched');
-      const st = await c.call('accounts.status', { fresh: true });
-      assert.deepEqual([st[0].loggedIn, st[0].unknown], [false, undefined], '`claude auth status` ran');
-      await c.call('sessions.forget', { id: s.id });
+      const { session } = await addAccount('Spaced', 'spaced');
+      assert.ok(session.command.endsWith(` '${path.join(dir, 'claude')}' auth login`), session.command);
+      const a = (await c.call('hello')).accounts.find(x => x.email === 'spaced@example.test');
+      assert.ok(a, 'it ran and the login was saved');
+      await c.call('accounts.remove', { id: a.id });
     } finally {
       await c.call('settings.set', { values: { claudeCommand: path.join(__dirname, 'fake-claude.js') } });
+    }
+  });
+
+  await step('accounts: startup imports old folder accounts and finished sign-ins, and tidies the rest', async () => {
+    const h = path.join(tmp, 'h5');
+    const acc = path.join(h, 'accounts');
+    const cfg = path.join(tmp, 'claude-h5');
+    fs.mkdirSync(cfg, { recursive: true });
+    const mk = (dir, who, global = true) => {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, '.credentials.json'), JSON.stringify(login(who)));
+      if (global) fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify({ oauthAccount: oauthOf(who) }));
+    };
+    const oldId = crypto.randomUUID();
+    const emptyId = crypto.randomUUID();
+    mk(path.join(acc, 'login-2'), 'old');
+    fs.mkdirSync(path.join(acc, 'empty'));
+    const done = path.join(acc, `.login-${crypto.randomUUID()}`);
+    mk(done, 'fresh');
+    const stale = path.join(acc, `.login-${crypto.randomUUID()}`);
+    fs.mkdirSync(stale);
+    const half = path.join(acc, `.login-${crypto.randomUUID()}`);
+    mk(half, 'half', false);
+    const t = new Date(Date.now() - 2 * 86400e3);
+    for (const d of [stale, half]) fs.utimesSync(d, t, t);
+    const young = path.join(acc, `.login-${crypto.randomUUID()}`);
+    fs.mkdirSync(young);
+    const shellId = crypto.randomUUID();
+    fs.writeFileSync(path.join(h, 'state.json'), JSON.stringify({
+      version: 3, groups: [], repos: [], worktrees: {}, layouts: {},
+      sessions: [{ id: shellId, kind: 'shell', name: 'sign in · Login 2', repoPath: tmp, worktreePath: tmp, createdAt: Date.now(), account: oldId, command: 'claude auth login' }],
+      prefs: { activeAccount: oldId, accounts: [{ id: oldId, name: 'Login 2', dir: path.join(acc, 'login-2'), shared: true }, { id: emptyId, name: 'Empty', dir: path.join(acc, 'empty'), shared: true }] },
+    }));
+    const p = spawn('node', [path.join(APP, 'server', 'main.js')], { env: { ...process.env, SKIFFCODE_HOME: h, SKIFFCODE_PORT: String(PORT + 4), SHELL: '/bin/bash', CLAUDE_CONFIG_DIR: cfg }, stdio: 'ignore' });
+    try {
+      await until(() => fs.existsSync(path.join(h, 'server.pid')), 'server up');
+      const nc = await new Client(PORT + 4, fs.readFileSync(path.join(h, 'token'), 'utf8').trim()).connect();
+      const got = (await nc.call('hello')).accounts;
+      assert.deepEqual(got.map(a => [a.name, a.email]), [['Login 2', 'old@example.test'], ['Org fresh', 'fresh@example.test']]);
+      assert.equal(got[0].id, oldId, 'same id');
+      assert.deepEqual(readJ(path.join(acc, oldId, 'credentials.json')), readJ(path.join(acc, 'login-2', '.credentials.json')));
+      assert.ok(fs.existsSync(path.join(acc, 'login-2', '.credentials.json')), 'old folders are kept');
+      assert.ok(fs.existsSync(path.join(acc, 'empty')));
+      assert.ok(!fs.existsSync(done), 'a finished sign-in is imported, then removed');
+      assert.ok(!fs.existsSync(stale), 'an old unfinished one is removed');
+      assert.ok(fs.existsSync(path.join(half, '.credentials.json')), 'an old one holding a login is kept');
+      assert.ok(fs.existsSync(young), 'a recent unfinished one is left');
+      const st = readJ(path.join(h, 'state.json'));
+      assert.equal(st.sessions[0].command, undefined, 'a sign-in tab resumes as a plain shell');
+      assert.equal(st.sessions[0].account, undefined);
+      assert.deepEqual(st.prefs.accounts.map(a => Object.keys(a).sort()), [['id', 'name'], ['id', 'name']]);
+      assert.equal(st.prefs.activeAccount, undefined);
+      assert.deepEqual(fs.readdirSync(cfg), [], 'the shared folder is untouched');
+    } finally {
+      p.kill('SIGTERM');
     }
   });
 
@@ -963,7 +1264,7 @@ function startServer() {
   });
 
   await step('CLI: `skiffcode new` makes a worktree + named Claude session with a first prompt; `claude` and `list`', async () => {
-    const cliEnv = { ...process.env, SKIFFCODE_APP: APP, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT) };
+    const cliEnv = { ...process.env, SKIFFCODE_APP: APP, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT), CLAUDE_CONFIG_DIR: CLAUDE_HOME };
     const run = (...a) => execFileSync(path.join(APP, 'bin', 'skiffcode'), a, { env: cliEnv, encoding: 'utf8' });
     plan('SessionStart,hang');
     const before = calls().length;
@@ -1021,7 +1322,7 @@ function startServer() {
   });
 
   await step('one server per home; `skiffcode stop` stops only SkiffCode; the last log is kept', async () => {
-    const r = spawnSync('node', [path.join(APP, 'server', 'main.js')], { env: { ...process.env, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT + 2) }, encoding: 'utf8', timeout: 8000 });
+    const r = spawnSync('node', [path.join(APP, 'server', 'main.js')], { env: { ...process.env, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT + 2), CLAUDE_CONFIG_DIR: CLAUDE_HOME }, encoding: 'utf8', timeout: 8000 });
     assert.equal(r.status, 1, 'a second server on the same home exits');
     assert.match(r.stderr, /already running/);
     assert.equal(fs.readFileSync(path.join(HOME, 'server.pid'), 'utf8'), String(server.pid));
@@ -1107,7 +1408,7 @@ function startServer() {
     assert.equal(s5.name, 'notes');
     await c.call('sessions.forget', { id: s5.id });
     await assert.rejects(c.call('repos.add', { path: os.homedir() }), /Pick a project folder/);
-    const cliEnv = { ...process.env, SKIFFCODE_APP: APP, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT) };
+    const cliEnv = { ...process.env, SKIFFCODE_APP: APP, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT), CLAUDE_CONFIG_DIR: CLAUDE_HOME };
     assert.throws(() => execFileSync(path.join(APP, 'bin', 'skiffcode'), ['new', notes, 'x', '--no-claude'], { env: cliEnv, encoding: 'utf8', stdio: 'pipe' }), /isn’t a git repository.*skiffcode claude/s);
     await c.call('git.init', { root: notes });
     const after = (await c.call('hello')).repos.find(x => x.path === notes);
@@ -1367,7 +1668,7 @@ function startServer() {
     for (const t of ['node', 'git', 'grep', 'python3', 'bash', 'sh']) fs.symlinkSync(execFileSync('bash', ['-c', `command -v ${t}`], { encoding: 'utf8' }).trim(), path.join(bin, t));
     const h3 = path.join(tmp, 'h4');
     fs.mkdirSync(h3);
-    const p3 = spawn('node', [path.join(APP, 'server', 'main.js')], { env: { ...process.env, PATH: bin, SKIFFCODE_HOME: h3, SKIFFCODE_PORT: String(PORT + 3), SHELL: '/bin/bash' }, stdio: 'ignore' });
+    const p3 = spawn('node', [path.join(APP, 'server', 'main.js')], { env: { ...process.env, PATH: bin, SKIFFCODE_HOME: h3, SKIFFCODE_PORT: String(PORT + 3), SHELL: '/bin/bash', CLAUDE_CONFIG_DIR: path.join(tmp, 'claude-h4') }, stdio: 'ignore' });
     try {
       await until(() => fs.existsSync(path.join(h3, 'token')) && fs.existsSync(path.join(h3, 'server.pid')), 'server without rg up');
       const nc = await new Client(PORT + 3, fs.readFileSync(path.join(h3, 'token'), 'utf8').trim()).connect();
@@ -1412,7 +1713,7 @@ function startServer() {
     const h = path.join(tmp, 'h2');
     fs.mkdirSync(h);
     const file = path.join(h, 'state.json');
-    const env = { ...process.env, SKIFFCODE_HOME: h, SKIFFCODE_PORT: String(PORT + 1) };
+    const env = { ...process.env, SKIFFCODE_HOME: h, SKIFFCODE_PORT: String(PORT + 1), CLAUDE_CONFIG_DIR: path.join(tmp, 'claude-h2') };
     const newer = JSON.stringify({ version: 99, repos: [{ path: '/x' }] });
     fs.writeFileSync(file, newer);
     const r = spawnSync('node', [path.join(APP, 'server', 'main.js')], { env, encoding: 'utf8', timeout: 8000 });

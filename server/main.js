@@ -18,7 +18,7 @@ const notify = require('./notify');
 const { Accounts, claudeBin } = require('./accounts');
 const history = require('./history');
 const { Sounds, DEFAULTS: SOUND_DEFAULTS } = require('./sounds');
-const { run, skiffcodeHome, privateDir, realpath, isGitDir, TERM_SIZE, within, safeToDelete, pool } = require('./util');
+const { run, shq, skiffcodeHome, privateDir, realpath, isGitDir, TERM_SIZE, within, safeToDelete, pool } = require('./util');
 
 const VERSION = require('../package.json').version;
 const VIEW_SANDBOX = 'allow-scripts allow-forms allow-popups allow-modals allow-downloads'; // what a previewed page may do: its own origin, no SkiffCode access
@@ -85,7 +85,9 @@ const settings = () => {
   return s;
 };
 const accounts = new Accounts(state, HOME);
-const accountDirs = () => accounts.list().map(a => ({ id: a.id, dir: a.dir || accounts.defaultConfigDir() }));
+accounts.startup();
+// Every session runs on the shared Claude config folder, so that's where conversations are.
+const claudeDirs = () => [accounts.defaultConfigDir()];
 const sounds = new Sounds(HOME);
 // Attachments dropped onto sessions are kept a week.
 try {
@@ -94,6 +96,10 @@ try {
 } catch { /* none yet */ }
 const sessions = new Sessions(state, HOME, settings, accounts);
 sessions.on('usage', () => broadcast('usage', accounts.usage));
+accounts.onSaved = a => {
+  pushState();
+  broadcast('toast', { kind: 'info', text: `Saved ${a.name}` });
+};
 
 // ------------------------------------------------------------------ clients
 
@@ -134,8 +140,8 @@ function snapshot() {
     repos: state.repos,
     sessions: sessions.list(),
     prefs: { muted: !!state.prefs.muted, collapsed: state.prefs.collapsed || {} },
-    accounts: accounts.list().map(a => ({ id: a.id, name: a.name, dir: a.dir || accounts.defaultConfigDir(), shared: a.shared })),
-    activeAccount: accounts.activeId(),
+    accounts: accounts.list(),
+    currentLogin: accounts.currentLogin(),
     usage: accounts.usage,
     settings: settings(),
   };
@@ -565,12 +571,12 @@ const api = {
   async 'branches.delete'({ repo, branch, force }) { await git.deleteBranch(repo, branch, !!force); broadcast('worktrees.changed', { repo }); },
 
   // sessions & terminals
-  async 'sessions.create'({ kind, worktreePath, name, cols, rows, resumeClaudeId, account }) {
+  async 'sessions.create'({ kind, worktreePath, name, cols, rows, resumeClaudeId }) {
     const root = rootOf(worktreePath);
     const repo = repoForWorktree(root);
     const wts = repo ? await git.listWorktrees(repo.path).catch(() => []) : [];
     const wt = wts.find(w => w.path === root);
-    const s = await sessions.create({ kind, repoPath: repo ? repo.path : root, worktreePath: root, branch: wt && wt.branch, name, cols, rows, resumeClaudeId, account });
+    const s = await sessions.create({ kind, repoPath: repo ? repo.path : root, worktreePath: root, branch: wt && wt.branch, name, cols, rows, resumeClaudeId });
     return s;
   },
   /** Folder browser for "Add repository": sub-folders of a folder, git repos marked. */
@@ -600,8 +606,7 @@ const api = {
   'claude.history'({ worktreePath }) {
     const root = rootOf(worktreePath);
     const tracked = new Map(state.sessions.filter(s => s.kind === 'claude' && s.claudeId).map(s => [s.claudeId, s.id]));
-    const accts = accountDirs();
-    return history.listConversations(root, accts, tracked);
+    return history.listConversations(root, claudeDirs(), tracked);
   },
   /** Delete a session completely: stop it, remove it here, and delete Claude's saved conversation. */
   async 'sessions.purge'({ id }) {
@@ -611,35 +616,34 @@ const api = {
     const cid = s.kind === 'claude' ? s.claudeId : null;
     await sessions.forget(id);
     if (!cid) return { deleted: [] };
-    return { deleted: history.deleteConversation(accountDirs().map(a => a.dir), folder, cid) };
+    return { deleted: history.deleteConversation(claudeDirs(), folder, cid) };
   },
   /** Delete a past conversation from the Resume list (and its session here, if it has one). */
   async 'claude.deleteConversation'({ worktreePath, id }) {
     const root = rootOf(worktreePath);
     const open = state.sessions.find(x => x.kind === 'claude' && x.claudeId === id);
     if (open) await sessions.forget(open.id);
-    return { deleted: history.deleteConversation(accountDirs().map(a => a.dir), root, id) };
+    return { deleted: history.deleteConversation(claudeDirs(), root, id) };
   },
   /** How many saved Claude conversations these folders have (for the "also delete" checkbox). */
   'claude.countConversations'({ folders }) {
-    const accts = accountDirs();
-    return knownFolders(folders).reduce((n, f) => n + history.listConversations(f, accts, new Map(), Infinity).length, 0);
+    return knownFolders(folders).reduce((n, f) => n + history.listConversations(f, claudeDirs(), new Map(), Infinity).length, 0);
   },
   /** Delete every saved Claude conversation of these folders (a worktree or repo you're removing). */
   async 'claude.purgeFolders'({ folders }) {
-    const accts = accountDirs();
+    const dirs = claudeDirs();
     let n = 0;
     for (const f of knownFolders(folders)) {
       for (const s of state.sessions.filter(x => x.worktreePath === f && x.kind === 'claude')) await sessions.forget(s.id);
-      for (const c of history.listConversations(f, accts, new Map(), Infinity)) {
-        history.deleteConversation(accts.map(a => a.dir), f, c.id);
+      for (const c of history.listConversations(f, dirs, new Map(), Infinity)) {
+        history.deleteConversation(dirs, f, c.id);
         n++;
       }
     }
     return { deleted: n };
   },
   /** Pick up an existing Claude conversation (pasted ID or `claude --resume …` line) as a SkiffCode session. */
-  async 'sessions.adopt'({ worktreePath, conversation, name, account, cols, rows }) {
+  async 'sessions.adopt'({ worktreePath, conversation, name, cols, rows }) {
     const id = history.parseConversationId(conversation);
     if (!id) throw new Error('Paste a conversation ID or the `claude --resume …` line Claude printed when it exited');
     const existing = state.sessions.find(s => s.kind === 'claude' && s.claudeId === id);
@@ -651,7 +655,7 @@ const api = {
     const found = api['claude.history']({ worktreePath: root }).find(c => c.id === id);
     const label = found && (found.title || found.first);
     const short = label ? (label.length > 40 ? `${label.slice(0, 38).trimEnd()}…` : label) : '';
-    return api['sessions.create']({ kind: 'claude', worktreePath: root, name: name || short || undefined, cols, rows, resumeClaudeId: id, account: account || (found && found.account) });
+    return api['sessions.create']({ kind: 'claude', worktreePath: root, name: name || short || undefined, cols, rows, resumeClaudeId: id });
   },
   async 'sessions.resume'({ id, cols, rows }) { return sessions.resume(sessionId(id), cols, rows); },
   async 'sessions.stop'({ id }) { await sessions.stop(sessionId(id)); },
@@ -707,31 +711,24 @@ const api = {
     if (cols && rows) c.resize(cols, rows);
     return { ok: true };
   },
-  // Claude accounts (logins)
-  async 'accounts.status'({ fresh }) {
-    const list = accounts.list();
-    const cmd = (settings().claudeCommand || 'claude');
-    const out = await Promise.all(list.map(async a => ({ id: a.id, ...(await accounts.authStatus(a.id, cmd, fresh)) })));
-    return out;
-  },
-  'accounts.setActive'({ id }) { accounts.setActive(id); },
-  'accounts.add'({ name, share }) { return accounts.add(name, share !== false); },
-  'accounts.rename'({ id, name }) { accounts.rename(id, name); },
-  'accounts.remove'({ id }) { accounts.remove(id, state.sessions.filter(s => (s.account || 'default') === id).map(s => s.name)); },
-  /** Sign in (or switch org) for an account: a shell tab running `claude auth login` with that account's config. */
-  async 'accounts.login'({ id, worktreePath, console: useConsole }) {
+  // Claude accounts: saved logins, one of them in the shared config folder
+  /** Add account: a shell tab signs in to a private folder; the login is saved when it's done. The login in use is untouched. */
+  async 'accounts.add'({ name, worktreePath }) {
     const root = rootOf(worktreePath);
     const repo = repoForWorktree(root);
-    accounts.invalidate(id);
-    const a = accounts.get(id);
-    const cmd = claudeBin(settings().claudeCommand);
-    return sessions.create({ kind: 'shell', repoPath: repo ? repo.path : root, worktreePath: root, name: `sign in · ${a.name}`, account: id, command: `${cmd} auth login${useConsole ? ' --console' : ''}` });
+    const clean = String(name || '').trim();
+    const scratch = accounts.startSignIn(clean);
+    // The folder goes in the command itself: it beats the user's shell rc and survives a resume.
+    return sessions.create({ kind: 'shell', repoPath: repo ? repo.path : root, worktreePath: root, name: `sign in · ${clean}`, command: `CLAUDE_CONFIG_DIR=${shq(scratch)} ${claudeBin(settings().claudeCommand)} auth login` });
   },
-  async 'accounts.logout'({ id }) {
-    const cmd = claudeBin(settings().claudeCommand);
-    const env = accounts.env(id);
-    await run('sh', ['-lc', `${cmd} auth logout`], { env, timeout: 30_000 }).catch(() => {});
-    accounts.invalidate(id);
+  async 'accounts.use'({ id }) { await accounts.use(id); pushState(); },
+  'accounts.saveCurrent'({ name }) { const a = accounts.saveCurrent(name); pushState(); return a; },
+  'accounts.rename'({ id, name }) { accounts.rename(id, name); },
+  'accounts.remove'({ id }) { accounts.remove(id); pushState(); },
+  async 'accounts.refreshUsage'({ id }) {
+    const u = await accounts.refreshUsage(id);
+    broadcast('usage', accounts.usage);
+    return u;
   },
 
   'term.history'({ id }) {

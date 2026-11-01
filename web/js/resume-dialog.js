@@ -48,7 +48,6 @@ export async function resumeDialog(app, worktreePath, { value = '' } = {}) {
     sel = Math.max(0, Math.min(sel, v.length - 1));
     clear(list, v.length ? v.map((c, i) => {
       const live = c.session && session(c.session);
-      const acct = (store.accounts || []).length > 1 ? ((store.accounts || []).find(a => a.id === c.account) || {}).name : '';
       return h(`div.resume-item${i === sel && !pasted ? '.selected' : ''}`, {
         title: [c.title && c.first ? `First prompt: ${c.first}` : '', c.summary ? `Summary: ${c.summary}` : '', `ID: ${c.id}`].filter(Boolean).join('\n'),
         onmousemove: () => { if (sel !== i) { sel = i; render(); } },
@@ -57,7 +56,7 @@ export async function resumeDialog(app, worktreePath, { value = '' } = {}) {
       icon('claude', 'resume-icon'),
       h('div.resume-main',
         h('div.resume-title', label(c)),
-        h('div.resume-meta', [when(c.updated), c.prompts ? `${c.prompts}${c.prompts >= 50 ? '+' : ''} prompt${c.prompts === 1 ? '' : 's'}` : '', acct].filter(Boolean).join(' · '))),
+        h('div.resume-meta', [when(c.updated), c.prompts ? `${c.prompts}${c.prompts >= 50 ? '+' : ''} prompt${c.prompts === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · '))),
       live ? h('span.resume-tag', live.state === 'ended' ? 'in SkiffCode · stopped' : 'open in SkiffCode') : null,
       h('button.icon-btn.resume-delete', { title: 'Delete this conversation', onclick: ev => { ev.stopPropagation(); void remove(c); } }, icon('trash')));
     }) : h('div.muted.resume-empty', 'No conversations match.'));
@@ -88,7 +87,7 @@ export async function resumeDialog(app, worktreePath, { value = '' } = {}) {
   }
 
   async function pick(c) {
-    await adopt(c.id, c.account);
+    await adopt(c.id);
   }
   function submit() {
     if (UUID.test(input.value)) return adopt(input.value);
@@ -96,11 +95,11 @@ export async function resumeDialog(app, worktreePath, { value = '' } = {}) {
     if (c) return pick(c);
   }
   let busy = false;
-  async function adopt(conversation, account) {
+  async function adopt(conversation) {
     if (busy) return;
     busy = true;
     try {
-      const s = await call('sessions.adopt', { worktreePath, conversation, account, ...TERM_SIZE });
+      const s = await call('sessions.adopt', { worktreePath, conversation, ...TERM_SIZE });
       m.close(s);
       await app.actions.focusSession(s.id);
     } catch (e) {

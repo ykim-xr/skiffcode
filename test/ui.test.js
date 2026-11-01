@@ -35,15 +35,20 @@ fs.mkdirSync(other);
 sh('git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m x', other);
 
 const server = spawn('node', [path.join(APP, 'server', 'main.js')], {
-  env: { ...process.env, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT), SHELL: '/bin/bash', CLAUDE_CONFIG_DIR: path.join(tmp, 'claude-home'), SKIFFCODE_VENDOR: process.env.SKIFFCODE_VENDOR || path.join(APP, 'vendor') },
+  env: { ...process.env, SKIFFCODE_HOME: HOME, SKIFFCODE_PORT: String(PORT), SHELL: '/bin/bash', CLAUDE_CONFIG_DIR: path.join(tmp, 'claude-home'), SKIFFCODE_USAGE_URL: `http://127.0.0.1:${PORT + 100}/usage`, SKIFFCODE_VENDOR: process.env.SKIFFCODE_VENDOR || path.join(APP, 'vendor') },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 server.stderr.on('data', d => process.stderr.write(`[server] ${d}`));
 
-// A tiny local web app for the web-page viewer: /ok can be framed, /deny refuses (X-Frame-Options)
+// A tiny local web app for the web-page viewer: /ok can be framed, /deny refuses (X-Frame-Options).
+// /usage stands in for Anthropic's usage endpoint.
 const webPort = PORT + 100;
 const web = `http://127.0.0.1:${webPort}`;
 require('http').createServer((req, res) => {
+  if (req.url === '/usage') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ five_hour: { utilization: 37, resets_at: new Date(Date.now() + 3600e3).toISOString() }, seven_day: { utilization: 12, resets_at: new Date(Date.now() + 4 * 86400e3).toISOString() } }));
+  }
   if (req.url === '/deny') res.writeHead(200, { 'Content-Type': 'text/html', 'X-Frame-Options': 'DENY' });
   else res.writeHead(200, { 'Content-Type': 'text/html' });
   res.end('<h1>local app</h1>');
@@ -688,7 +693,7 @@ const G = {};
     await drop(`${W} .row-top .term-body:not(.hidden)`, { internal: { root: wt, path: 'notes.txt', type: 'file' } });
     await page.waitForFunction(() => [...document.querySelectorAll('.workspace:not(.hidden) .row-top .stub-term')].some(p => p.textContent.includes('@notes.txt')));
     // a shell (bottom panel) gets the full path
-    await page.click(`${W} .row-top .tabbar-actions button[title^="New shell"]`);
+    await page.evaluate(() => window.skiffcode.actions.newSession(null, 'shell')); // shells open in the bottom panel
     await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; return t && t.session && t.session.kind === 'shell' && t.attached; });
     await sleep(500);
     const shellSel = `${W} .row-bottom .term-body:not(.hidden)`;
@@ -787,7 +792,7 @@ const G = {};
   });
 
   await step('a shell in the worktree: type a command, see output', async () => {
-    await page.click('.workspace:not(.hidden) .tabbar-actions button[title^="New shell"]');
+    await page.evaluate(() => window.skiffcode.actions.newSession(null, 'shell')); // shells open in the bottom panel
     await page.waitForSelector('.workspace:not(.hidden) .row-bottom .tab.active >> text=shell');
     await sleep(500);
     const id = await page.evaluate(() => window.skiffcode.active.activeTab.sessionId);
@@ -843,14 +848,14 @@ const G = {};
     await page.waitForFunction(i => !window.skiffcode.active.allTabs().some(t => t.sessionId === i), id);
   });
 
-  await step('bottom panel: split down, hide/show, and the layout survives a reload', async () => {
+  await step('bottom panel: move to panel, split right, hide/show, and the layout survives a reload', async () => {
     await page.keyboard.press('Control+p');
     await page.waitForSelector('.qp-input');
     await page.keyboard.type('README');
     await page.keyboard.press('Enter');
     await page.waitForSelector('.workspace:not(.hidden) .row-top .tab.active >> text=README.md');
     await page.click('.workspace:not(.hidden) .row-top .tab:has-text("README.md")', { button: 'right' });
-    await page.click('.menu-item >> text=Split down (bottom panel)');
+    await page.click('.menu-item >> text=Move to panel');
     await page.waitForSelector('.workspace:not(.hidden) .row-bottom .tab >> text=README.md');
     await page.click('.workspace:not(.hidden) .row-bottom .tab:has-text("README.md")', { button: 'right' });
     await page.click('.menu-item >> text=Split right');
@@ -869,7 +874,7 @@ const G = {};
     assert.equal(await page.locator('.workspace:not(.hidden) .row-bottom .pane').count(), 2, 'bottom split restored');
     // put README back on top for the next steps
     await page.click('.workspace:not(.hidden) .row-bottom .tab:has-text("README.md")', { button: 'right' });
-    await page.click('.menu-item >> text=Move up to the main area');
+    await page.click('.menu-item >> text=Move to main area');
     await page.waitForSelector('.workspace:not(.hidden) .row-top .tab >> text=README.md');
   });
 
@@ -956,7 +961,7 @@ const G = {};
     await shot('03b-sidebar-sync');
   });
 
-  await step('usage in the status bar; account panel: add + sign in, switch', async () => {
+  await step('usage in the status bar; account panel: add, use, refresh usage', async () => {
     plan('SessionStart,UserPromptSubmit,Status:63:91,Stop,hang');
     const s = await page.evaluate(() => import('/js/store.js').then(m => m.store.sessions.find(x => x.kind === 'claude')));
     await page.evaluate(id => import('/js/rpc.js').then(r => r.call('sessions.stop', { id }).then(() => r.call('sessions.resume', { id }))), s.id);
@@ -965,31 +970,50 @@ const G = {};
     assert.match(await page.textContent('.sb-item.usage .usage-reset'), /^↻ (1h 5\dm|2h 0m)$/);
     assert.match(await page.getAttribute('.sb-item.usage', 'title'), /5-hour: 63% used, resets in/);
     await shot('07-usage');
+    // account panel: Add account signs in through a tab; the login is saved when it's done
+    const claudeHome = path.join(tmp, 'claude-home');
+    fs.mkdirSync(claudeHome, { recursive: true });
+    fs.writeFileSync(path.join(claudeHome, '.claude.json'), JSON.stringify({ numStartups: 1 })); // Claude's global config, with no login yet
+    const addAccount = async (name, who) => {
+      fs.writeFileSync(`${process.env.FAKE_SCRIPT_FILE}.login`, who);
+      await page.click('.sb-item.usage');
+      await page.click('.accounts-modal .btn >> text=Add account…');
+      await page.fill('.modal:not(.accounts-modal) .input', name);
+      await page.keyboard.press('Enter');
+      // sign-in runs in a shell tab in the bottom panel
+      await page.waitForSelector(`.workspace:not(.hidden) .row-bottom .tab >> text=sign in · ${name}`, { timeout: 10000 });
+      await page.waitForSelector('.toast >> text=Finish signing in');
+      await page.waitForSelector(`.toast >> text=Saved ${name}`, { timeout: 10000 });
+    };
     await page.click('.sb-item.usage');
-    await page.waitForSelector('.accounts-modal .account.active >> text=Default');
-    await page.waitForSelector('.accounts-modal .account-who >> text=Not signed in');
-    await page.click('.accounts-modal .btn >> text=Add account…');
-    await page.fill('.modal:not(.accounts-modal) .input', 'Work');
-    await page.keyboard.press('Enter');
-    // sign-in runs in a shell tab in the bottom panel
-    await page.waitForSelector('.workspace:not(.hidden) .row-bottom .tab >> text=sign in · Work', { timeout: 10000 });
-    await page.waitForSelector('.toast >> text=Finish signing in');
-    const dir = path.join(HOME, 'accounts', 'work');
-    for (let i = 0; i < 100 && !fs.existsSync(path.join(dir, 'fake-login.json')); i++) await sleep(50);
-    assert.ok(fs.existsSync(path.join(dir, 'fake-login.json')), 'signed in with the Work config folder');
+    await page.waitForSelector('.accounts-modal .accounts-current >> text=Not signed in');
+    await page.click('.accounts-modal .btn >> text=Done');
+    await addAccount('Work', 'work');
+    await addAccount('Home', 'home');
+    assert.ok(!fs.existsSync(path.join(claudeHome, '.credentials.json')), 'adding never changes the login in use');
     await page.click('.sb-item.usage');
-    await page.waitForSelector('.accounts-modal .account:has-text("Work") .account-who >> text=me@work.test', { timeout: 10000 });
-    await page.click('.accounts-modal .account:has-text("Work") .account-name');
-    await page.waitForSelector('.accounts-modal .account.active:has-text("Work")');
+    await page.waitForSelector('.accounts-modal .account:has-text("Work") .account-who >> text=work@example.test');
+    // Use: confirm, then the shared login is Work's
+    await page.click('.accounts-modal .account:has-text("Work") .btn >> text=Use');
+    await page.click('.modal:not(.accounts-modal) .btn >> text=Switch');
+    await page.waitForSelector('.accounts-modal .account.active:has-text("Work") .account-tag >> text=in use');
+    await page.waitForSelector('.accounts-modal .accounts-current >> text=Signed in now: work@example.test');
+    assert.match(JSON.parse(fs.readFileSync(path.join(claudeHome, '.credentials.json'), 'utf8')).claudeAiOauth.accessToken, /^at-work-/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(claudeHome, '.claude.json'), 'utf8')).oauthAccount.emailAddress, 'work@example.test');
+    await page.click('.accounts-modal .account:has-text("Home") .btn >> text=Use');
+    await page.click('.modal:not(.accounts-modal) .btn >> text=Switch');
+    await page.waitForSelector('.accounts-modal .account.active:has-text("Home") .account-tag >> text=in use');
+    assert.equal(await page.locator('.accounts-modal .account.active').count(), 1, 'the tag moved');
+    // refresh reads usage for that account
+    await page.click('.accounts-modal .account:has-text("Work") .account-refresh');
+    await page.waitForSelector('.accounts-modal .account:has-text("Work") .usage-meter.ok:has-text("37%")');
+    await page.waitForSelector('.accounts-modal .account:has-text("Work") .account-updated >> text=Updated');
     await shot('08-accounts');
     await page.click('.accounts-modal .btn >> text=Done');
-    await page.waitForSelector('.sb-item.usage .usage-acct >> text=Work');
-    assert.equal(await page.locator('.sb-item.usage .usage-meter.unknown').count(), 2, 'no usage reported for Work yet');
+    await page.waitForSelector('.sb-item.usage .usage-acct >> text=Home');
+    assert.equal(await page.locator('.sb-item.usage .usage-meter.unknown').count(), 2, 'no usage reported for Home yet');
     const st = JSON.parse(fs.readFileSync(path.join(HOME, 'state.json'), 'utf8'));
-    assert.equal(st.prefs.activeAccount, st.prefs.accounts[0].id);
-    // back to Default for the rest
-    await page.evaluate(() => import('/js/rpc.js').then(r => r.call('accounts.setActive', { id: 'default' })));
-    await page.waitForSelector('.sb-item.usage .usage-acct >> text=Default');
+    assert.deepEqual(st.prefs.accounts.map(a => a.name), ['Work', 'Home']);
   });
 
   await step('Active panel (needs you + working, by repo) and subagents in the sidebar; collapsible; click opens', async () => {
@@ -1320,7 +1344,7 @@ const G = {};
     fs.mkdirSync(rep, { recursive: true });
     fs.writeFileSync(path.join(rep, 'index.html'), '<!doctype html><link rel=stylesheet href="s.css"><h1 id=r>coverage 93%</h1>');
     fs.writeFileSync(path.join(rep, 's.css'), '#r { color: rgb(4, 5, 6); }');
-    await page.click('.workspace:not(.hidden) .tabbar-actions button[title^="New shell"]');
+    await page.evaluate(() => window.skiffcode.actions.newSession(null, 'shell')); // shells open in the bottom panel
     await page.waitForSelector('.workspace:not(.hidden) .row-bottom .tab.active >> text=shell');
     await sleep(400);
     const id = await page.evaluate(() => window.skiffcode.active.activeTab.sessionId);
@@ -1605,18 +1629,181 @@ const G = {};
     assert.deepEqual(await order(), ['src/app.py', 'README.md', 'src/site.css']);
   });
 
-  await step('tabs: dropping a tab on the right edge of a pane moves it to a new pane beside it', async () => {
-    const W = '.workspace:not(.hidden)';
+  // ---- split tree in the main area
+  const W = '.workspace:not(.hidden)';
+  /** The main area as nested data: a split is { row | column: [...] }, a pane is its file and web tabs ('*' marks the active one). */
+  const shape = () => page.evaluate(() => {
+    const ws = window.skiffcode.active;
+    const name = el => {
+      const t = ws.allTabs().find(x => x.uid === el.dataset.uid);
+      return t && (t.path || t.url) ? (t.path || t.url) + (el.classList.contains('active') ? '*' : '') : null;
+    };
+    const walk = el => el.classList.contains('pane')
+      ? [...el.querySelectorAll(':scope > .tabbar > .tab')].map(name).filter(Boolean)
+      : { [el.classList.contains('split-column') ? 'column' : 'row']: [...el.children].filter(c => !c.classList.contains('sash')).map(walk) };
+    return walk(document.querySelector('.workspace:not(.hidden) .row-top').firstElementChild);
+  });
+  const openAll = (...paths) => page.evaluate(async ps => { const ws = window.skiffcode.active; for (const p of ps) await ws.openFile(p); }, paths);
+  const splitTab = (path, side) => page.evaluate(([p, s]) => { const ws = window.skiffcode.active; ws.split(ws.find(t => t.path === p), s); }, [path, side]);
+
+  await step('split tree: Split right, then Split down on the right pane nests the panes', async () => {
     await freshMain();
-    await page.evaluate(async () => { const ws = window.skiffcode.active; for (const p of ['README.md', 'src/app.py']) await ws.openFile(p); });
-    await page.evaluate(() => {
+    await openAll('README.md', 'src/app.py', 'src/site.css');
+    await page.evaluate(u => window.skiffcode.active.openWeb(u), `${web}/ok`);
+    await page.click(`${W} .row-top .tab:has-text("site.css")`, { button: 'right' });
+    await page.click('.menu-item >> text=Split right');
+    await page.evaluate(() => { const ws = window.skiffcode.active; ws.moveTab(ws.find(t => t.path === 'src/app.py'), ws.top.panes[1]); });
+    await page.click(`${W} .row-top .split-row > .pane:last-child .tabbar-actions button[title="Split down"]`);
+    assert.deepEqual(await shape(), { row: [['README.md', `${web}/ok*`], { column: [['src/site.css*'], ['src/app.py*']] }] });
+    await shot('15-split-tree');
+  });
+
+  await step('split tree: a sash resizes nested panes; a reload restores the tree, active tabs, sizes and the focused pane', async () => {
+    const sash = await page.locator(`${W} .row-top .split-column > .sash`).boundingBox();
+    const ratio = () => page.evaluate(() => { const [b, c] = document.querySelectorAll('.workspace:not(.hidden) .row-top .split-column > .pane'); return b.offsetHeight / (b.offsetHeight + c.offsetHeight); });
+    const before = await ratio();
+    await page.mouse.move(sash.x + sash.width / 2, sash.y + sash.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(sash.x + sash.width / 2, sash.y + sash.height / 2 + 120, { steps: 4 });
+    await page.mouse.up();
+    const after = await ratio();
+    assert.ok(after > before + 0.1, `the upper pane grew (${before} → ${after})`);
+    await page.click(`${W} .row-top .split-column > .pane:last-child .pane-body`); // focus the lower pane
+    const tree = await shape();
+    await sleep(700); // layout is saved shortly after changes
+    const saved = await page.evaluate(() => import('/js/store.js').then(m => m.store.layouts[window.skiffcode.active.root]));
+    assert.equal(saved.v, 2);
+    assert.deepEqual(saved.top.map(p => p.tabs.length), [2, 1, 1], 'top stays the flat list of panes older builds read');
+    assert.deepEqual(saved.main.children[1].children, [1, 2]);
+    await page.reload();
+    await page.waitForSelector('.wt-row.active >> text=main', { timeout: 15000 });
+    await page.waitForSelector(`${W} .row-top .split-column`);
+    assert.deepEqual(await shape(), tree);
+    assert.ok(Math.abs(await ratio() - after) < 0.02, 'sizes restored');
+    assert.equal(await page.evaluate(() => window.skiffcode.active.focused.active.path), 'src/app.py', 'focused pane restored');
+  });
+
+  await step('split tree: dropping a tab on an edge of a pane splits that way; on the middle it moves there', async () => {
+    const drag = p => page.evaluate(path => {
       const dt = new DataTransfer();
-      window.skiffcode.active.top.panes[0].tabs[1].tabEl.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+      window.skiffcode.active.find(t => t.path === path).tabEl.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+    }, p);
+    const zone = () => page.evaluate(() => document.querySelector('.workspace:not(.hidden) .row-top .drop-zone').className);
+    for (const [side, at, want] of [
+      ['right', [0.9, 0.5], { row: [['README.md*'], ['src/app.py*']] }],
+      ['left', [0.1, 0.5], { row: [['src/app.py*'], ['README.md*']] }],
+      ['down', [0.5, 0.9], { column: [['README.md*'], ['src/app.py*']] }],
+      ['up', [0.5, 0.1], { column: [['src/app.py*'], ['README.md*']] }],
+    ]) {
+      await freshMain();
+      await openAll('README.md', 'src/app.py');
+      await drag('src/app.py');
+      await dnd(`${W} .row-top .pane-body`, ['dragenter', 'dragover'], { at });
+      assert.match(await zone(), new RegExp(`zone-${side}\\b`), side);
+      await dnd(`${W} .row-top .pane-body`, ['drop'], { at });
+      assert.deepEqual(await shape(), want, side);
+      assert.equal(await page.evaluate(() => window.skiffcode.active.dragTab || null), null, 'the drag is over');
+    }
+    await freshMain();
+    await openAll('README.md', 'src/app.py', 'src/site.css');
+    await splitTab('src/app.py', 'right');
+    await drag('src/site.css');
+    await dnd(`${W} .row-top .split-row > .pane:last-child .pane-body`, ['dragenter', 'dragover', 'drop'], { at: [0.5, 0.5] });
+    assert.deepEqual(await shape(), { row: [['README.md*'], ['src/app.py', 'src/site.css*']] });
+  });
+
+  await step('split tree: closing the last tab of a nested pane collapses its split; unsaved text survives split, move and collapse', async () => {
+    await freshMain();
+    await openAll('README.md', 'src/app.py', 'src/site.css');
+    const edited = () => page.evaluate(() => { const t = window.skiffcode.active.find(x => x.path === 'src/app.py'); return [t.entry.model.getValue(), t.dirty()]; });
+    await page.evaluate(() => window.skiffcode.active.find(t => t.path === 'src/app.py').entry.model.setValue('unsaved\n'));
+    await splitTab('src/app.py', 'right');
+    await splitTab('src/site.css', 'down');
+    assert.deepEqual(await shape(), { row: [{ column: [['README.md*'], ['src/site.css*']] }, ['src/app.py*']] });
+    assert.deepEqual(await edited(), ['unsaved\n', true]);
+    await page.hover(`${W} .row-top .tab:has-text("README.md")`);
+    await page.click(`${W} .row-top .tab:has-text("README.md") .tab-close`);
+    assert.deepEqual(await shape(), { row: [['src/site.css*'], ['src/app.py*']] });
+    await page.evaluate(() => { const ws = window.skiffcode.active; ws.moveTab(ws.find(t => t.path === 'src/app.py'), ws.top.panes[0]); });
+    assert.deepEqual(await shape(), ['src/site.css', 'src/app.py*']);
+    assert.deepEqual(await edited(), ['unsaved\n', true]);
+    await page.evaluate(() => window.skiffcode.active.find(t => t.path === 'src/app.py').entry.model.setValue('def greet(name):\n    return name\n'));
+  });
+
+  await step('split tree: the New shell and New Claude session buttons of a nested pane open the tab in that pane', async () => {
+    await freshMain();
+    await openAll('README.md', 'src/app.py', 'src/site.css');
+    await splitTab('src/site.css', 'right');
+    await splitTab('src/app.py', 'down');
+    const nested = `${W} .row-top .split-column > .pane:last-child`;
+    const has = kind => page.waitForFunction(k => window.skiffcode.active.find(t => t.path === 'src/app.py').pane.tabs.some(t => t.session && t.session.kind === k), kind, { timeout: 10000 });
+    await page.click(`${nested} .tabbar-actions button[title^="New shell"]`);
+    await has('shell');
+    plan('SessionStart,hang');
+    await page.click(`${nested} .tabbar-actions button[title^="New Claude session"]`);
+    await page.waitForSelector('.modal-title >> text=New Claude session');
+    await page.evaluate(() => { const ws = window.skiffcode.active; ws.focusPane(ws.top.panes[0]); }); // focus moves on while the name is asked
+    await page.click('.modal .btn.primary >> text=Start');
+    await has('claude');
+    await page.evaluate(async () => {
+      const { call } = await import('/js/rpc.js');
+      for (const t of window.skiffcode.active.allTabs().filter(x => x.kind === 'session')) await call('sessions.forget', { id: t.sessionId });
     });
-    await dnd(`${W} .row-top .pane-body`, ['dragenter', 'dragover', 'drop'], { at: [0.9, 0.4] });
-    const panes = () => page.evaluate(() => window.skiffcode.active.top.panes.map(p => p.tabs.map(t => t.path)));
-    assert.deepEqual(await panes(), [['README.md'], ['src/app.py']]);
-    assert.equal(await page.evaluate(() => window.skiffcode.active.dragTab || null), null, 'the drag is over');
+  });
+
+  await step('split tree: the main area takes 8 panes, the bottom panel 5', async () => {
+    await freshMain();
+    assert.equal(await page.evaluate(() => {
+      const ws = window.skiffcode.active;
+      for (let i = 0; i < 9; i++) ws.openWeb('');
+      for (let i = 0; i < 7; i++) ws.split(ws.top.panes[0].tabs[0], i % 2 ? 'down' : 'right');
+      return ws.top.panes.length;
+    }), 8);
+    await page.click(`${W} .row-top .pane .tabbar-actions button[title="Split right"]`);
+    await page.waitForSelector('#toasts >> text=Up to 8 panes');
+    assert.equal(await page.evaluate(() => window.skiffcode.active.top.panes.length), 8);
+    assert.equal(await page.evaluate(() => {
+      const ws = window.skiffcode.active;
+      const p = ws.bottom.addPane();
+      for (let i = 0; i < 6; i++) ws.openWeb('', { pane: p });
+      for (let i = 0; i < 5; i++) ws.split(p.tabs[0], 'right');
+      return ws.bottom.panes.length;
+    }), 5);
+    await resetUi();
+    await page.click(`${W} .row-bottom .pane .tabbar-actions button[title="Split right"]`);
+    await page.waitForSelector('#toasts >> text=Up to 5 panes');
+    assert.equal(await page.evaluate(() => window.skiffcode.active.bottom.panes.length), 5);
+  });
+
+  await step('layout: a v2 layout without a tree, a damaged tree and a tree over 8 panes load with every tab', async () => {
+    await freshMain();
+    const r = await page.evaluate(async web => {
+      const app = window.skiffcode;
+      const ws = app.active;
+      const { Workspace } = await import('/js/workspace.js');
+      const { store } = await import('/js/store.js');
+      const saved = store.layouts[ws.root];
+      const pane = (...names) => ({ tabs: names.map(n => ({ kind: 'web', url: `${web}/${n}` })), active: names.length - 1 });
+      const read = p => p.tabs.filter(t => t.kind === 'web').map(t => t.url.slice(web.length + 1) + (t === p.active ? '*' : ''));
+      const out = [];
+      for (const layout of [
+        { v: 2, top: [{ ...pane('a', 'b'), active: 0, flex: '0.3000 1 0' }, { ...pane('c'), flex: '0.7000 1 0' }], bottom: [pane('d')], focused: [0, 1] },
+        { v: 2, top: [pane('a'), pane('b', 'c'), pane('d')], main: { split: 'row', sizes: [1, 'x'], children: [0, { split: 'diagonal' }, { split: 'column', children: [] }, 'x', 1, 7] }, bottom: [] },
+        { v: 2, top: 'abcdefghij'.split('').map(n => pane(n)), main: { split: 'row', sizes: [], children: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] }, bottom: [] },
+      ]) {
+        store.layouts[ws.root] = layout;
+        const w = new Workspace(app, { path: ws.root, repo: { path: ws.repoPath } });
+        w.saveSoon = () => {};
+        w.restore();
+        out.push({ top: w.top.panes.map(read), bottom: w.bottom.panes.map(read), flex: w.top.panes.map(p => parseFloat(p.el.style.flex)), focused: w.top.panes.indexOf(w.focused) });
+        w.dispose();
+      }
+      store.layouts[ws.root] = saved;
+      return out;
+    }, web);
+    assert.deepEqual(r[0], { top: [['a*', 'b'], ['c*']], bottom: [['d*']], flex: [0.3, 0.7], focused: 1 });
+    assert.deepEqual(r[1].top, [['a*'], ['b', 'c*', 'd']], 'a damaged tree skips bad nodes; an unplaced pane joins the last one');
+    assert.deepEqual(r[2].top, [['a*'], ['b*'], ['c*'], ['d*'], ['e*'], ['f*'], ['g*'], ['h*', 'i', 'j']], 'over 8 panes: the rest join the last pane');
   });
 
   await step('the first Ctrl+Shift+` with no bottom panel opens a shell', async () => {

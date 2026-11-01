@@ -12,7 +12,7 @@ export const store = {
   settings: {},
   layouts: {},
   accounts: [],
-  activeAccount: 'default',
+  currentLogin: null, // the login in the shared Claude folder: { email, org, plan, saved, expired }
   usage: {},
   worktrees: new Map(), // repo path -> { list: [...], missing, error }
   status: new Map(), // worktree path -> BranchStatus
@@ -43,7 +43,7 @@ export function applySnapshot(s) {
     settings: s.settings,
   });
   if (s.accounts) store.accounts = s.accounts;
-  if (s.activeAccount) store.activeAccount = s.activeAccount;
+  if ('currentLogin' in s) store.currentLogin = s.currentLogin;
   if (s.usage) store.usage = s.usage;
   if (s.layouts) store.layouts = s.layouts;
   if (s.home) store.home = s.home;

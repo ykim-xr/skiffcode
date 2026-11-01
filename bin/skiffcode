@@ -72,7 +72,8 @@ Stop it, or run SkiffCode on another port:  SKIFFCODE_PORT=3418 skiffcode"
   # A private log without changing the server's umask (its terminals inherit that).
   (umask 077; : >>"$LOG"); chmod 600 "$LOG"
   # Always from the home folder: started from a Windows folder (/mnt/c/…, slow in WSL) the server can hang or fail.
-  ( cd "$HOME" 2>/dev/null || cd /; exec setsid nohup node "$APP/server/main.js" >>"$LOG" 2>&1 </dev/null ) &
+  # SKIFFCODE_USAGE_URL is for tests only: a shell's leftover value must never get a real token.
+  ( cd "$HOME" 2>/dev/null || cd /; exec setsid nohup env -u SKIFFCODE_USAGE_URL node "$APP/server/main.js" >>"$LOG" 2>&1 </dev/null ) &
   for _ in $(seq 1 150); do
     running && return 0
     sleep 0.1

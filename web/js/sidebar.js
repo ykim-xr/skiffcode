@@ -296,7 +296,7 @@ function sessionRow(s, depth, agentsKey) {
   const ended = s.state === 'ended';
   return h(`div.row.session-row${s.unread ? '.unread' : ''}${A.isSessionFocused(s.id) ? '.focused' : ''}`, {
     style: { paddingLeft: `${6 + depth * 12}px` },
-    title: [`${s.name} — ${stateLabel(s)}`, s.model ? `${s.model}${s.contextPct !== undefined ? ` · context ${s.contextPct}%` : ''}` : '', (store.accounts || []).length > 1 ? `Account: ${((store.accounts || []).find(a => a.id === (s.account || 'default')) || {}).name || 'Default'}` : '', 'Double-click to rename'].filter(Boolean).join('\n'),
+    title: [`${s.name} — ${stateLabel(s)}`, s.model ? `${s.model}${s.contextPct !== undefined ? ` · context ${s.contextPct}%` : ''}` : '', 'Double-click to rename'].filter(Boolean).join('\n'),
     onclick: () => A.focusSession(s.id),
     ondblclick: e => { e.preventDefault(); A.renameSession(s); },
     oncontextmenu: e => contextMenu(e, [

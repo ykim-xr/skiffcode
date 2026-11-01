@@ -83,13 +83,13 @@ function projectDirs(configDir, folder) {
 
 /**
  * Conversations Claude has for `folder`, newest first.
- * accounts: [{ id, dir }] (dir = Claude config dir). tracked: Map claudeId -> SkiffCode session id.
+ * configDirs: Claude config folders. tracked: Map claudeId -> SkiffCode session id.
  */
-function listConversations(folder, accounts, tracked, limit = 40) {
+function listConversations(folder, configDirs, tracked, limit = 40) {
   const out = [];
   const seen = new Set();
-  for (const a of accounts) {
-    for (const dir of projectDirs(a.dir, folder)) {
+  for (const cfg of configDirs) {
+    for (const dir of projectDirs(cfg, folder)) {
       let files = [];
       try { files = fs.readdirSync(dir).filter(f => f.endsWith('.jsonl') && UUID.test(f)); } catch { continue; }
       for (const f of files) {
@@ -100,7 +100,7 @@ function listConversations(folder, accounts, tracked, limit = 40) {
           if (!t.first && !t.title) continue; // nothing was ever asked
           if (t.cwd && path.resolve(t.cwd) !== path.resolve(folder)) continue;
           seen.add(id);
-          out.push({ id, account: a.id, title: t.title, summary: t.summary, first: t.first, prompts: t.prompts, started: t.started, updated: t.updated, session: tracked.get(id) || null });
+          out.push({ id, title: t.title, summary: t.summary, first: t.first, prompts: t.prompts, started: t.started, updated: t.updated, session: tracked.get(id) || null });
         } catch { /* unreadable: skip */ }
       }
     }

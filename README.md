@@ -13,7 +13,8 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 - **Subagents** counted on their session; click to list them with their type
 - **Resume past conversations**, including ones started elsewhere (a terminal, Orca): pick from the worktree's list or paste `claude --resume <id>`
 - **Delete a session for good**: its Claude conversation goes too, so it's gone from `/resume`; removing a worktree or folder can do the same for all of its conversations
-- **Claude usage** (5-hour / weekly, time to reset) in the status bar; switch between Claude logins and orgs
+- **Claude usage** (5-hour / weekly, time to reset) in the status bar
+- **Saved Claude logins**: switch every session to another login or org in one click, like `/login`; refresh each account's usage
 
 **Repos and git**
 - Repos, git worktrees and plain folders in groups, in your own order, with your own icon and color
@@ -24,6 +25,7 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 
 **Editor and app**
 - Monaco editor with syntax colors for ~80 languages and F12 go-to-definition; quick open and search
+- **Split panes** like VS Code: split right or down, nested, up to 8 panes; drop a tab on a pane's edge to split that way; the bottom panel takes up to 5 side by side
 - **Drag and drop** like VS Code: files from Explorer into a folder (copied in) or onto a Claude session (attached); from the Files panel onto a folder (moved), an editor pane (opened) or a session (`@path`)
 - **Viewers**: images and PDFs open in a tab; HTML pages (and SVG) get a live preview to the side that reloads as files change
 - **Paths in terminals are links**, Claude’s output included: an HTML report opens in your browser on click, or as a preview inside SkiffCode on Ctrl+click; code opens in the editor at its line; right-click for more. Works with Linux, `C:\…` and `\\wsl.localhost\…` paths

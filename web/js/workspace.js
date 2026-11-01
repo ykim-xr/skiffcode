@@ -1,6 +1,6 @@
-// One worktree's workspace: two rows of panes (main area on top, a bottom
-// panel for shells), each row can split right, plus its own Files / Changes /
-// Search panel. Every opened worktree stays alive in the page, so switching
+// One worktree's workspace: a main area split into nested panes like VS Code,
+// a bottom panel of panes side by side (for shells), plus its own Files /
+// Changes / Search panel. Every opened worktree stays alive in the page, so switching
 // between them is instant.
 import { h, icon, clear, basename, readStored, debounce, TERM_SIZE } from './util.js';
 import { call } from './rpc.js';
@@ -14,12 +14,20 @@ import { isInternal, isExternal, readInternal } from './dnd.js';
 import { contextMenu, toast } from './dialogs.js';
 import { keyHint, withKey } from './keybindings.js';
 
-const MAX_PANES_PER_ROW = 3;
+const MAX_MAIN_PANES = 8;
+const MAX_PANEL_PANES = 5;
+const EDGE = 0.25; // a drop this close to a pane's edge splits that way
+
+/** A flex value that grows in proportion to g. */
+const flexOf = g => `${+g.toFixed(4)} 1 0`;
+/** A node's share of its split (1 while a sash drag holds it at a fixed size). */
+const growOf = node => { const v = parseFloat(node.el.style.flex); return v > 0 ? v : 1; };
 
 class Pane {
   constructor(ws, row) {
     this.ws = ws;
     this.row = row;
+    this.parent = null; // the Split it is in (main area only)
     this.tabs = [];
     this.active = null;
     this.bar = h('div.tabbar', {
@@ -54,29 +62,37 @@ class Pane {
     this.el = h('div.pane', { onmousedown: () => ws.focusPane(this) }, this.bar, this.body);
   }
 
-  /** Drop zones like Orca: right edge = split right, bottom edge = split down, middle = move here. */
+  /**
+   * Drop zones like VS Code. Main area: an edge splits that way, the middle moves here.
+   * Bottom panel: the right edge splits right, the top edge moves to the main area.
+   */
   dragOver(e) {
-    if (!this.ws.dragTab && !isInternal(e)) return;
+    const tab = this.ws.dragTab;
+    if (!tab && !isInternal(e)) return;
     e.preventDefault();
     const r = this.body.getBoundingClientRect();
     const x = (e.clientX - r.left) / r.width;
     const y = (e.clientY - r.top) / r.height;
     let zone = 'center';
-    if (y > 0.7 && this.row.kind === 'top') zone = 'down';
-    else if (y < 0.3 && this.row.kind === 'bottom') zone = 'up';
-    else if (x > 0.7 && this.row.panes.length < MAX_PANES_PER_ROW) zone = 'right';
+    if (this.row.kind === 'bottom') {
+      if (y < EDGE) zone = 'up';
+      else if (x > 1 - EDGE && this.ws.canSplit(this, tab)) zone = 'right';
+    } else if (this.ws.canSplit(this, tab)) {
+      const [side, d] = [['left', x], ['right', 1 - x], ['up', y], ['down', 1 - y]].sort((a, b) => a[1] - b[1])[0];
+      if (d < EDGE) zone = side;
+    }
     this.zone.dataset.zone = zone;
     this.zone.className = `drop-zone zone-${zone}`;
   }
 
-  /** A file dragged from the Files panel: open it here, or in a new split (right / down edge). */
+  /** A file dragged from the Files panel: open it here, then handle the zone as a dropped tab would. */
   async dropFile(e, zone) {
     const it = readInternal(e);
     if (!it || it.type !== 'file' || it.root !== this.ws.root) return;
     const t = await this.ws.openFile(it.path, { pane: this });
-    if (!t) return;
-    if (zone === 'right') this.ws.splitRight(t);
-    else if (zone === 'down' || zone === 'up') this.ws.splitDown(t);
+    if (!t || zone === 'center') return;
+    if (zone === 'up' && this.row.kind === 'bottom') this.ws.moveToMain(t);
+    else this.ws.split(t, zone, this);
   }
 
   add(tab, { activate = true, index } = {}) {
@@ -161,8 +177,9 @@ class Pane {
             t.kind === 'session' && t.session && t.session.kind === 'claude' ? { label: 'Delete session and conversation…', icon: 'trash', danger: true, action: () => ws.app.actions.purgeSession(t.session) } : null,
             { label: 'Close others', action: async () => { for (const x of this.tabs.filter(y => y !== t)) await ws.closeTab(x); } }, // one question at a time
             { separator: true },
-            this.row.panes.length < MAX_PANES_PER_ROW ? { label: 'Split right', icon: 'split', action: () => ws.splitRight(t) } : null,
-            { label: bottom ? 'Move up to the main area' : 'Split down (bottom panel)', icon: bottom ? 'up' : 'down', action: () => ws.splitDown(t) },
+            this.tabs.length > 1 ? { label: 'Split right', icon: 'split', action: () => ws.split(t, 'right') } : null,
+            !bottom && this.tabs.length > 1 ? { label: 'Split down', icon: 'splitDown', action: () => ws.split(t, 'down') } : null,
+            bottom ? { label: 'Move to main area', icon: 'up', action: () => ws.moveToMain(t) } : { label: 'Move to panel', icon: 'down', action: () => ws.moveToPanel(t) },
             t.kind === 'file' || t.kind === 'view' || t.kind === 'web' ? { separator: true } : null,
             t.kind === 'file' && hasPreview(t.path) ? { label: 'Open preview to the side', icon: 'eye', action: () => ws.openPreview(t.path) } : null,
             t.kind === 'file' || t.kind === 'view' ? { label: 'Copy path', icon: 'link', action: () => navigator.clipboard.writeText(`${ws.root}/${t.path}`) } : null,
@@ -191,7 +208,7 @@ class Pane {
       return el;
     }),
     h('div.tabbar-fill', {
-      ondblclick: () => ws.app.actions.newSession(ws.root, bottom ? 'shell' : 'claude'),
+      ondblclick: () => ws.app.actions.newSession(ws.root, bottom ? 'shell' : 'claude', { pane: this }),
       title: bottom ? 'Double-click for a new shell' : 'Double-click for a new Claude session',
     }),
     (this.actionsEl = this.renderActions()));
@@ -205,10 +222,10 @@ class Pane {
       this.active && this.active.kind === 'file' && hasPreview(this.active.path)
         ? h('button.icon-btn', { title: 'Open preview to the side', onclick: () => ws.openPreview(this.active.path) }, icon('eye'))
         : null,
-      bottom ? null : h('button.icon-btn', { title: withKey('New Claude session', 'newClaude'), onclick: () => ws.app.actions.newSession(ws.root, 'claude') }, icon('claude')),
-      h('button.icon-btn', { title: withKey('New shell', 'newShell'), onclick: () => ws.app.actions.newSession(ws.root, 'shell', { pane: bottom ? this : undefined }) }, icon('terminal')),
-      this.row.panes.length < MAX_PANES_PER_ROW ? h('button.icon-btn', { title: 'Split right', onclick: () => this.active && ws.splitRight(this.active) }, icon('split')) : null,
-      !bottom ? h('button.icon-btn', { title: 'Split down', onclick: () => this.active && ws.splitDown(this.active) }, icon('splitDown')) : null,
+      bottom ? null : h('button.icon-btn', { title: withKey('New Claude session', 'newClaude'), onclick: () => ws.app.actions.newSession(ws.root, 'claude', { pane: this }) }, icon('claude')),
+      h('button.icon-btn', { title: withKey('New shell', 'newShell'), onclick: () => ws.app.actions.newSession(ws.root, 'shell', { pane: this }) }, icon('terminal')),
+      h('button.icon-btn', { title: 'Split right', onclick: () => this.active && ws.split(this.active, 'right') }, icon('split')),
+      bottom ? null : h('button.icon-btn', { title: 'Split down', onclick: () => this.active && ws.split(this.active, 'down') }, icon('splitDown')),
       bottom && this.row.panes.indexOf(this) === this.row.panes.length - 1
         ? h('button.icon-btn', { title: withKey('Hide panel', 'togglePanel'), onclick: () => ws.togglePanel(false) }, icon('chevronDown'))
         : null);
@@ -274,6 +291,199 @@ class Row {
   }
 }
 
+/** A split in the main area: panes or splits side by side ('row') or stacked ('column'), with sashes between. */
+class Split {
+  constructor(area, dir) {
+    this.area = area;
+    this.dir = dir;
+    this.parent = null;
+    this.children = [];
+    this.sashes = new Map(); // child → the sash before it
+    this.el = h(`div.split.split-${dir}`);
+  }
+
+  /** Puts the children and their sashes in the DOM. Elements already in place never move, so iframes in untouched panes don't reload. */
+  sync() {
+    const want = [];
+    this.children.forEach((c, i) => {
+      c.parent = this;
+      if (i) {
+        if (!this.sashes.has(c)) this.sashes.set(c, h(`div.sash.pane-sash.${this.dir === 'row' ? 'vertical' : 'horizontal'}`, { onmousedown: e => this.dragSash(e, c) }));
+        want.push(this.sashes.get(c));
+      }
+      want.push(c.el);
+    });
+    for (const c of this.sashes.keys()) if (this.children.indexOf(c) < 1) this.sashes.delete(c);
+    const keep = new Set(want);
+    for (const el of [...this.el.children]) if (!keep.has(el)) el.remove();
+    want.forEach((el, i) => { if (this.el.children[i] !== el) this.el.insertBefore(el, this.el.children[i] || null); });
+  }
+
+  dragSash(e, b) {
+    e.preventDefault();
+    const ws = this.area.ws;
+    const row = this.dir === 'row';
+    const size = n => (row ? n.el.offsetWidth : n.el.offsetHeight);
+    const pos = ev => (row ? ev.clientX : ev.clientY);
+    const min = row ? 140 : 80;
+    const a = this.children[this.children.indexOf(b) - 1];
+    const total = size(a) + size(b);
+    const start = pos(e);
+    const sa = size(a);
+    const move = ev => {
+      const x = Math.max(min, Math.min(total - min, sa + pos(ev) - start));
+      a.el.style.flex = `0 0 ${x}px`;
+      b.el.style.flex = `0 0 ${total - x}px`;
+      ws.layoutAll();
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      // keep proportions when the window resizes
+      const sizes = this.children.map(size);
+      const sum = sizes.reduce((n, s) => n + s, 0) || 1;
+      this.children.forEach((c, i) => (c.el.style.flex = flexOf(sizes[i] / sum || 1)));
+      ws.layoutAll();
+      ws.saveSoon();
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  }
+}
+
+/** The main area: a tree of splits with panes at the leaves. Has Row's interface (kind, el, panes, tabs()). */
+class MainArea {
+  constructor(ws) {
+    this.ws = ws;
+    this.kind = 'top';
+    this.el = h('div.ws-row.row-top');
+    this.setRoot(new Pane(ws, this));
+  }
+
+  /** Panes in reading order. */
+  get panes() {
+    const out = [];
+    const walk = n => (n instanceof Pane ? out.push(n) : n.children.forEach(walk));
+    walk(this.root);
+    return out;
+  }
+  tabs() {
+    return this.panes.flatMap(p => p.tabs);
+  }
+
+  setRoot(node) {
+    this.root = node;
+    node.parent = null;
+    node.el.style.flex = '';
+    if (this.el.firstChild !== node.el || this.el.children.length !== 1) this.el.replaceChildren(node.el);
+  }
+
+  /** Puts `node` where `old` is, with old's size. */
+  replace(old, node) {
+    const s = old.parent;
+    node.el.style.flex = old.el.style.flex;
+    old.parent = null;
+    if (!s) return this.setRoot(node);
+    s.children[s.children.indexOf(old)] = node;
+    s.sync();
+  }
+
+  /** A new pane on one side of `target` ('right' | 'left' | 'down' | 'up'), taking half of its size. */
+  splitPane(target, side) {
+    const dir = side === 'left' || side === 'right' ? 'row' : 'column';
+    const after = side === 'right' || side === 'down';
+    const p = new Pane(this.ws, this);
+    const s = target.parent;
+    if (s && s.dir === dir) {
+      target.el.style.flex = p.el.style.flex = flexOf(growOf(target) / 2);
+      s.children.splice(s.children.indexOf(target) + (after ? 1 : 0), 0, p);
+      s.sync();
+    } else {
+      const split = new Split(this, dir);
+      this.replace(target, split);
+      target.el.style.flex = p.el.style.flex = '';
+      split.children = after ? [target, p] : [p, target];
+      split.sync();
+    }
+    p.renderBar();
+    return p;
+  }
+
+  /** Takes out an empty pane; a split left with one child gives way to that child. The others keep their shares. */
+  removePane(p) {
+    const s = p.parent;
+    if (!s) return; // the root pane stays
+    s.children.splice(s.children.indexOf(p), 1);
+    p.parent = null;
+    if (s.children.length > 1) return s.sync();
+    const lone = s.children[0];
+    const up = s.parent;
+    if (lone instanceof Split && up && up.dir === lone.dir) {
+      // same direction as the split above: its children join that split with their share of the space
+      const scale = growOf(s) / lone.children.reduce((n, c) => n + growOf(c), 0);
+      for (const c of lone.children) c.el.style.flex = flexOf(growOf(c) * scale);
+      up.children.splice(up.children.indexOf(s), 1, ...lone.children);
+      up.sync();
+    } else this.replace(s, lone);
+  }
+
+  /** The tree for saving: a pane is its index in reading order, a split is { split, sizes, children }. */
+  spec() {
+    const panes = this.panes;
+    const walk = n => (n instanceof Pane ? panes.indexOf(n) : { split: n.dir, sizes: n.children.map(growOf), children: n.children.map(walk) });
+    return walk(this.root);
+  }
+
+  /** Replaces the tree with one built from a checked saved tree (see cleanTree). Returns the new panes by saved index. */
+  build(node) {
+    const made = new Map();
+    const make = n => {
+      if (typeof n === 'number') {
+        const p = new Pane(this.ws, this);
+        made.set(n, p);
+        return p;
+      }
+      const s = new Split(this, n.split);
+      s.children = n.children.map(make);
+      s.children.forEach((c, i) => (c.el.style.flex = flexOf(n.sizes[i])));
+      s.sync();
+      return s;
+    };
+    this.setRoot(make(node));
+    for (const p of made.values()) p.renderBar();
+    return made;
+  }
+}
+
+/**
+ * A saved main-area tree, checked: nodes of the wrong shape are dropped (never thrown on), a split with one
+ * child becomes that child, and each saved pane is placed once, MAX_MAIN_PANES at most.
+ * `used` lists the placed pane indexes in reading order.
+ */
+function cleanTree(node, count) {
+  const used = [];
+  const walk = (n, depth) => {
+    if (Number.isInteger(n)) {
+      if (n < 0 || n >= count || used.includes(n) || used.length >= MAX_MAIN_PANES) return null;
+      used.push(n);
+      return n;
+    }
+    if (!n || typeof n !== 'object' || depth > MAX_MAIN_PANES || (n.split !== 'row' && n.split !== 'column') || !Array.isArray(n.children)) return null;
+    const children = [];
+    const sizes = [];
+    n.children.forEach((c, i) => {
+      const k = walk(c, depth + 1);
+      if (k === null) return;
+      const size = Array.isArray(n.sizes) ? Number(n.sizes[i]) : NaN;
+      children.push(k);
+      sizes.push(size > 0 && Number.isFinite(size) ? size : 1);
+    });
+    if (!children.length) return null;
+    return children.length === 1 ? children[0] : { split: n.split, sizes, children };
+  };
+  return { tree: walk(node, 0), used };
+}
+
 /** Whether a worktree path belongs to a git repo (plain folders are added with kind: 'folder'). */
 function fs_isGit(root) {
   const r = store.repos.find(x => x.path === root);
@@ -286,7 +496,7 @@ export class Workspace {
     this.root = wt.path;
     this.repoPath = wt.repo.path;
     this.focused = null;
-    this.top = new Row(this, 'top');
+    this.top = new MainArea(this);
     this.bottom = new Row(this, 'bottom');
     this.panelHidden = false;
     this.panelHeight = 0.34; // fraction of the center height
@@ -308,7 +518,7 @@ export class Workspace {
     // A plain folder has no git, so it starts on Files.
     const lastView = readStored('skiffcode.rightView') || 'files';
     this.showRight(lastView === 'scm' && !fs_isGit(this.root) ? 'files' : lastView);
-    this.top.addPane();
+    this.top.panes[0].renderBar();
     this.focused = this.top.panes[0];
     this.saveSoon = debounce(() => this.saveLayout(), 400);
     this.applyPanel();
@@ -323,6 +533,7 @@ export class Workspace {
   focusPane(p) {
     if (this.focused === p) return;
     this.focused = p;
+    if (p && p.row === this.top) this.lastMain = p; // where "Move to main area" goes
     this.panes.forEach(x => x.el.classList.toggle('focused', x === p));
     this.files.markActive();
     this.app.reportView();
@@ -339,7 +550,8 @@ export class Workspace {
   }
 
   addTab(tab, opts = {}) {
-    const pane = opts.pane || this.paneFor(tab.kind === 'session' && tab.session && tab.session.kind === 'shell' ? 'shell' : tab.kind);
+    // a pane picked before an async step (a new session) may have closed meanwhile
+    const pane = opts.pane && this.panes.includes(opts.pane) ? opts.pane : this.paneFor(tab.kind === 'session' && tab.session && tab.session.kind === 'shell' ? 'shell' : tab.kind);
     pane.add(tab, opts);
     if (pane.row === this.bottom) {
       if (this.panelHidden && opts.activate !== false) this.panelHidden = false;
@@ -402,36 +614,55 @@ export class Workspace {
   }
 
   splitRight(tab) {
-    const row = tab.pane.row;
-    if (row.panes.length >= MAX_PANES_PER_ROW && tab.pane.tabs.length > 1) return;
-    const at = row.panes.indexOf(tab.pane) + 1;
-    const p = row.panes[at] && tab.pane.tabs.length === 1 ? row.panes[at] : row.addPane(at);
+    return this.split(tab, 'right');
+  }
+
+  /** Moves a tab into a new pane on one side of `target` (its own pane by default). The bottom panel splits right only. */
+  split(tab, side, target = tab.pane) {
+    const bottom = target.row === this.bottom;
+    if (bottom && side !== 'right') return;
+    if (target === tab.pane && target.tabs.length < 2) return; // its only tab: nothing would be left behind
+    if (!this.canSplit(target, tab)) return toast(bottom ? `Up to ${MAX_PANEL_PANES} panes in the panel` : `Up to ${MAX_MAIN_PANES} panes`);
+    const p = bottom ? this.bottom.addPane(this.bottom.panes.indexOf(target) + 1) : this.top.splitPane(target, side);
     this.moveTab(tab, p);
   }
 
-  /** Top → bottom panel, bottom → main area. */
-  splitDown(tab) {
-    const to = tab.pane.row === this.top ? this.bottom : this.top;
-    const p = to.panes[0] || to.addPane();
-    if (to === this.bottom) this.panelHidden = false;
+  /** Whether `target` can split for `tab` (null for a file): under the cap, or `tab` empties a pane in the same area so the count stays the same. */
+  canSplit(target, tab) {
+    if (tab && tab.pane === target && target.tabs.length < 2) return false;
+    const row = target.row;
+    if (row.panes.length < (row === this.bottom ? MAX_PANEL_PANES : MAX_MAIN_PANES)) return true;
+    return !!tab && tab.pane.row === row && tab.pane.tabs.length === 1;
+  }
+
+  moveToPanel(tab) {
+    if (tab.pane.row === this.bottom) return;
+    const p = this.bottom.panes[0] || this.bottom.addPane();
+    this.panelHidden = false;
     this.moveTab(tab, p);
+  }
+
+  /** To the main pane focused last. */
+  moveToMain(tab) {
+    const panes = this.top.panes;
+    const p = panes.includes(this.lastMain) ? this.lastMain : panes[0];
+    if (p !== tab.pane) this.moveTab(tab, p);
+  }
+
+  /** The pane right of p in the same row, if any. */
+  rightOf(p) {
+    if (p.row === this.bottom) return this.bottom.panes[this.bottom.panes.indexOf(p) + 1];
+    const s = p.parent;
+    const next = s && s.dir === 'row' ? s.children[s.children.indexOf(p) + 1] : null;
+    return next instanceof Pane ? next : null;
   }
 
   dropTab(pane, before, zone) {
     const t = this.dragTab;
     this.dragTab = null;
     if (!t) return;
-    if (zone === 'right') {
-      const row = pane.row;
-      const p = row.addPane(row.panes.indexOf(pane) + 1);
-      return this.moveTab(t, p);
-    }
-    if (zone === 'down' || zone === 'up') {
-      const row = zone === 'down' ? this.bottom : this.top;
-      const p = row.panes[0] || row.addPane();
-      if (row === this.bottom) this.panelHidden = false;
-      return this.moveTab(t, p);
-    }
+    if (zone === 'up' && pane.row === this.bottom) return this.moveToMain(t);
+    if (zone && zone !== 'center') return this.split(t, zone, pane);
     if (t === before || (t.pane === pane && !before)) return;
     let at = before ? pane.tabs.indexOf(before) : pane.tabs.length;
     if (t.pane === pane && pane.tabs.indexOf(t) < at) at--; // moveTab removes the tab first
@@ -545,10 +776,10 @@ export class Workspace {
     let t = this.find(x => x.kind === 'view' && x.path === path && x.mode === mode);
     if (!t) {
       let target = pane || this.paneFor('view');
-      const next = side && target.row.panes[target.row.panes.indexOf(target) + 1];
+      const next = side && this.rightOf(target);
       if (next) target = next; // a pane already to the right: open there
       t = this.addTab(new FileViewTab(this, path, mode, { preview }), { pane: target });
-      if (side && !next && t.pane.tabs.length > 1 && t.pane.row.panes.length < MAX_PANES_PER_ROW) this.splitRight(t);
+      if (side && !next && this.canSplit(t.pane, t)) this.splitRight(t);
     } else if (!preview) { t.pinned = true; t.pane.renderBar(); }
     this.reveal(t);
     await t.ready;
@@ -682,14 +913,16 @@ export class Workspace {
   }
 
   saveLayout() {
-    const rowSpec = row => row.panes.map(p => {
+    const paneSpec = p => {
       const saved = p.tabs.filter(t => t.pinned !== false && t.serialize()); // blank web tabs have nothing to save
-      return { tabs: saved.map(t => t.serialize()), active: Math.max(0, saved.indexOf(p.active)), flex: p.el.style.flex || '' };
-    });
+      return { tabs: saved.map(t => t.serialize()), active: Math.max(0, saved.indexOf(p.active)) };
+    };
+    // `top` stays the flat list of main-area panes that older builds read; `main` adds the tree and its sizes.
     const layout = {
       v: 2,
-      top: rowSpec(this.top),
-      bottom: rowSpec(this.bottom),
+      top: this.top.panes.map(paneSpec),
+      main: this.top.spec(),
+      bottom: this.bottom.panes.map(p => ({ ...paneSpec(p), flex: p.el.style.flex || '' })),
       panelHeight: this.panelHeight,
       panelHidden: this.panelHidden,
       focused: [this.focused && this.focused.row === this.bottom ? 1 : 0, this.focused ? this.focused.row.panes.indexOf(this.focused) : 0],
@@ -706,21 +939,34 @@ export class Workspace {
     if (layout) {
       if (Number.isFinite(layout.panelHeight)) this.panelHeight = Math.max(0.1, Math.min(0.8, layout.panelHeight));
       this.panelHidden = !!layout.panelHidden;
-      const fill = (row, specs) => specs.forEach((ps, i) => {
-        const pane = row === this.top && i === 0 ? this.top.panes[0] : row.addPane();
-        const made = (ps.tabs || []).map(spec => {
+      const fill = (pane, ps, { merge = false } = {}) => {
+        const made = (ps && Array.isArray(ps.tabs) ? ps.tabs : []).map(spec => {
           const t = tabFromSpec(this, spec); // null for a session that is gone
           if (!t) return null;
           if (t.kind === 'session') open.add(t.sessionId);
-          pane.add(t, { activate: false });
+          pane.add(t, { activate: false, index: pane.tabs.length }); // in saved order
           return t;
         });
-        if (ps.flex) pane.el.style.flex = ps.flex;
-        const want = made[ps.active] || pane.tabs[0];
+        if (merge) return;
+        const want = made[ps && ps.active] || pane.tabs[0];
         if (want) pane.activate(want);
-      });
-      fill(this.top, layout.top || []);
-      fill(this.bottom, layout.bottom || []);
+      };
+      const specs = Array.isArray(layout.top) ? layout.top : [];
+      let { tree, used } = cleanTree(layout.main, specs.length);
+      // no usable tree (a layout from before the tree): the panes side by side, as they were
+      if (tree === null) ({ tree, used } = cleanTree({ split: 'row', sizes: specs.map(ps => parseFloat(ps && ps.flex)), children: specs.map((_, i) => i) }, specs.length));
+      if (tree !== null) {
+        const made = this.top.build(tree);
+        specs.forEach((ps, i) => { if (made.has(i)) fill(made.get(i), ps); });
+        // panes the tree could not place keep their tabs in the last pane placed
+        const last = made.get(used[used.length - 1]);
+        specs.forEach((ps, i) => { if (!made.has(i)) fill(last, ps, { merge: true }); });
+      }
+      for (const ps of Array.isArray(layout.bottom) ? layout.bottom : []) {
+        const pane = this.bottom.addPane();
+        fill(pane, ps);
+        if (ps && ps.flex) pane.el.style.flex = ps.flex;
+      }
       for (const p of [...this.panes]) this.cleanupPane(p);
       if (layout.expanded) this.files.restoreExpanded(layout.expanded);
       const [r, i] = layout.focused || [0, 0];

@@ -1,5 +1,5 @@
-// Claude usage in the status bar (5-hour / weekly, time to reset) and the
-// account panel: switch login/org, sign in or out, add accounts.
+// Claude usage in the status bar (5-hour / weekly, time to reset) and the account panel:
+// saved logins, switching the shared login, adding one, refreshing usage.
 import { h, icon, clear } from './util.js';
 import { call, on } from './rpc.js';
 import { store, notify } from './store.js';
@@ -10,14 +10,21 @@ on('usage', u => {
   notify();
 });
 
-export function activeAccount() {
-  return store.accounts.find(a => a.id === store.activeAccount) || store.accounts[0];
+export function inUseAccount() {
+  return store.accounts.find(a => a.inUse);
 }
 
-export function accountName(id) {
-  const a = store.accounts.find(x => x.id === (id || 'default'));
-  return a ? a.name : 'Default';
+/** Usage of the login in use: under its account, or "current" when it isn't saved. */
+function currentUsage() {
+  const a = inUseAccount();
+  return (store.usage || {})[a ? a.id : 'current'];
 }
+
+function whoText(x) {
+  return [x.email, x.org, x.plan].filter(Boolean).join(' · ');
+}
+
+const timeText = ts => new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 
 /** "2h 14m", "3d 4h", "12m" */
 export function untilText(ts) {
@@ -56,21 +63,22 @@ function meter(label, w) {
 
 /** The status bar item. */
 export function usageItem() {
-  const a = activeAccount();
-  const u = (store.usage || {})[a ? a.id : 'default'];
+  const a = inUseAccount();
+  const cur = store.currentLogin;
+  const u = currentUsage();
   const five = live(u && u.fiveHour);
   const week = live(u && u.weekly);
-  const multi = store.accounts.length > 1;
+  const label = a ? a.name : cur ? cur.email : '';
   const tip = [
-    `Claude account: ${a ? a.name : 'Default'}`,
+    `Claude login: ${a ? a.name : cur ? whoText(cur) || 'signed in' : 'not signed in'}`,
     five ? `5-hour: ${Math.round(five.used)}% used, ${resetText(five.resetsAt)}` : '5-hour: not reported yet',
     week ? `Weekly: ${Math.round(week.used)}% used, ${resetText(week.resetsAt)}` : 'Weekly: not reported yet',
-    u ? `Updated ${new Date(u.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })} (Claude reports usage while a session is working)` : 'Usage appears once a Claude session talks to Claude (Pro/Max logins).',
-    'Click to switch account or sign in',
+    u ? `Updated ${timeText(u.at)} (Claude reports usage while a session is working)` : 'Usage appears once a Claude session talks to Claude (Pro/Max logins).',
+    'Click to switch account or refresh usage',
   ].join('\n');
   return h('span.sb-item.click.usage', { title: tip, onclick: () => accountsDialog() },
     icon('claude', 'st-claude'),
-    multi ? h('span.usage-acct', a ? a.name : 'Default') : null,
+    store.accounts.length && label ? h('span.usage-acct', label) : null,
     meter('5h', five),
     five && five.resetsAt ? h('span.usage-reset', `↻ ${untilText(five.resetsAt)}`) : null,
     meter('wk', week),
@@ -79,10 +87,12 @@ export function usageItem() {
 
 /** The account panel. */
 export async function accountsDialog() {
+  const current = h('div.accounts-current');
   const body = h('div.accounts-list');
   const m = modal([
     h('div.modal-title', 'Claude accounts'),
-    h('div.modal-detail.muted', 'New sessions use the selected account. Running sessions keep the account they started with. Each account is its own Claude login (CLAUDE_CONFIG_DIR).'),
+    h('div.modal-detail.muted', 'Every Claude session uses the login in use. Pick a saved login to switch all of them, like /login does.'),
+    current,
     body,
     h('div.modal-buttons',
       h('button.btn', { onclick: addAccount }, icon('plus'), 'Add account…'),
@@ -90,61 +100,68 @@ export async function accountsDialog() {
   ]);
   m.box.classList.add('accounts-modal');
 
-  let status = {};
+  const loading = new Set();
   const render = () => {
-    clear(body, store.accounts.map(a => {
-      const st = status[a.id];
+    const cur = store.currentLogin;
+    clear(current,
+      h('span.accounts-current-text', cur ? `Signed in now: ${whoText(cur) || 'unknown login'}` : 'Not signed in to Claude'),
+      cur && cur.expired ? h('span.account-warn', 'expired') : null,
+      cur && !cur.saved ? h('button.btn.small', { onclick: saveCurrent }, 'Save as account…') : null);
+    clear(body, store.accounts.length ? store.accounts.map(a => {
       const u = (store.usage || {})[a.id];
       const five = live(u && u.fiveHour);
       const week = live(u && u.weekly);
-      const active = a.id === store.activeAccount;
-      const who = !st ? 'Checking…' : st.unknown ? 'Couldn’t check sign-in' : st.loggedIn ? [st.email, st.org, st.plan].filter(Boolean).join(' · ') || `Signed in (${st.method})` : 'Not signed in';
-      return h(`div.account${active ? '.active' : ''}`, { onclick: e => { if (!e.target.closest('button')) setActive(a); } },
-        h('span.account-radio', active ? icon('check') : null),
+      return h(`div.account${a.inUse ? '.active' : ''}`, { dataset: { id: a.id } },
         h('div.account-main',
-          h('div.account-name', a.name, active ? h('span.account-tag', 'active') : null),
-          h(`div.account-who${st && st.loggedIn === false && !st.unknown ? '.warn' : ''}`, who),
+          h('div.account-name', a.name, a.inUse ? h('span.account-tag', 'in use') : null),
+          h('div.account-who', whoText(a) || 'Saved login'),
           h('div.account-usage', meter('5h', five), five ? h('span.muted', ` ${resetText(five.resetsAt)}`) : null),
           h('div.account-usage', meter('wk', week), week ? h('span.muted', ` ${resetText(week.resetsAt)}`) : null),
-          h('div.account-dir', a.dir)),
+          u ? h('div.account-updated', `Updated ${timeText(u.at)}`) : null),
         h('div.account-actions',
-          h('button.btn.small', { onclick: () => login(a), title: 'Opens a sign-in tab for this account (also how you switch org)' }, st && st.loggedIn ? 'Switch login…' : 'Sign in…'),
-          st && st.loggedIn ? h('button.btn.small', { onclick: () => logout(a) }, 'Sign out') : null,
+          a.inUse ? null : h('button.btn.small', { onclick: () => use(a) }, 'Use'),
+          h('button.icon-btn.account-refresh', { title: 'Refresh usage', disabled: loading.has(a.id), onclick: () => refresh(a) }, icon('refresh')),
           h('button.icon-btn', { title: 'Rename', onclick: () => rename(a) }, icon('edit')),
-          a.id !== 'default' ? h('button.icon-btn', { title: 'Remove from SkiffCode', onclick: () => remove(a) }, icon('trash')) : null));
-    }));
+          h('button.icon-btn', { title: 'Forget this saved login', onclick: () => remove(a) }, icon('trash'))));
+    }) : h('div.muted.accounts-empty', 'No saved logins yet. Add one to switch between logins and orgs.'));
   };
   render();
-  const refreshStatus = async fresh => {
-    try {
-      for (const s of await call('accounts.status', { fresh })) status[s.id] = s;
-    } catch { /* keep */ }
-    render();
-  };
-  void refreshStatus(true);
 
-  async function setActive(a) {
-    if (a.id === store.activeAccount) return;
-    store.activeAccount = a.id;
-    render();
-    notify();
-    await call('accounts.setActive', { id: a.id });
-    toast(`New Claude sessions will use “${a.name}”.`, { icon: 'claude', timeout: 3000 });
-  }
-  async function login(a) {
-    if (!store.active) return toast('Open a worktree first — the sign-in runs in a tab there.', { kind: 'warn' });
-    const s = await call('accounts.login', { id: a.id, worktreePath: store.active });
-    m.close();
-    const ws = window.skiffcode.workspaces.get(store.active);
-    for (let i = 0; i < 40 && !store.sessions.some(x => x.id === s.id); i++) await new Promise(r => setTimeout(r, 50));
-    if (ws) ws.openSession(s.id);
-    toast(`Finish signing in to “${a.name}” in the “${s.name}” tab. If the browser shows a code, paste it there.`, { icon: 'link', timeout: 15000 });
-  }
-  async function logout(a) {
-    const v = await confirmDialog({ title: `Sign out of “${a.name}”?`, detail: 'Claude sessions using this account will need to sign in again.', buttons: [{ label: 'Sign out', value: 'yes', danger: true }] });
+  async function use(a) {
+    const v = await confirmDialog({
+      title: `Switch every Claude session to “${a.name}”?`,
+      detail: 'Running sessions use it from their next request; new sessions start with it.',
+      buttons: [{ label: 'Switch', value: 'yes', primary: true }],
+    });
     if (v !== 'yes') return;
-    await call('accounts.logout', { id: a.id });
-    await refreshStatus(true);
+    try {
+      await call('accounts.use', { id: a.id });
+      toast(`Claude sessions now use “${a.name}”.`, { icon: 'claude', timeout: 4000 });
+    } catch (e) {
+      toast(e.message, { kind: 'error' });
+    }
+  }
+  async function refresh(a) {
+    loading.add(a.id);
+    render();
+    try {
+      await call('accounts.refreshUsage', { id: a.id });
+    } catch (e) {
+      toast(e.message, { kind: 'error' });
+    } finally {
+      loading.delete(a.id);
+      render();
+    }
+  }
+  async function saveCurrent() {
+    const cur = store.currentLogin || {};
+    const name = await promptDialog({ title: 'Save this login as an account', value: cur.org || cur.email || '', okLabel: 'Save' });
+    if (!name) return;
+    try {
+      await call('accounts.saveCurrent', { name });
+    } catch (e) {
+      toast(e.message, { kind: 'error' });
+    }
   }
   async function rename(a) {
     const name = await promptDialog({ title: 'Rename account', value: a.name, okLabel: 'Rename' });
@@ -154,7 +171,7 @@ export async function accountsDialog() {
     render();
   }
   async function remove(a) {
-    const v = await confirmDialog({ title: `Remove “${a.name}” from SkiffCode?`, detail: 'It is signed out on this machine. Its conversations and settings are kept.', buttons: [{ label: 'Remove', value: 'yes', danger: true }] });
+    const v = await confirmDialog({ title: 'Forget this saved login?', detail: 'You stay signed in to the login in use now.', buttons: [{ label: 'Forget', value: 'yes', danger: true }] });
     if (v !== 'yes') return;
     try {
       await call('accounts.remove', { id: a.id });
@@ -163,19 +180,22 @@ export async function accountsDialog() {
     }
   }
   async function addAccount() {
-    const name = await promptDialog({ title: 'Add a Claude account', placeholder: 'Work, Client X, Personal…', okLabel: 'Add', detail: 'Your settings, CLAUDE.md, agents, commands and skills are shared from your main ~/.claude. Then sign in to it.' });
+    if (!store.active) return toast('Open a worktree first — the sign-in runs in a tab there.', { kind: 'warn' });
+    const name = await promptDialog({ title: 'Add a Claude account', placeholder: 'Work, Client X, Personal…', okLabel: 'Sign in', detail: 'A tab runs claude auth login in a private folder. The login in use now doesn’t change until you pick the new account.' });
     if (!name) return;
     try {
-      const a = await call('accounts.add', { name, share: true });
-      for (let i = 0; i < 20 && !store.accounts.some(x => x.id === a.id); i++) await new Promise(r => setTimeout(r, 50));
-      status[a.id] = { loggedIn: false };
-      render();
-      await login(a);
+      const s = await call('accounts.add', { name, worktreePath: store.active });
+      m.close();
+      const ws = window.skiffcode.workspaces.get(store.active);
+      for (let i = 0; i < 40 && !store.sessions.some(x => x.id === s.id); i++) await new Promise(r => setTimeout(r, 50));
+      if (ws) ws.openSession(s.id);
+      toast(`Finish signing in in the “${s.name}” tab. SkiffCode saves the login when it’s done.`, { icon: 'link', timeout: 15000 });
     } catch (e) {
       toast(e.message, { kind: 'error' });
     }
   }
-  const off = on('state', () => setTimeout(render, 0));
-  const obs = new MutationObserver(() => { if (!m.box.isConnected) { off(); obs.disconnect(); } });
+  const offState = on('state', () => setTimeout(render, 0));
+  const offUsage = on('usage', () => setTimeout(render, 0));
+  const obs = new MutationObserver(() => { if (!m.box.isConnected) { offState(); offUsage(); obs.disconnect(); } });
   obs.observe(document.getElementById('overlay'), { childList: true });
 }

@@ -88,7 +88,7 @@ class Sessions extends EventEmitter {
 
   // ---------------------------------------------------------------- actions
 
-  async create({ kind = 'claude', repoPath, worktreePath, branch, name, cols, rows, account, command, resumeClaudeId, prompt }) {
+  async create({ kind = 'claude', repoPath, worktreePath, branch, name, cols, rows, command, resumeClaudeId, prompt }) {
     if (!fs.existsSync(worktreePath)) throw new Error(`Folder not found: ${worktreePath}`);
     const siblings = this.state.sessionsIn(worktreePath).filter(s => s.kind === kind).length;
     const base = kind === 'shell' ? 'shell' : branch || path.basename(worktreePath);
@@ -102,7 +102,6 @@ class Sessions extends EventEmitter {
       branch,
       createdAt: Date.now(),
       prompted: !!resumeClaudeId, // an existing conversation: start with --resume
-      account: account || this.accounts.activeId(),
       command: command || undefined, // shells only: run this first (e.g. `claude auth login`)
       initialPrompt: kind === 'claude' && !resumeClaudeId && prompt && String(prompt).trim() ? String(prompt) : undefined, // sent once, on first start
     };
@@ -223,16 +222,14 @@ class Sessions extends EventEmitter {
     const command = s.kind === 'claude'
       ? [shell, '-lic', `exec ${this.claudeCommand(s)}`]
       : s.command ? [shell, '-lic', `${s.command}; exec ${shq(shell)} -l`] : [shell, '-l'];
-    const account = s.account || 'default';
+    // Every session runs on the shared Claude config folder: CLAUDE_CONFIG_DIR only as the server has it.
     const env = {
       ...process.env,
-      ...this.accounts.env(account),
-      SKIFFCODE_SESSION_ID: s.id, SKIFFCODE_STATUS_DIR: this.statusDir, SKIFFCODE_ACCOUNT: account,
+      SKIFFCODE_SESSION_ID: s.id, SKIFFCODE_STATUS_DIR: this.statusDir,
       TERM: 'xterm-256color', SKIFFCODE_PTY_LOG: this.logFile(s.id),
     };
-    if (account === 'default' && !process.env.CLAUDE_CONFIG_DIR) delete env.CLAUDE_CONFIG_DIR;
     // Keep your own status line: SkiffCode's wrapper records usage, then runs yours.
-    const own = s.kind === 'claude' ? userStatusLine(this.accounts.configDir(account), this.accounts.defaultConfigDir()) : undefined;
+    const own = s.kind === 'claude' ? userStatusLine(null, this.accounts.defaultConfigDir()) : undefined;
     if (own) env.SKIFFCODE_USER_STATUSLINE = own.command;
     else delete env.SKIFFCODE_USER_STATUSLINE;
     if (preload && fs.existsSync(this.logFile(s.id))) env.SKIFFCODE_PTY_PRELOAD = this.logFile(s.id);
@@ -426,7 +423,7 @@ class Sessions extends EventEmitter {
       l.claudeName = cname;
     }
     // Usage from an old snapshot would be stamped as fresh: only live reports count.
-    if (!initial && this.accounts.recordUsage(s.account || 'default', j.rate_limits)) this.emit('usage');
+    if (!initial && this.accounts.recordUsage(j.rate_limits)) this.emit('usage');
     if (JSON.stringify(prev) !== JSON.stringify(info)) this.emit('change');
   }
 

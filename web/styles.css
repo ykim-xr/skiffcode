@@ -149,10 +149,14 @@ select.input { padding: 2px 6px; }
 .drop-zone { position: absolute; z-index: 20; pointer-events: none; background: #0078d433; border: 1px solid var(--focus); transition: all .08s; }
 .drop-zone.zone-center { inset: 0; }
 .drop-zone.zone-right { top: 0; bottom: 0; right: 0; width: 50%; }
-.drop-zone.zone-down { left: 0; right: 0; bottom: 0; height: 40%; }
+.drop-zone.zone-left { top: 0; bottom: 0; left: 0; width: 50%; }
+.drop-zone.zone-down { left: 0; right: 0; bottom: 0; height: 50%; }
 .drop-zone.zone-up { left: 0; right: 0; top: 0; height: 50%; }
-.pane { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--border); }
-.pane:first-child { border-left: 0; }
+.split { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; }
+.split-column { flex-direction: column; }
+.pane { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.row-bottom > .sash + .pane, .split-row > .sash + * { border-left: 1px solid var(--border); }
+.split-column > .sash + * { border-top: 1px solid var(--border); }
 .pane-body { flex: 1; min-height: 0; position: relative; }
 .tab-body { position: absolute; inset: 0; display: flex; flex-direction: column; }
 .editor-host { flex: 1; min-height: 0; }
@@ -396,19 +400,18 @@ body.attention #statusbar { background: #5a3e0a; color: #fff; }
 .usage-reset { font: 11px var(--mono); color: var(--fg-dim); }
 .accounts-modal { width: 600px; }
 .accounts-list { display: flex; flex-direction: column; gap: 6px; }
-.account { display: flex; gap: 10px; padding: 10px; border: 1px solid var(--border-strong); border-radius: 6px; cursor: pointer; align-items: flex-start; }
-.account:hover { background: var(--bg-hover); }
+.accounts-current { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 12px; color: var(--fg-muted); }
+.accounts-current-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.accounts-empty { padding: 10px 0; }
+.account { display: flex; gap: 10px; padding: 10px; border: 1px solid var(--border-strong); border-radius: 6px; align-items: flex-start; }
 .account.active { border-color: var(--focus); background: #0078d414; }
-.account-radio { width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border-strong); display: flex; align-items: center; justify-content: center; flex: none; margin-top: 1px; }
-.account.active .account-radio { border-color: var(--focus); background: var(--focus); color: #fff; }
-.account-radio .icon { width: 12px; height: 12px; }
 .account-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .account-name { font-weight: 600; color: var(--fg-strong); display: flex; align-items: center; gap: 6px; }
 .account-tag { font: 600 10px var(--font); text-transform: uppercase; letter-spacing: .05em; color: var(--focus); }
 .account-who { font-size: 12px; color: var(--fg-muted); }
-.account-who.warn { color: var(--question); }
+.account-warn { font: 600 10px var(--font); text-transform: uppercase; letter-spacing: .05em; color: var(--question); }
 .account-usage { font-size: 11px; display: flex; gap: 4px; align-items: center; }
-.account-dir { font: 11px var(--mono); color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-updated { font-size: 11px; color: var(--fg-dim); }
 .account-actions { display: flex; gap: 4px; align-items: center; flex: none; }
 
 /* Active panel (needs you + working) */

@@ -1,5 +1,6 @@
 'use strict';
 const { execFile } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -41,15 +42,48 @@ function skiffcodeHome() {
 
 /** Write a private (0600) file in one step: synced to disk before it replaces the old one. */
 function writeFileAtomic(file, content) {
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  const fd = fs.openSync(tmp, 'w', 0o600);
+  // 'wx': never reuse a file someone left there (it would keep its own mode); a failed write leaves no copy
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  const fd = fs.openSync(tmp, 'wx', 0o600);
   try {
-    fs.writeFileSync(fd, content);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
+    try {
+      fs.writeFileSync(fd, content);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* gone */ }
+    throw e;
   }
-  fs.renameSync(tmp, file);
+}
+
+/**
+ * Replace a file someone else owns (Claude's) in one step. A symlink stays a symlink: its target is
+ * replaced. The file keeps its mode unless `mode` is given. Contents are never logged.
+ */
+function writeFileReplacing(file, content, mode) {
+  let real = file;
+  try { real = fs.realpathSync(file); } catch { /* a new file */ }
+  if (mode === undefined) {
+    try { mode = fs.statSync(real).mode & 0o777; } catch { mode = 0o600; }
+  }
+  const tmp = path.join(path.dirname(real), `.${path.basename(real)}.skiffcode-${process.pid}-${crypto.randomBytes(4).toString('hex')}.tmp`);
+  try {
+    const fd = fs.openSync(tmp, 'wx', 0o600);
+    try {
+      fs.writeFileSync(fd, content);
+      fs.fchmodSync(fd, mode);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, real);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* not made */ }
+    throw e;
+  }
 }
 
 /** A folder only you can open (made 0700, and an existing one tightened). */
@@ -128,4 +162,4 @@ async function pool(items, limit, fn) {
   return out;
 }
 
-module.exports = { run, shq, skiffcodeHome, writeFileAtomic, privateDir, which, userShell, realpath, isGitDir, TERM_SIZE, within, safeToDelete, pool };
+module.exports = { run, shq, skiffcodeHome, writeFileAtomic, writeFileReplacing, privateDir, which, userShell, realpath, isGitDir, TERM_SIZE, within, safeToDelete, pool };
