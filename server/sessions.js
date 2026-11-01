@@ -639,6 +639,17 @@ const AGENT_TOOLS = new Set(['Agent', 'Task']);
 function applyAgentEvent(list, ev, at) {
   const e = ev.hook_event_name;
   const done = (x, how = 'done') => { x.state = how; x.endedAt = at; return true; };
+  // Claude lists the subagents still running in the background: any other background one has ended,
+  // also one stopped without a SubagentStop.
+  let swept = false;
+  if (Array.isArray(ev.background_tasks)) {
+    const live = new Set(ev.background_tasks.filter(t => t && t.type === 'subagent').map(t => t.id));
+    for (const x of list) if (x.state === 'running' && x.background && x.agentId && !live.has(x.agentId)) swept = done(x) || swept;
+  }
+  return applyOne(list, ev, at, e, done) || swept;
+}
+
+function applyOne(list, ev, at, e, done) {
   if (e === 'PreToolUse' && AGENT_TOOLS.has(ev.tool_name)) {
     if (ev.tool_use_id && list.some(x => x.toolUseId === ev.tool_use_id)) return false;
     const ti = ev.tool_input || {};
@@ -647,7 +658,8 @@ function applyAgentEvent(list, ev, at) {
   }
   if (e === 'SubagentStart') {
     if (list.some(x => x.agentId === ev.agent_id)) return false;
-    const open = list.filter(x => !x.agentId && x.state === 'running');
+    // The newest unpaired call: it was just made (older unpaired ones may be stale).
+    const open = list.filter(x => !x.agentId && x.state === 'running').reverse();
     const m = open.find(x => x.type === ev.agent_type) || open[0];
     if (m) m.agentId = ev.agent_id;
     else list.push({ key: ev.agent_id || `a${at}-${list.length}`, agentId: ev.agent_id, type: ev.agent_type || 'agent', description: '', state: 'running', startedAt: at });
@@ -663,7 +675,17 @@ function applyAgentEvent(list, ev, at) {
     const m = list.find(x => x.toolUseId && x.toolUseId === ev.tool_use_id);
     if (!m || m.state !== 'running') return false;
     const r = ev.tool_response;
-    if (r && (r.isAsync || r.status === 'async_launched')) return m.background ? false : (m.background = true);
+    if (r && (r.isAsync || r.status === 'async_launched')) {
+      // The result names the agent: trust it over the SubagentStart pairing, which guesses when several start together.
+      const id = typeof r.agentId === 'string' ? r.agentId : undefined;
+      const changed = !m.background || (id && m.agentId !== id);
+      if (id && m.agentId !== id) {
+        for (const x of list) if (x !== m && x.agentId === id) x.agentId = undefined;
+        m.agentId = id;
+      }
+      m.background = true;
+      return !!changed;
+    }
     return m.background ? false : done(m);
   }
   return false;
@@ -677,4 +699,4 @@ function alertKind(from, to) {
   return undefined;
 }
 
-module.exports = { Sessions, alertKind, needsYou };
+module.exports = { Sessions, alertKind, needsYou, applyAgentEvent };

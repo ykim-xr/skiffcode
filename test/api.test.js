@@ -708,6 +708,20 @@ function startServer() {
     await c.call('sessions.forget', { id: s.id });
   });
 
+  await step('subagents: the agent a tool result names is the one that stops; Claude\'s list of running ones ends the rest', async () => {
+    const { applyAgentEvent } = require(path.join(APP, 'server', 'sessions.js'));
+    const run = events => { const list = []; events.forEach((ev, i) => applyAgentEvent(list, ev, i)); return Object.fromEntries(list.map(x => [x.toolUseId, x.state])); };
+    const pre = (id, desc) => ({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_use_id: id, tool_input: { subagent_type: 'general-purpose', description: desc } });
+    const launched = (id, agentId) => ({ hook_event_name: 'PostToolUse', tool_name: 'Agent', tool_use_id: id, tool_response: { isAsync: true, status: 'async_launched', agentId } });
+    const cases = [
+      // an older call that never started must not take the new agent's start and stop
+      ['paired by the tool result', [pre('old', 'stale'), pre('new', 'critic'), { hook_event_name: 'SubagentStart', agent_id: 'ag1', agent_type: 'general-purpose' }, launched('new', 'ag1'), { hook_event_name: 'SubagentStop', agent_id: 'ag1' }], { old: 'running', new: 'done' }],
+      // stopped without its own SubagentStop: another agent's stop lists what still runs
+      ['ended by the running list', [pre('a', 'one'), launched('a', 'agA'), pre('b', 'two'), launched('b', 'agB'), { hook_event_name: 'SubagentStop', agent_id: 'agX', background_tasks: [{ id: 'agB', type: 'subagent', status: 'running' }, { id: 'sh1', type: 'shell', status: 'running' }] }], { a: 'done', b: 'running' }],
+    ];
+    for (const [name, events, want] of cases) assert.deepEqual(run(events), want, name);
+  });
+
   await step('subagents: listed per session with type + description; finished / stopped tracked; memory readout', async () => {
     plan('SessionStart,UserPromptSubmit,Agent:Explore:Find auth code,AgentBg:general-purpose:Run the tests,AgentAsync:security-reviewer:Review auth,sleep:800,AgentDone:1,Stop,hang');
     const s3 = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, cols: 80, rows: 24 });
