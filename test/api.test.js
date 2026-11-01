@@ -1370,9 +1370,10 @@ function startServer() {
       await sleep(200);
       assert.deepEqual([victim.exitCode, victim.signalCode], [null, null], 'a stale server.pid names another program: left alone');
       fs.writeFileSync(path.join(h3, 'server.log'), 'old run\n');
+      fs.writeFileSync(path.join(h3, 'token'), 'old-token\n'); // the real case after a reboot: the probe runs before the start
       const startedAt = Date.now();
       cli3('url');
-      assert.ok(Date.now() - startedAt < 15000, 'a closed port that stays silent (WSL mirrored networking) does not stall the start');
+      assert.ok(Date.now() - startedAt < 8000, 'a closed port that stays silent (WSL mirrored networking) does not stall the start');
       assert.equal(fs.readFileSync(path.join(h3, 'server.log.1'), 'utf8'), 'old run\n', 'the previous log is kept');
       assert.equal(fs.statSync(path.join(h3, 'server.log')).mode & 0o777, 0o600);
       const pid3 = Number(fs.readFileSync(path.join(h3, 'server.pid'), 'utf8'));

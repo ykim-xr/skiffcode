@@ -53,7 +53,8 @@ status_json() {
   # The token goes in the environment: other users can read a command line (ps), not an environment.
   SKIFFCODE_TOKEN="$t" node -e '
     fetch(`http://127.0.0.1:${process.argv[1]}/api/status`, { headers: { "x-skiffcode-token": process.env.SKIFFCODE_TOKEN }, signal: AbortSignal.timeout(2000) })
-      .then(r => (r.ok ? r.text() : "")).then(t => process.stdout.write(t)).catch(() => {});
+      .then(r => (r.ok ? r.text() : "")).then(t => process.stdout.write(t)).catch(() => {})
+      .finally(() => process.exit()); // an aborted fetch can keep node alive for 10s on a port that stays silent
   ' "$PORT"
 }
 # Time-limited: under WSL mirrored networking a closed loopback port can stay silent, and a plain connect then waits about 2 minutes.
@@ -62,6 +63,7 @@ port_owner() { command -v ss >/dev/null && ss -ltnpH "sport = :$PORT" 2>/dev/nul
 running() { [[ -n "$(status_json 2>/dev/null || true)" ]]; }
 
 start() {
+  [[ -t 2 ]] && echo "Opening SkiffCode …" >&2
   running && return 0
   if port_busy; then
     die "port $PORT is already used by another program ($(port_owner || echo unknown)).
