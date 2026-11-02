@@ -2385,6 +2385,30 @@ const G = {};
     assert.deepEqual(out, [[], [], [], ['changes']]);
   });
 
+  await step('terminals: a terminal shown again corrects its scrollbar, so the wheel reaches the bottom', async () => {
+    const W = '.workspace:not(.hidden)';
+    await freshMain();
+    await page.click(`${W} .empty-actions .btn >> text=New shell`);
+    await page.waitForFunction(() => window.skiffcode.active.activeTab?.term);
+    await page.evaluate(async () => {
+      const ws = window.skiffcode.active;
+      const first = window.__firstTerm = ws.activeTab;
+      await ws.app.actions.newSession(ws.root, 'shell', { pane: first.pane });
+    });
+    await page.waitForFunction(() => window.skiffcode.active.activeTab !== window.__firstTerm);
+    const syncs = await page.evaluate(async () => {
+      const first = window.__firstTerm, v = first.term._core.viewport, sync = v.syncScrollArea;
+      let n = 0;
+      v.syncScrollArea = function (...a) { n++; return sync.apply(this, a); };
+      first.pane.activate(first);
+      await new Promise(r => setTimeout(r, 300));
+      v.syncScrollArea = sync;
+      return n;
+    });
+    assert.ok(syncs > 0, 'scrollbar recalculated when the tab comes back');
+    await page.evaluate(() => { const ws = window.skiffcode.active; return Promise.all(ws.allTabs().filter(t => t.sessionId).map(t => import('/js/rpc.js').then(r => r.call('sessions.forget', { id: t.sessionId })))); });
+  });
+
   await step('terminals: saved output is shown without answering its old cursor queries again', async () => {
     const W = '.workspace:not(.hidden)';
     await freshMain();

@@ -569,6 +569,8 @@ export class TerminalTab extends Tab {
     try {
       this.fit.fit();
     } catch { return; }
+    // Output written while hidden leaves xterm's scrollbar a screen too short, so the wheel stops above the bottom. No public API redoes it.
+    this.term._core?.viewport?.syncScrollArea?.(true);
     const { cols, rows } = this.term;
     if (this.attached && (cols !== this.lastCols || rows !== this.lastRows)) {
       this.lastCols = cols;

@@ -1,5 +1,6 @@
 // Test stand-in for xterm.js: keeps the decoded output in a <pre>.
 window.Terminal = class {
+  _core = { viewport: { syncScrollArea() {} } };
   constructor(o) { this.o = o; this.options = { ...o }; this.cols = 100; this.rows = 30; this.modes = { bracketedPasteMode: false }; this.text = ''; this.dec = new TextDecoder(); }
   loadAddon(a) { a.activate && a.activate(this); }
   open(el) { this.pre = document.createElement('pre'); this.pre.className = 'stub-term'; this.pre.style.cssText = 'margin:0;color:#ccc;white-space:pre-wrap;height:100%;overflow:auto'; this.pre.tabIndex = 0; el.append(this.pre);
