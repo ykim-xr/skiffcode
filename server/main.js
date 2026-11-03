@@ -1254,21 +1254,27 @@ const cli = {
 const INBOX = path.join(HOME, 'inbox');
 fs.mkdirSync(INBOX, { recursive: true, mode: 0o700 });
 let draining = false;
+let drainAgain = false;
 async function drainInbox() {
-  if (draining) return;
+  if (draining) { drainAgain = true; return; }
   draining = true;
   try {
-    for (const f of fs.readdirSync(INBOX).filter(f => f.endsWith('.path')).sort()) {
-      const full = path.join(INBOX, f);
-      const dir = fs.readFileSync(full, 'utf8').trim();
-      fs.rmSync(full, { force: true });
-      try {
-        const repo = await addRepo(dir);
-        broadcast('open.worktree', { path: realpath(dir), repo: repo.path });
-      } catch (e) {
-        broadcast('toast', { kind: 'error', text: e.message });
+    do {
+      drainAgain = false;
+      for (const f of fs.readdirSync(INBOX).filter(f => f.endsWith('.path')).sort()) {
+        const full = path.join(INBOX, f);
+        const text = fs.readFileSync(full, 'utf8');
+        if (!text.endsWith('\n')) continue; // still being written: the write's own event brings us back
+        fs.rmSync(full, { force: true });
+        const dir = text.trim();
+        try {
+          const repo = await addRepo(dir);
+          broadcast('open.worktree', { path: realpath(dir), repo: repo.path });
+        } catch (e) {
+          broadcast('toast', { kind: 'error', text: e.message });
+        }
       }
-    }
+    } while (drainAgain);
   } catch { /* ignore */ } finally {
     draining = false;
   }

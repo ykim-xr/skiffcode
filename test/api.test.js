@@ -705,7 +705,8 @@ function startServer() {
     const hookout = () => (fs.existsSync(process.env.FAKE_LOG + '.hookout') ? fs.readFileSync(process.env.FAKE_LOG + '.hookout', 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : []);
     plan('SessionStart,Status:10:20:first,sleep:1500,UserPromptSubmit,Status:10:20:renamed here,sleep:800,Status:10:20:named in Claude,hang');
     const s7 = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, name: 'first', cols: 80, rows: 24 });
-    await sleep(500);
+    // past SessionStart, which would take a waiting title itself
+    await until(async () => (await c.call('hello')).sessions.find(x => x.id === s7.id).state === 'idle', 'Claude started');
     // something was typed since Claude went idle: the name waits for the next prompt
     await c.call('term.open', { id: s7.id, cols: 80, rows: 24 });
     c.input(s7.id, 'x');
@@ -751,11 +752,11 @@ function startServer() {
     plan('SessionStart,UserPromptSubmit,Agent:Explore:Find auth code,AgentBg:general-purpose:Run the tests,AgentAsync:security-reviewer:Review auth,sleep:800,AgentDone:1,Stop,hang');
     const s3 = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, cols: 80, rows: 24 });
     const agentsOf = async () => ((await c.call('hello')).sessions.find(x => x.id === s3.id) || {}).agents || [];
-    const all = await until(async () => { const a = await agentsOf(); return a.length === 3 && a.every(x => x.state === 'running') && a; }, 'three running subagents');
+    const all = await until(async () => { const a = await agentsOf(); return a.length === 3 && a.every(x => x.state === 'running') && a[2].background && a; }, 'three running subagents, the last moved to the background');
     assert.deepEqual(all.map(a => [a.type, a.description, !!a.background]), [['Explore', 'Find auth code', false], ['general-purpose', 'Run the tests', true], ['security-reviewer', 'Review auth', true]]);
     const after = await until(async () => { const a = await agentsOf(); return a[0] && a[0].state === 'done' && a; }, 'first subagent done');
     assert.deepEqual(after.slice(1).map(a => a.state), ['running', 'running'], 'background subagents (asked for, or moved there by Claude) keep running after Claude stops');
-    assert.ok(after[0].endedAt >= after[0].startedAt);
+    assert.ok(after[0].endedAt >= after[0].startedAt, `ended ${after[0].endedAt}, started ${after[0].startedAt}`);
     const mem = await c.call('system.memory');
     assert.ok(mem.server > 10e6 && mem.sessions[s3.id] > 1e6, 'memory of the server and the session');
     await c.call('sessions.stop', { id: s3.id });
@@ -1543,12 +1544,15 @@ function startServer() {
     assert.equal((await c.call('repos.add', { path: w })).kind, 'folder');
     await c.call('fs.watch', { root: w, path: '' }); // the git watch fails: not a repository yet
     await sleep(400);
+    c.events.length = 0;
     sh('git init -q -b main', w);
     await until(async () => (await c.call('hello')).repos.find(r => r.path === w).kind === undefined, 'folder became a repo');
-    await sleep(600); // the announcement's own git.changed
+    const changed = () => c.events.some(e => e.event === 'git.changed' && e.data.root === w);
+    await until(changed, "the announcement's own git.changed");
     c.events.length = 0;
-    sh('git add a.txt', w); // only .git/index changes, which only the git watcher sees
-    await until(() => c.events.some(e => e.event === 'git.changed' && e.data.root === w), 'git.changed after git init');
+    // Only .git/HEAD changes, which only the git watcher sees. That watch starts just after the announcement, so repeat.
+    let tries = 0;
+    await until(() => { if (tries++ % 12 === 0) sh(`git symbolic-ref HEAD refs/heads/b${tries}`, w); return changed(); }, 'git.changed after git init');
     await c.call('fs.unwatch', { root: w, path: '' });
     await c.call('repos.remove', { path: w });
   });
@@ -1648,6 +1652,20 @@ function startServer() {
     const r2 = await c.call('worktrees.remove', { repo: base, path: wip.path, deleteBranch: true });
     assert.equal(r2.branch, 'unmerged');
     await c.call('repos.remove', { path: base });
+  });
+
+  await step('`skiffcode <dir>` inbox: a request still being written waits for its whole line', async () => {
+    const r2 = path.join(tmp, 'code', 'inboxslow');
+    fs.mkdirSync(r2);
+    const file = path.join(HOME, 'inbox', `${Date.now()}-slow.path`);
+    c.events.length = 0;
+    fs.writeFileSync(file, '');
+    await sleep(300);
+    assert.ok(fs.existsSync(file), 'an empty request stays until it is written');
+    assert.ok(!c.events.some(e => e.event === 'toast'));
+    fs.appendFileSync(file, r2 + '\n');
+    await until(() => c.last('open.worktree')?.data.path === r2, 'open event');
+    await c.call('repos.remove', { path: r2 });
   });
 
   await step('`skiffcode <dir>` inbox: a folder that is not there says so', async () => {
