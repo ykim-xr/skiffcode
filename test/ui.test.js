@@ -1671,6 +1671,20 @@ const G = {};
   const openAll = (...paths) => page.evaluate(async ps => { const ws = window.skiffcode.active; for (const p of ps) await ws.openFile(p); }, paths);
   const splitTab = (path, side) => page.evaluate(([p, s]) => { const ws = window.skiffcode.active; ws.split(ws.find(t => t.path === p), s); }, [path, side]);
 
+  await step('a text file in a web tab stays readable when the system is in dark mode', async () => {
+    await freshMain();
+    const file = path.join(tmp, 'notes.txt');
+    fs.writeFileSync(file, 'hello\n');
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await page.evaluate(f => window.skiffcode.active.openWeb(f), file);
+    const el = page.locator(`${W} iframe.viewer-frame.page`).last();
+    const frame = await (await el.elementHandle()).contentFrame();
+    await frame.waitForSelector('pre');
+    const text = await frame.evaluate(() => getComputedStyle(document.querySelector('pre')).color);
+    assert.notEqual(text, await el.evaluate(x => getComputedStyle(x).backgroundColor));
+    await page.emulateMedia({ colorScheme: null });
+  });
+
   await step('split tree: Split right, then Split down on the right pane nests the panes', async () => {
     await freshMain();
     await openAll('README.md', 'src/app.py', 'src/site.css');
