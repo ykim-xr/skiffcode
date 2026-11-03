@@ -1038,10 +1038,26 @@ const G = {};
     assert.equal(await page.locator('.active-panel .panel-repo').count(), 0, 'flat list, no repo headings');
     assert.match(await page.textContent('.active-panel .active-row'), /login flow\s*myapp · feat\/login/);
     await page.waitForSelector('.session-row:has-text("login flow") .need-pill >> text=asking');
+    // on hover the badge stays next to the buttons, not in the middle of the row
+    const badgeGap = async (row, badge) => {
+      await page.hover(row);
+      return page.evaluate(([r, b]) => {
+        const el = document.querySelector(r);
+        el.style.width = '600px'; // the bug needs free space in the row
+        const gap = el.querySelector('.row-actions').getBoundingClientRect().left - el.querySelector(b).getBoundingClientRect().right;
+        el.style.width = '';
+        return gap;
+      }, [row, badge]);
+    };
+    const sessionGap = await badgeGap('.session-row:has(.need-pill)', '.need-pill');
+    assert.ok(sessionGap <= 8, `session badge next to its buttons (gap ${sessionGap}px)`);
+    await shot('03c-badge-hover');
     // badges only where the session is hidden: none while everything is expanded
     assert.equal(await page.locator('.repo-row .badge.need, .wt-row .badge.need').count(), 0);
     await page.click('.wt-row:has-text("feat/login") .twisty');
     await page.waitForSelector('.wt-row:has-text("feat/login") .badge.need');
+    const worktreeGap = await badgeGap('.wt-row:has(.badge.need)', '.badge.need');
+    assert.ok(worktreeGap <= 8, `worktree badge next to its buttons (gap ${worktreeGap}px)`);
     await page.click('.wt-row:has-text("feat/login") .twisty');
     // the count opens the subagent list (with its type), and the arrow folds it again
     await page.click('.session-row:has-text("login flow") .agent-count');
