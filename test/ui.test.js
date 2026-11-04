@@ -1442,6 +1442,35 @@ const G = {};
     await page.evaluate(async i => { const ws = window.skiffcode.active; for (const t of ws.allTabs()) if (['view', 'web'].includes(t.kind) || t.sessionId === i) await ws.closeTab(t); }, id);
   });
 
+  await step('Reveal in file manager: the Files menu and the terminal path menu ask the server, with the absolute path', async () => {
+    const W = '.workspace:not(.hidden)';
+    const root = await page.evaluate(() => window.skiffcode.active.root);
+    const revealed = () => page.evaluate(() => window.__held.map(m => m.params));
+    // held back and recorded here (a dropped call is not in __sent): the real server would open a file manager on this desktop.
+    // A held call never answers, and nothing waits for it.
+    await page.evaluate(() => { window.__held = []; window.__drop = m => m.method === 'fs.reveal' && !!window.__held.push(m); });
+    try {
+      await page.click(`${W} .file-row[data-path="README.md"]`, { button: 'right' });
+      await page.click('.menu-item >> text=Reveal in file manager');
+      await page.waitForFunction(() => window.__held.length === 1);
+      assert.deepEqual(await revealed(), [{ cwd: root, path: `${root}/README.md` }]);
+      // a path printed in a terminal: the same item, for a folder and for a file (the menu items, built from a stub link)
+      await page.evaluate(async () => {
+        const { linkMenuItems } = await import('/js/termlinks.js');
+        const ws = window.skiffcode.active;
+        for (const type of ['dir', 'file']) {
+          const item = linkMenuItems({ ws }, { kind: 'path', info: { abs: `/outside/${type}`, type, root: null, rel: null } }).find(i => i && i.label === 'Reveal in file manager');
+          item.action();
+        }
+      });
+      await page.waitForFunction(() => window.__held.length === 3);
+      assert.deepEqual((await revealed()).slice(1), [{ cwd: root, path: '/outside/dir' }, { cwd: root, path: '/outside/file' }]);
+    } finally {
+      await page.evaluate(() => { window.__drop = null; });
+    }
+    assert.equal(await page.evaluate(() => window.__sent.filter(m => m.method === 'fs.reveal').length), 0, 'nothing reached the server');
+  });
+
   await step('jump palette and groups / drag-to-reorder repos', async () => {
     await page.evaluate(p => import('/js/rpc.js').then(r => r.call('repos.add', { path: p })), other);
     await page.waitForSelector('.repo-row >> text=other');
@@ -1450,6 +1479,34 @@ const G = {};
     await page.keyboard.press('Control+Alt+j');
     await page.waitForSelector('.qp-sep >> text=Sessions');
     await page.keyboard.press('Escape');
+  });
+
+  await step('drag sessions to reorder them within a worktree', async () => {
+    plan('SessionStart,hang');
+    const wt = path.join(tmp, 'code', 'myapp.worktrees', 'feat-login');
+    const ids = [];
+    for (const name of ['order-a', 'order-b']) {
+      ids.push(await page.evaluate(([p, n]) => import('/js/rpc.js').then(r => r.call('sessions.create', { kind: 'claude', worktreePath: p, name: n, cols: 80, rows: 24 })).then(x => x.id), [wt, name]));
+      await page.waitForSelector(`.session-row >> text=${name}`);
+    }
+    const order = () => page.evaluate(() => [...document.querySelectorAll('.tree .session-row .row-label')].map(e => e.textContent).filter(t => t.startsWith('order-')));
+    assert.deepEqual(await order(), ['order-a', 'order-b']);
+    const from = await page.locator('.tree .session-row:has-text("order-b")').boundingBox();
+    const to = await page.locator('.tree .session-row:has-text("order-a")').boundingBox();
+    await page.mouse.move(from.x + 40, from.y + from.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(to.x + 40, to.y + 3, { steps: 6 });
+    await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.setUnread', { id: i, unread: true })), ids[0]); // a state change in mid-drag
+    await sleep(200);
+    await page.mouse.up();
+    await page.waitForFunction(() => [...document.querySelectorAll('.tree .session-row .row-label')].map(e => e.textContent).filter(t => t.startsWith('order-'))[0] === 'order-b');
+    assert.deepEqual(await order(), ['order-b', 'order-a']);
+    await page.reload();
+    await page.waitForSelector('.wt-row.active >> text=feat/login', { timeout: 15000 });
+    await page.waitForSelector('.tree .session-row >> text=order-a');
+    assert.deepEqual(await order(), ['order-b', 'order-a'], 'the order is saved');
+    for (const id of ids) await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.forget', { id: i })), id);
+    await page.waitForSelector('.session-row:has-text("order-")', { state: 'detached' });
   });
 
   await step('delete a session and its conversation from the sidebar', async () => {
@@ -2466,6 +2523,28 @@ const G = {};
     }, id);
     assert.deepEqual(replies, [], 'no answers sent for queries in the saved output');
     await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.forget', { id: i })), id);
+  });
+
+  await step('the notification banner shows once, and stays away when the browser forgets its site data', async () => {
+    // Headless Chromium reports 'denied', which hides the banner: a fresh context that reports 'default' stands in for a real browser.
+    const ctx = await browser.newContext({ viewport: { width: 1500, height: 900 } });
+    await ctx.addInitScript(() => Object.defineProperty(Notification, 'permission', { get: () => 'default' }));
+    const pg = await ctx.newPage();
+    const banner = '.toast >> text=Get a desktop notification when Claude needs you?';
+    const asked = () => JSON.parse(fs.readFileSync(path.join(HOME, 'state.json'), 'utf8')).prefs.askedNotify;
+    try {
+      await pg.goto(`http://localhost:${PORT}/?tkn=${token}`);
+      await pg.waitForSelector(banner);
+      for (let i = 0; i < 40 && !asked(); i++) await sleep(50);
+      assert.equal(asked(), true, 'the server remembers that it asked');
+      await pg.evaluate(() => localStorage.clear());
+      await pg.reload();
+      await pg.waitForSelector('.wt-row.active', { timeout: 15000 });
+      await sleep(500);
+      assert.equal(await pg.locator(banner).count(), 0, 'not asked again after the site data is cleared');
+    } finally {
+      await ctx.close();
+    }
   });
 
   await step('no JavaScript errors', async () => {

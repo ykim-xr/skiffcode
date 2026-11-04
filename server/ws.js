@@ -16,11 +16,37 @@ class WsConnection extends EventEmitter {
     this.fragBytes = 0;
     this.fragOpcode = 0;
     this.open = true;
+    this.heard = true;
     socket.setNoDelay(true);
-    socket.on('data', d => this.onData(d));
+    socket.on('data', d => { this.heard = true; this.onData(d); });
     socket.on('close', () => this.finish());
     socket.on('error', () => this.finish());
-    this.pinger = setInterval(() => this.sendFrame(0x9, Buffer.alloc(0)), 25_000);
+    // A connection can die with no close reaching us (such as across hibernate). Counting ticks, not
+    // clock time, means the first tick after a wake spares a client that spoke before the sleep.
+    this.pinger = setInterval(() => {
+      if (!this.heard) return this.socket.destroy();
+      this.heard = false;
+      this.sendFrame(0x9, Buffer.alloc(0));
+    }, 25_000);
+  }
+
+  /** Ping now: true as soon as anything arrives, false after `ms`. Never closes the socket. */
+  answers(ms) {
+    if (!this.open) return Promise.resolve(false);
+    return new Promise(resolve => {
+      const done = ok => {
+        clearTimeout(timer);
+        this.socket.off('data', onData);
+        this.off('close', onClose);
+        resolve(ok);
+      };
+      const onData = () => done(true);
+      const onClose = () => done(false);
+      const timer = setTimeout(() => done(false), ms);
+      this.socket.on('data', onData);
+      this.on('close', onClose);
+      this.sendFrame(0x9, Buffer.alloc(0));
+    });
   }
 
   finish() {

@@ -117,6 +117,25 @@ function startServer() {
     assert.equal(st.repos.find(r => r.name === 'beta').group, id);
   });
 
+  await step('/api/status counts only clients that answer a ping (a connection that died silently is not open)', async () => {
+    const status = async () => (await (await fetch(`http://127.0.0.1:${PORT}/api/status`, { headers: { 'x-skiffcode-token': token } })).json()).clients;
+    assert.equal(await status(), 1, 'only the healthy client');
+    const raw = net.connect(PORT, '127.0.0.1');
+    let got = Buffer.alloc(0);
+    raw.on('data', d => { got = Buffer.concat([got, d]); });
+    raw.on('error', () => {});
+    raw.write(`GET /ws HTTP/1.1\r\nHost: localhost:${PORT}\r\nOrigin: http://localhost:${PORT}\r\nCookie: skiffcode_tkn=${token}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${crypto.randomBytes(16).toString('base64')}\r\n\r\n`);
+    try {
+      await until(() => got.includes('101 Switching'), 'raw socket upgraded');
+      const t0 = Date.now();
+      assert.equal(await status(), 1, 'the silent socket is not counted, the healthy client still is');
+      assert.ok(Date.now() - t0 < 1900, 'answers within the launcher\'s 2 s limit');
+      assert.ok(got.includes(Buffer.from([0x89, 0x00])), 'the silent socket was connected and pinged');
+    } finally {
+      raw.destroy();
+    }
+  });
+
   let wt, sid;
   await step('new worktree: .env copied, Claude starts in it (with base recorded)', async () => {
     plan('SessionStart,hang');
@@ -251,6 +270,25 @@ function startServer() {
     await sleep(1500);
     assert.equal(calls().length, n + 1, 'one launch');
     await c.call('sessions.forget', { id: s.id });
+  });
+
+  await step('sessions.move: reorders within a worktree, ignores another worktree', async () => {
+    plan('SessionStart,hang');
+    const mk = (name, worktreePath = wt) => c.call('sessions.create', { kind: 'claude', worktreePath, name, cols: 80, rows: 24 });
+    const [a, b, d] = [await mk('mv-a'), await mk('mv-b'), await mk('mv-c')];
+    const other = await mk('mv-other', repo);
+    const order = async () => (await c.call('hello')).sessions.filter(x => /^mv-/.test(x.name) && x.worktreePath === wt).map(x => x.name.slice(3));
+    assert.deepEqual(await order(), ['a', 'b', 'c']);
+    for (const [id, target, after, want] of [[d, a, false, 'cab'], [a, b, true, 'cba'], [b, d, false, 'bca'], [b, a, true, 'cab']]) {
+      await c.call('sessions.move', { id: id.id, target: target.id, after });
+      assert.equal((await order()).join(''), want);
+    }
+    const all = async () => (await c.call('hello')).sessions.map(x => x.id).join();
+    const before = await all();
+    await c.call('sessions.move', { id: a.id, target: other.id });
+    await c.call('sessions.move', { id: a.id, target: a.id, after: true });
+    assert.equal(await all(), before, 'another worktree, or itself: nothing changes');
+    for (const x of [a, b, d, other]) await c.call('sessions.forget', { id: x.id });
   });
 
   await step('restart: model and context come back from the status line; no unread marks; a pending rename wins', async () => {
@@ -1224,6 +1262,20 @@ function startServer() {
     fs.rmSync(lone); fs.rmSync(`${lone}.css`);
     await assert.rejects(c.call('fs.viewUrl', { path: '/definitely/not/here.html' }), /Not found/);
     fs.rmSync(path.join(wt, 'site'), { recursive: true });
+  });
+
+  await step('reveal in file manager: the commands per platform; a missing path or unknown folder is refused before anything starts', async () => {
+    const { revealCommands } = require('../server/fsops'); // pure: starts nothing
+    const win = String.raw`\\wsl.localhost\Ubuntu\home\me\my docs\a.txt`;
+    assert.deepEqual(revealCommands('/home/me/my docs/a.txt', { wsl: true, windowsPath: win }), [{ file: 'explorer.exe', args: [`/select,${win}`] }]);
+    const [dbus, open] = revealCommands('/home/me/my docs/a,b.txt', { wsl: false });
+    assert.equal(dbus.file, 'dbus-send');
+    assert.equal(dbus.args.at(-2), 'array:string:file:///home/me/my%20docs/a%2Cb.txt', 'spaces and commas are escaped');
+    assert.equal(dbus.args.at(-1), 'string:');
+    assert.deepEqual(open, { file: 'xdg-open', args: ['/home/me/my docs'] });
+    await assert.rejects(c.call('fs.reveal', { cwd: wt, path: 'no/such/file.txt' }), /Not found: no\/such\/file\.txt/);
+    await assert.rejects(c.call('fs.reveal', { cwd: '/etc', path: '/etc/passwd' }), /Not a worktree/);
+    await assert.rejects(c.call('fs.reveal', { cwd: wt, path: '' }), /Bad path/);
   });
 
   await step('delete a session completely: its Claude conversation is gone from /resume; folders can be purged', async () => {

@@ -95,7 +95,7 @@ export function worktree(p) {
 export function sessionsIn(p) {
   return store.sessions
     .filter(s => s.worktreePath === p)
-    .sort((a, b) => (a.kind === b.kind ? a.createdAt - b.createdAt : a.kind === 'claude' ? -1 : 1));
+    .sort((a, b) => (a.kind === b.kind ? 0 : a.kind === 'claude' ? -1 : 1)); // stable: the saved order decides within a kind
 }
 
 export function session(id) {

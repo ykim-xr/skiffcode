@@ -31,6 +31,7 @@ export const stateLabel = s => (s.command && s.state !== 'ended' && !needsYou(s.
 let A; // actions from app.js
 let root;
 let drag = null;
+let renderAfterDrag = false;
 
 export function initSidebar(el, actions) {
   A = actions;
@@ -49,9 +50,12 @@ function toggle(key) {
 }
 
 function render() {
+  // A rebuild would remove the dragged row: its drop and dragend would be lost.
+  renderAfterDrag = !!drag;
+  if (drag) return;
   const list = h('div.tree', {
-    ondragover: e => { if (drag) { e.preventDefault(); markDrop(null); } },
-    ondrop: e => { if (drag && e.target === list) { e.preventDefault(); drop(null); } },
+    ondragover: e => { if (!drag) return; markDrop(null); if (drag.kind !== 'session') e.preventDefault(); },
+    ondrop: e => { if (drag && drag.kind !== 'session' && e.target === list) { e.preventDefault(); drop(null); } },
   });
   // Each group / repo / folder is one block, so a hairline can separate them.
   for (const g of store.groups) list.append(groupRow(g));
@@ -294,8 +298,13 @@ function agentRow(s, a, depth) {
 
 function sessionRow(s, depth, agentsKey) {
   const ended = s.state === 'ended';
-  return h(`div.row.session-row${s.unread ? '.unread' : ''}${A.isSessionFocused(s.id) ? '.focused' : ''}`, {
+  const me = { kind: 'session', id: s.id, worktreePath: s.worktreePath };
+  const row = h(`div.row.session-row${s.unread ? '.unread' : ''}${A.isSessionFocused(s.id) ? '.focused' : ''}`, {
     style: { paddingLeft: `${6 + depth * 12}px` },
+    draggable: 'true',
+    ondragstart: e => startDrag(e, me),
+    ondragover: e => { if (drag && drag.kind === 'session') overRow(e, row, me); },
+    ondrop: e => { if (drag && drag.kind === 'session') { e.preventDefault(); e.stopPropagation(); drop({ ...me, after: row.dataset.drop === 'after' }); } },
     title: [`${s.name} — ${stateLabel(s)}`, s.model ? `${s.model}${s.contextPct !== undefined ? ` · context ${s.contextPct}%` : ''}` : '', 'Double-click to rename'].filter(Boolean).join('\n'),
     onclick: () => A.focusSession(s.id),
     ondblclick: e => { e.preventDefault(); A.renameSession(s); },
@@ -321,9 +330,10 @@ function sessionRow(s, depth, agentsKey) {
       ? h('button.icon-btn', { title: 'Resume', onclick: e => { e.stopPropagation(); A.resumeSession(s.id); } }, icon('play'))
       : h('button.icon-btn', { title: 'Stop', onclick: e => { e.stopPropagation(); A.stopSession(s.id); } }, icon('stop')),
     h('button.icon-btn', { title: 'Close session', onclick: e => { e.stopPropagation(); A.closeSession(s); } }, icon('close'))));
+  return row;
 }
 
-// ---- drag and drop (repos and groups)
+// ---- drag and drop (repos, groups, and sessions within a worktree)
 
 function startDrag(e, item) {
   drag = item;
@@ -336,6 +346,7 @@ function overRow(e, row, target) {
   if (!drag) return;
   e.stopPropagation();
   if (drag.kind === 'group' && target.kind !== 'group') return; // no drop here
+  if (drag.kind === 'session' && (target.kind !== 'session' || target.worktreePath !== drag.worktreePath || target.id === drag.id)) { markDrop(null); return; }
   e.preventDefault();
   const r = row.getBoundingClientRect();
   const y = e.clientY - r.top;
@@ -353,6 +364,10 @@ function drop(target) {
   drag = null;
   markDrop(null);
   if (!item) return;
+  if (item.kind === 'session') {
+    if (target && target.kind === 'session' && target.worktreePath === item.worktreePath && target.id !== item.id) call('sessions.move', { id: item.id, target: target.id, after: !!target.after });
+    return;
+  }
   if (target && item.kind === target.kind && (item.path || item.id) === (target.path || target.id)) return;
   call('repos.move', { items: [item], target: target && { ...target } });
 }
@@ -360,4 +375,5 @@ function drop(target) {
 document.addEventListener('dragend', () => {
   drag = null;
   if (root) markDrop(null);
+  if (renderAfterDrag) render();
 });

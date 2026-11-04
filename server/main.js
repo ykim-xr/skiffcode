@@ -144,7 +144,7 @@ function snapshot() {
     groups: state.groups,
     repos: state.repos,
     sessions: sessions.list(),
-    prefs: { muted: !!state.prefs.muted, collapsed: state.prefs.collapsed || {} },
+    prefs: { muted: !!state.prefs.muted, askedNotify: !!state.prefs.askedNotify, collapsed: state.prefs.collapsed || {} },
     accounts: accounts.list(),
     currentLogin: accounts.currentLogin(),
     usage: accounts.usage,
@@ -468,6 +468,7 @@ const api = {
   },
   'prefs.collapse'({ key, collapsed }) { state.update(d => { d.prefs.collapsed = { ...(d.prefs.collapsed || {}), [key]: collapsed || undefined }; }); },
   'prefs.mute'({ muted }) { state.update(d => { d.prefs.muted = !!muted; }); },
+  'prefs.askedNotify'() { state.update(d => { d.prefs.askedNotify = true; }); },
   'settings.set'({ values }) { state.update(d => { d.prefs.settings = { ...(d.prefs.settings || {}), ...values }; }); return settings(); },
 
   // worktrees
@@ -667,6 +668,15 @@ const api = {
   async 'sessions.forget'({ id }) { await sessions.forget(sessionId(id)); },
   async 'sessions.rename'({ id, name }) { await sessions.rename(sessionId(id), name); },
   'sessions.setUnread'({ id, unread }) { sessions.setUnread(sessionId(id), unread); },
+  /** Reorder sessions within one worktree: put `id` before `target`, or after it when `after` is set. */
+  'sessions.move'({ id, target, after }) {
+    const a = state.session(sessionId(id)), b = state.session(sessionId(target));
+    if (a === b || a.worktreePath !== b.worktreePath) return;
+    state.update(d => {
+      d.sessions.splice(d.sessions.indexOf(a), 1);
+      d.sessions.splice(d.sessions.indexOf(b) + (after ? 1 : 0), 0, a);
+    });
+  },
   view(info, client) { sessions.setViewing(client.id, info); },
   /** Memory: the SkiffCode server, and each session's terminal + everything running in it (Claude, tools). */
   async 'system.memory'() {
@@ -770,6 +780,15 @@ const api = {
         return null;
       }
     });
+  },
+  /** Show a file or folder in the system file manager. Any path is allowed, like fs.viewUrl: a terminal can print any path, and this opens a window but exposes no content. */
+  async 'fs.reveal'({ cwd, path: p }) {
+    if (typeof p !== 'string' || !p || p.length > 1024) throw new Error('Bad path');
+    const abs = toLinuxPath(p, rootOf(cwd));
+    let st;
+    try { st = fs.statSync(abs); } catch { throw new Error(`Not found: ${p}`); }
+    if (!st.isFile() && !st.isDirectory()) throw new Error(`Not found: ${p}`);
+    await fsops.reveal(abs);
   },
   /** A /view URL for a file anywhere (you clicked its path): HTML, images, PDFs, text. */
   'fs.viewUrl'({ path: p }) {
@@ -1102,8 +1121,11 @@ const server = http.createServer((req, res) => {
       res.writeHead(403);
       return res.end();
     }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ version: VERSION, clients: clients.size, pid: process.pid }));
+    // A page whose connection died silently (after hibernate) still sits in `clients`: count only those that answer.
+    return void Promise.all([...clients].map(c => c.conn.answers(1200))).then(answered => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ version: VERSION, clients: answered.filter(Boolean).length, pid: process.pid }));
+    });
   }
   if (url.pathname === '/api/cli' && req.method === 'POST') {
     if (!tokenOk(req.headers['x-skiffcode-token'])) {

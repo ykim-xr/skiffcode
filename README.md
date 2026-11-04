@@ -7,6 +7,7 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 **Claude sessions**
 - Several Claude sessions and shells per worktree; they keep running when you close the window, restart SkiffCode or reboot (they resume where they left off)
 - Name sessions when you start them; names stay in sync with Claude both ways (rename here, or `/rename` in Claude)
+- Drag sessions in the sidebar to reorder them within a worktree
 - **Active panel**: every session waiting for you or working; one click opens it
 - At a glance: orange Claude icon while working, a zigzag while a command it started runs, ❓ / 🛡 when it needs you
 - **Alerts** for questions, permission prompts and finished work: a sound per alert (built-in or your own file, with volume) and desktop notifications
@@ -29,6 +30,7 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 - **Drag and drop** like VS Code: files from Explorer into a folder (copied in) or onto a Claude session (attached); from the Files panel onto a folder (moved), an editor pane (opened) or a session (`@path`)
 - **Viewers**: images and PDFs open in a tab; HTML pages (and SVG) get a live preview to the side that reloads as files change
 - **Paths in terminals are links**, Claude’s output included: an HTML report opens in your browser on click, or as a preview inside SkiffCode on Ctrl+click; code opens in the editor at its line; right-click for more. Works with Linux, `C:\…` and `\\wsl.localhost\…` paths
+- **Reveal in file manager**: right-click a file or folder in the Files panel, or a path in a terminal, to see it in Explorer (WSL) or your desktop's file manager
 - **Web pages in a tab**: Ctrl+click a link in a terminal or the editor to open it inside SkiffCode (a plain click in a terminal opens your browser), or the globe button for a new tab where you type a web address or paste a file path; sites that refuse to be embedded get an “Open in your browser” button
 - Terminals: select and right-click to copy, right-click to paste; Ctrl+C copies a selection, Ctrl+V pastes
 - Panel background colors, comfortable or compact sidebar, idle worktrees unload to save memory

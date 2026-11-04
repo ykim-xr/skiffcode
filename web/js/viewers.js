@@ -317,6 +317,11 @@ export function pathHint(info) {
   return `${LINK_HINT} · right-click for more`;
 }
 
+/** Show a file or folder (an absolute path) in the system file manager. */
+export function revealInFileManager(cwd, abs) {
+  call('fs.reveal', { cwd, path: abs }).catch(err => toast(err.message, { kind: 'error' }));
+}
+
 /** Open any file in your browser, from SkiffCode's read-only file server. */
 function openInBrowser(abs) {
   const w = window.open('', '_blank'); // opened now, while the click still counts (popup blockers)

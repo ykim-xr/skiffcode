@@ -2,7 +2,7 @@
 import { h, icon, clear, basename, dirname, dirtyCount, STATUS_LETTER } from './util.js';
 import { call, on } from './rpc.js';
 import { contextMenu, promptDialog, confirmDialog, toast } from './dialogs.js';
-import { hasPreview, viewerFor } from './viewers.js';
+import { hasPreview, viewerFor, revealInFileManager } from './viewers.js';
 import { startInternal, isInternal, isExternal, readInternal, takeExternal, uploadInto, moveInto } from './dnd.js';
 import { move as moveModels } from './models.js';
 
@@ -241,6 +241,7 @@ export class FilesView {
       { label: 'Rename…', icon: 'edit', action: () => this.rename(e) },
       { label: 'Copy path', icon: 'link', action: () => navigator.clipboard.writeText(`${this.ws.root}/${e.path}`) },
       { label: 'Copy relative path', action: () => navigator.clipboard.writeText(e.path) },
+      { label: 'Reveal in file manager', icon: 'folder', action: () => revealInFileManager(this.ws.root, `${this.ws.root}/${e.path}`) },
       { separator: true },
       { label: 'Delete', icon: 'trash', danger: true, action: () => this.remove(e) },
     ];

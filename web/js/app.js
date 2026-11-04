@@ -700,8 +700,9 @@ function applyFontSize(n) {
 }
 
 function maybeAskNotifications() {
-  if (!('Notification' in window) || Notification.permission !== 'default' || readStored('skiffcode.askedNotify')) return;
-  try { localStorage.setItem('skiffcode.askedNotify', '1'); } catch { /* storage unavailable: ask again next time */ }
+  if (!('Notification' in window) || Notification.permission !== 'default' || store.prefs.askedNotify) return;
+  store.prefs.askedNotify = true;
+  call('prefs.askedNotify');
   toast('Get a desktop notification when Claude needs you?', { timeout: 0, icon: 'bell', actions: [{ label: 'Allow notifications', action: () => askNotifications() }] });
 }
 

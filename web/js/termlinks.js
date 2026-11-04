@@ -5,7 +5,7 @@
 //   right-click  → a menu: open here, open in your browser, show in Files, copy
 import { call } from './rpc.js';
 import { toast } from './dialogs.js';
-import { openPath, openLink, pathHint, pathKind } from './viewers.js';
+import { openPath, openLink, pathHint, pathKind, revealInFileManager } from './viewers.js';
 
 // Linux (/…, ~/…, ./…), Windows (C:\…), WSL shares (\\wsl.localhost\…), relative (src/app.py) and bare
 // file names with an extension (index.html); an optional :line or :line:col after any of them.
@@ -133,6 +133,7 @@ export function linkMenuItems(tab, link) {
     return [
       inHere ? { label: 'Show in Files', icon: 'files', action: () => openPath(app, ws, info, {}) } : null,
       { label: 'Copy path', icon: 'link', action: () => copy(info.abs) },
+      { label: 'Reveal in file manager', icon: 'folder', action: () => revealInFileManager(ws.root, info.abs) },
     ];
   }
   const kind = pathKind(info.abs);
@@ -143,6 +144,7 @@ export function linkMenuItems(tab, link) {
     inHere ? { label: 'Show in Files', icon: 'files', action: () => ws.files.reveal(info.rel) } : null,
     { separator: true },
     { label: 'Copy path', icon: 'link', action: () => copy(info.abs) },
+    { label: 'Reveal in file manager', icon: 'folder', action: () => revealInFileManager(ws.root, info.abs) },
   ];
 }
 

@@ -2,7 +2,10 @@
 // File tree, read/write and lightweight watching for the open worktree.
 const fs = require('fs');
 const path = require('path');
-const { run, within, safeToDelete, realpath, isGitDir } = require('./util');
+const { pathToFileURL } = require('url');
+const { spawn } = require('child_process');
+const { run, which, within, safeToDelete, realpath, isGitDir } = require('./util');
+const { isWSL } = require('./notify');
 
 const MAX_EDIT_SIZE = 8 * 1024 * 1024;
 const HIDDEN = new Set(['.git']);
@@ -185,4 +188,56 @@ class Watcher {
   }
 }
 
-module.exports = { list, read, write, create, rename, remove, upload, guard, realInside, setLinkRoots, Watcher, MAX_UPLOAD };
+/**
+ * The commands that show `abs` in the system file manager, in the order to try them.
+ * `windowsPath` (WSL only) is `abs` as Windows names it.
+ */
+function revealCommands(abs, { wsl, windowsPath }) {
+  if (wsl) return [{ file: 'explorer.exe', args: [`/select,${windowsPath}`] }];
+  // dbus-send splits an array:string value on commas, so a comma in a file name must be escaped
+  const uri = pathToFileURL(abs).href.replace(/,/g, '%2C');
+  return [
+    { file: 'dbus-send', args: ['--session', '--dest=org.freedesktop.FileManager1', '--type=method_call', '/org/freedesktop/FileManager1', 'org.freedesktop.FileManager1.ShowItems', `array:string:${uri}`, 'string:'] },
+    { file: 'xdg-open', args: [path.dirname(abs)] },
+  ];
+}
+
+const REVEAL_WAIT_MS = 2000;
+
+/**
+ * Starts one command with no shell and no stdin. Resolves true if it started and did not fail, false otherwise.
+ * `anyExit`: any exit code counts (explorer.exe exits 1 even when it worked).
+ * A command still running after REVEAL_WAIT_MS has started: it is left to run (a file manager from xdg-open
+ * stays up), or killed when `killOnWait` is set (dbus-send hanging means no file manager answered).
+ */
+function startCommand(cmd, { anyExit, killOnWait }) {
+  return new Promise(resolve => {
+    let timer;
+    const done = ok => { clearTimeout(timer); resolve(ok); };
+    // like notify.js: detached, so a Windows program gets no controlling terminal to be suspended on
+    const child = spawn(cmd.file, cmd.args, { stdio: 'ignore', detached: true, cwd: fs.existsSync('/mnt/c') && isWSL() ? '/mnt/c' : undefined });
+    child.on('error', () => done(false));
+    child.on('exit', code => done(anyExit || code === 0));
+    timer = setTimeout(() => {
+      if (killOnWait) { try { child.kill(); } catch { /* gone already */ } return done(false); }
+      child.unref();
+      done(true);
+    }, REVEAL_WAIT_MS);
+  });
+}
+
+/** Shows an existing file or folder in the system file manager (Explorer on WSL). Throws if none could be started. */
+async function reveal(abs) {
+  const wsl = isWSL();
+  let windowsPath;
+  if (wsl) windowsPath = (await run('wslpath', ['-w', abs], { timeout: 5000 }).catch(() => '')).trim();
+  if (wsl && !windowsPath) throw new Error('Could not open a file manager.');
+  for (const cmd of revealCommands(abs, { wsl, windowsPath })) {
+    const exe = which(cmd.file) || (cmd.file === 'explorer.exe' && fs.existsSync('/mnt/c/Windows/explorer.exe') ? '/mnt/c/Windows/explorer.exe' : undefined);
+    if (!exe) continue;
+    if (await startCommand({ ...cmd, file: exe }, { anyExit: wsl, killOnWait: cmd.file === 'dbus-send' })) return;
+  }
+  throw new Error('Could not open a file manager.');
+}
+
+module.exports = { revealCommands, reveal, list, read, write, create, rename, remove, upload, guard, realInside, setLinkRoots, Watcher, MAX_UPLOAD };
