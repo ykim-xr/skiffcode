@@ -1266,8 +1266,20 @@ function startServer() {
 
   await step('reveal in file manager: the commands per platform; a missing path or unknown folder is refused before anything starts', async () => {
     const { revealCommands } = require('../server/fsops'); // pure: starts nothing
-    const win = String.raw`\\wsl.localhost\Ubuntu\home\me\my docs\a.txt`;
-    assert.deepEqual(revealCommands('/home/me/my docs/a.txt', { wsl: true, windowsPath: win }), [{ file: 'explorer.exe', args: [`/select,${win}`] }]);
+    const decode = cmd => Buffer.from(cmd.args[cmd.args.indexOf('-EncodedCommand') + 1], 'base64').toString('utf16le');
+    for (const [name, win, quoted] of [
+      ['spaces', String.raw`\\wsl.localhost\Ubuntu\home\me\my docs\a.txt`, String.raw`'\\wsl.localhost\Ubuntu\home\me\my docs\a.txt'`],
+      ['quotes cannot end the string', String.raw`\\wsl.localhost\Ubuntu\home\me\it's a\x’; calc; ‘.txt`, String.raw`'\\wsl.localhost\Ubuntu\home\me\it''s a\x’’; calc; ‘‘.txt'`],
+    ]) {
+      const cmds = revealCommands('/home/me/x', { wsl: true, windowsPath: win });
+      assert.equal(cmds.length, 1, name);
+      assert.equal(cmds[0].file, 'powershell.exe', name);
+      assert.deepEqual(cmds[0].args.slice(0, 4), ['-NoProfile', '-NonInteractive', '-OutputFormat', 'Text'], name);
+      const script = decode(cmds[0]);
+      assert.ok(script.includes(`('/select,"' + ${quoted} + '"')`), `${name}: Explorer gets /select,"<path>" with the path escaped`);
+      assert.ok(script.includes('SetForegroundWindow') && script.includes('keybd_event'), `${name}: the window is raised`);
+    }
+    assert.ok(decode(revealCommands('/x/y', { wsl: true, windowsPath: String.raw`\\wsl.localhost\Ubuntu\home\me\my docs\a.txt` })[0]).includes(`$prefix='my docs - '`), 'the fallback matches the parent folder title');
     const [dbus, open] = revealCommands('/home/me/my docs/a,b.txt', { wsl: false });
     assert.equal(dbus.file, 'dbus-send');
     assert.equal(dbus.args.at(-2), 'array:string:file:///home/me/my%20docs/a%2Cb.txt', 'spaces and commas are escaped');

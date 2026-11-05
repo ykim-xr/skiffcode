@@ -5,7 +5,7 @@ const path = require('path');
 const { pathToFileURL } = require('url');
 const { spawn } = require('child_process');
 const { run, which, within, safeToDelete, realpath, isGitDir } = require('./util');
-const { isWSL } = require('./notify');
+const { isWSL, powershell } = require('./notify');
 
 const MAX_EDIT_SIZE = 8 * 1024 * 1024;
 const HIDDEN = new Set(['.git']);
@@ -189,11 +189,58 @@ class Watcher {
 }
 
 /**
+ * A string for a PowerShell script in single quotes. PowerShell also treats the curly single quotes as
+ * quotes, and a doubled quote is the only escape: this is what keeps a file name from ending the string.
+ */
+const psQuote = s => `'${String(s).replace(/['\u2018\u2019\u201A\u201B]/g, q => q + q)}'`;
+
+/**
+ * A PowerShell script that shows `windowsPath` in Explorer and brings the window to the front.
+ * PowerShell starts Explorer because WSL quotes a whole argument, giving "/select,C:\a b" (which Explorer
+ * rejects) instead of /select,"C:\a b". The key press comes first because Windows only lets the process
+ * that got the last input take the foreground; F24 (0x87) is used by no app. If no new window shows up
+ * the script ends quietly: the window opened, it just can't be raised.
+ */
+function revealScript(windowsPath) {
+  const parts = windowsPath.split('\\').filter(Boolean);
+  const folder = parts.length > 1 ? parts[parts.length - 2] : ''; // Explorer titles the window with the parent
+  return `$ProgressPreference='SilentlyContinue'
+$ErrorActionPreference='Stop'
+Add-Type -TypeDefinition @'
+using System;using System.Text;using System.Collections.Generic;using System.Runtime.InteropServices;
+public static class SkiffReveal{
+ delegate bool P(IntPtr h,IntPtr l);
+ [DllImport("user32.dll")] static extern bool EnumWindows(P p,IntPtr l);
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h,StringBuilder s,int n);
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h,StringBuilder s,int n);
+ [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+ [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+ [DllImport("user32.dll")] public static extern void keybd_event(byte v,byte s,uint f,UIntPtr e);
+ public static List<IntPtr> Windows(){var r=new List<IntPtr>();EnumWindows((h,l)=>{var c=new StringBuilder(64);GetClassName(h,c,64);if(c.ToString()=="CabinetWClass"&&IsWindowVisible(h))r.Add(h);return true;},IntPtr.Zero);return r;}
+ public static string Title(IntPtr h){var t=new StringBuilder(256);GetWindowText(h,t,256);return t.ToString();}
+}
+'@
+$old=[SkiffReveal]::Windows()
+Start-Process explorer.exe -ArgumentList ('/select,"' + ${psQuote(windowsPath)} + '"')
+$h=$null
+$sw=[Diagnostics.Stopwatch]::StartNew()
+while(-not $h -and $sw.ElapsedMilliseconds -lt 3000){ foreach($x in [SkiffReveal]::Windows()){ if($old -notcontains $x){$h=$x} }; if(-not $h){Start-Sleep -Milliseconds 50} }
+if(-not $h){ $prefix=${psQuote(`${folder} - `)}; foreach($x in [SkiffReveal]::Windows()){ if([SkiffReveal]::Title($x).StartsWith($prefix,[StringComparison]::Ordinal)){$h=$x} } }
+if(-not $h){exit 0}
+[SkiffReveal]::keybd_event(0x87,0,0,[UIntPtr]::Zero);[SkiffReveal]::keybd_event(0x87,0,2,[UIntPtr]::Zero)
+[SkiffReveal]::SetForegroundWindow($h) | Out-Null
+`;
+}
+
+/**
  * The commands that show `abs` in the system file manager, in the order to try them.
  * `windowsPath` (WSL only) is `abs` as Windows names it.
  */
 function revealCommands(abs, { wsl, windowsPath }) {
-  if (wsl) return [{ file: 'explorer.exe', args: [`/select,${windowsPath}`] }];
+  if (wsl) {
+    const enc = Buffer.from(revealScript(windowsPath), 'utf16le').toString('base64');
+    return [{ file: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand', enc] }];
+  }
   // dbus-send splits an array:string value on commas, so a comma in a file name must be escaped
   const uri = pathToFileURL(abs).href.replace(/,/g, '%2C');
   return [
@@ -206,18 +253,18 @@ const REVEAL_WAIT_MS = 2000;
 
 /**
  * Starts one command with no shell and no stdin. Resolves true if it started and did not fail, false otherwise.
- * `anyExit`: any exit code counts (explorer.exe exits 1 even when it worked).
  * A command still running after REVEAL_WAIT_MS has started: it is left to run (a file manager from xdg-open
- * stays up), or killed when `killOnWait` is set (dbus-send hanging means no file manager answered).
+ * stays up, and the PowerShell script can take longer on a busy machine), or killed when `killOnWait` is set
+ * (dbus-send hanging means no file manager answered).
  */
-function startCommand(cmd, { anyExit, killOnWait }) {
+function startCommand(cmd, { killOnWait }) {
   return new Promise(resolve => {
     let timer;
     const done = ok => { clearTimeout(timer); resolve(ok); };
     // like notify.js: detached, so a Windows program gets no controlling terminal to be suspended on
     const child = spawn(cmd.file, cmd.args, { stdio: 'ignore', detached: true, cwd: fs.existsSync('/mnt/c') && isWSL() ? '/mnt/c' : undefined });
     child.on('error', () => done(false));
-    child.on('exit', code => done(anyExit || code === 0));
+    child.on('exit', code => done(code === 0));
     timer = setTimeout(() => {
       if (killOnWait) { try { child.kill(); } catch { /* gone already */ } return done(false); }
       child.unref();
@@ -233,11 +280,11 @@ async function reveal(abs) {
   if (wsl) windowsPath = (await run('wslpath', ['-w', abs], { timeout: 5000 }).catch(() => '')).trim();
   if (wsl && !windowsPath) throw new Error('Could not open a file manager.');
   for (const cmd of revealCommands(abs, { wsl, windowsPath })) {
-    const exe = which(cmd.file) || (cmd.file === 'explorer.exe' && fs.existsSync('/mnt/c/Windows/explorer.exe') ? '/mnt/c/Windows/explorer.exe' : undefined);
+    const exe = wsl ? powershell() : which(cmd.file);
     if (!exe) continue;
-    if (await startCommand({ ...cmd, file: exe }, { anyExit: wsl, killOnWait: cmd.file === 'dbus-send' })) return;
+    if (await startCommand({ ...cmd, file: exe }, { killOnWait: cmd.file === 'dbus-send' })) return;
   }
   throw new Error('Could not open a file manager.');
 }
 
-module.exports = { revealCommands, reveal, list, read, write, create, rename, remove, upload, guard, realInside, setLinkRoots, Watcher, MAX_UPLOAD };
+module.exports = { revealScript, revealCommands, reveal, list, read, write, create, rename, remove, upload, guard, realInside, setLinkRoots, Watcher, MAX_UPLOAD };

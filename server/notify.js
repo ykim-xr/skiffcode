@@ -129,4 +129,4 @@ function alertWithoutWindow({ session, kind, repoName, settings, muted, soundFil
   if (settings.desktopNotifications !== false) desktopNotify(title, body);
 }
 
-module.exports = { alertWithoutWindow, playFile, desktopNotify, isWSL };
+module.exports = { alertWithoutWindow, playFile, desktopNotify, isWSL, powershell };
