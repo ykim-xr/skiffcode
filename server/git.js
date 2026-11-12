@@ -257,8 +257,13 @@ async function showFile(dir, ref, rel) {
 
 // ---- actions
 
+// Not pathspecs: a file named `:!x` must not mean "all but x", nor `f[1].txt` match `f1.txt`.
+const literal = files => files.map(f => `:(literal)${f}`);
+// Hooks (pre-commit, post-checkout) and LFS downloads can take minutes.
+const HOOK_TIMEOUT = 600_000;
+
 async function stage(dir, files) {
-  if (files.length) await git(dir, ['add', '-A', '--', ...files]);
+  if (files.length) await git(dir, ['add', '-A', '--', ...literal(files)]);
 }
 async function stageAll(dir) {
   await git(dir, ['add', '-A']);
@@ -266,9 +271,9 @@ async function stageAll(dir) {
 async function unstage(dir, files) {
   if (!files.length) return;
   try {
-    await git(dir, ['restore', '--staged', '--', ...files]);
+    await git(dir, ['restore', '--staged', '--', ...literal(files)]);
   } catch {
-    await git(dir, ['reset', '-q', '--', ...files]); // before the first commit
+    await git(dir, ['reset', '-q', '--', ...literal(files)]); // before the first commit
   }
 }
 async function unstageAll(dir) {
@@ -283,7 +288,7 @@ async function discard(dir, files) {
   const s = await status(dir);
   const untracked = new Set(s.untracked.map(f => f.path));
   const tracked = files.filter(f => !untracked.has(f));
-  if (tracked.length) await git(dir, ['restore', '--worktree', '--', ...tracked]).catch(() => git(dir, ['checkout', '--', ...tracked]));
+  if (tracked.length) await git(dir, ['restore', '--worktree', '--', ...literal(tracked)]).catch(() => git(dir, ['checkout', '--', ...literal(tracked)]));
   for (const f of files.filter(f => untracked.has(f))) {
     const abs = path.join(dir, f);
     if (abs.startsWith(dir + path.sep)) fs.rmSync(abs, { recursive: true, force: true });
@@ -291,10 +296,10 @@ async function discard(dir, files) {
 }
 async function commit(dir, message, { all = false, amend = false } = {}) {
   if (all) await git(dir, ['add', '-A']);
-  if (amend && !message) return git(dir, ['commit', '--amend', '--no-edit']);
+  if (amend && !message) return git(dir, ['commit', '--amend', '--no-edit'], { timeout: HOOK_TIMEOUT });
   const args = ['commit', '-F', '-'];
   if (amend) args.push('--amend');
-  return git(dir, args, { input: message });
+  return git(dir, args, { input: message, timeout: HOOK_TIMEOUT });
 }
 async function push(dir) {
   const s = await status(dir);
@@ -307,10 +312,114 @@ async function pull(dir) {
   return run('git', ['pull', '--no-edit'], { cwd: dir, timeout: 180_000 }).catch(e => { throw new Error(e.stderr || e.message); });
 }
 
+// ---- stashes
+// A stash is named by its sha only. pop and drop look its index up right before the call, under a per-repo
+// lock, so a click on a stale list never removes another stash.
+
+const STASH_STALE = 'The stash list changed. Refresh and try again.';
+const stashLocks = new Map();
+
+function safeSha(sha) {
+  if (typeof sha !== 'string' || !/^[0-9a-f]{40,64}$/.test(sha)) throw new Error(`Not a valid stash: ${sha}`);
+  return sha;
+}
+
+/** Stash calls of one repo run one after another (refs/stash is shared by all its worktrees). */
+async function withStashLock(dir, fn) {
+  const key = (await git(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).trim();
+  const prev = stashLocks.get(key) || Promise.resolve();
+  const next = prev.catch(() => undefined).then(fn);
+  const tail = next.catch(() => undefined);
+  stashLocks.set(key, tail);
+  tail.then(() => { if (stashLocks.get(key) === tail) stashLocks.delete(key); });
+  return next;
+}
+
+async function stashList(dir) {
+  const out = await git(dir, ['stash', 'list', '--format=%gd%x1f%H%x1f%gs%x1f%ct']).catch(() => '');
+  return out.split('\n').filter(Boolean).map((l, index) => {
+    const [ref, sha, subject, ct] = l.split('\x1f');
+    const m = /^(?:WIP on|On) (.*?): /.exec(subject);
+    return { index, sha, ref, message: m ? subject.slice(m[0].length) : subject, branch: m ? m[1] : null, time: Number(ct) * 1000 };
+  });
+}
+
+async function stashFiles(dir, sha) {
+  safeSha(sha);
+  const base = (await git(dir, ['rev-parse', '--verify', `${sha}^1`])).trim();
+  const [names, nums, hasUntracked] = await Promise.all([
+    git(dir, ['diff', '--name-status', '-z', '-M', base, sha]),
+    git(dir, ['diff', '--numstat', '-z', '-M', base, sha]),
+    git(dir, ['rev-parse', '--verify', '--quiet', `${sha}^3`]).then(() => true, () => false),
+  ]);
+  const counts = parseNumstat(nums);
+  const files = parseNameStatus(names).map(f => ({ ...f, ...counts.get(f.path) }));
+  if (hasUntracked) {
+    const out = await git(dir, ['ls-tree', '-r', '-z', '--name-only', `${sha}^3`]);
+    for (const p of out.split('\0').filter(Boolean)) files.push({ path: p, status: 'A', untracked: true });
+  }
+  return { files, base };
+}
+
+const STASH_MODES = { all: ['-u'], tracked: [], staged: ['--staged'], files: ['-u'] };
+
+async function stashPush(dir, { mode, message, files }) {
+  if (!Object.hasOwn(STASH_MODES, mode)) throw new Error(`Unknown stash mode: ${mode}`);
+  if (mode === 'files' && !(Array.isArray(files) && files.length && files.every(f => typeof f === 'string' && f))) throw new Error('No files to stash');
+  const args = ['stash', 'push', ...STASH_MODES[mode]];
+  if (typeof message === 'string' && message.trim()) args.push(`--message=${message.trim()}`);
+  if (mode === 'files') args.push('--', ...files.map(f => `:(literal)${f}`)); // not globs: `f[1].txt` must not match `f1.txt`
+  return withStashLock(dir, async () => {
+    try {
+      const out = await git(dir, args, { timeout: 180_000 });
+      return { stashed: !/No local changes to save/.test(out) };
+    } catch (e) {
+      if (/No staged changes/.test(e.stdout + e.stderr)) return { stashed: false };
+      throw e;
+    }
+  });
+}
+
+async function stashIndex(dir, sha) {
+  const found = (await stashList(dir)).find(s => s.sha === sha);
+  if (!found) throw new Error(STASH_STALE);
+  return `stash@{${found.index}}`;
+}
+
+/** Apply keeps the stash; pop removes it. On merge conflicts git keeps the stash and this returns `conflicts: true`. */
+async function stashApply(dir, sha, pop) {
+  safeSha(sha);
+  return withStashLock(dir, async () => {
+    const args = pop ? ['stash', 'pop', await stashIndex(dir, sha)] : ['stash', 'apply', sha];
+    try {
+      return { conflicts: false, output: await git(dir, args, { timeout: 180_000 }) };
+    } catch (e) {
+      const output = e.stdout + e.stderr;
+      if (/^CONFLICT \(/m.test(output)) return { conflicts: true, output };
+      throw e;
+    }
+  });
+}
+
+async function stashDrop(dir, sha) {
+  safeSha(sha);
+  return withStashLock(dir, async () => git(dir, ['stash', 'drop', await stashIndex(dir, sha)]));
+}
+
+async function stashClear(dir, shas) {
+  if (!Array.isArray(shas) || !shas.length) throw new Error('Not a valid stash list');
+  shas.forEach(safeSha);
+  return withStashLock(dir, async () => {
+    const now = (await stashList(dir)).map(s => s.sha);
+    if (now.length !== shas.length || now.some((s, i) => s !== shas[i])) throw new Error(STASH_STALE);
+    await git(dir, ['stash', 'clear']);
+  });
+}
+
 async function addWorktree(repo, target, spec) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  if (spec.newBranch) await git(repo, ['worktree', 'add', ...(spec.track ? ['--track'] : ['--no-track']), '-b', spec.newBranch, target, safeRef(spec.base)]);
-  else await git(repo, ['worktree', 'add', target, safeRef(spec.branch)]);
+  if (spec.newBranch) await git(repo, ['worktree', 'add', ...(spec.track ? ['--track'] : ['--no-track']), '-b', spec.newBranch, target, safeRef(spec.base)], { timeout: HOOK_TIMEOUT });
+  else await git(repo, ['worktree', 'add', target, safeRef(spec.branch)], { timeout: HOOK_TIMEOUT });
 }
 async function removeWorktree(repo, target, force) {
   const args = ['worktree', 'remove'];
@@ -340,5 +449,5 @@ module.exports = {
   git, resolveRepoRoot, parseWorktreeList, listWorktrees, localBranches, remoteNames, baseRefs, defaultBase, refExists, isValidBranchName,
   compareBase, parseStatusV2, status, branchStatus, parseNameStatus, changesSince, commitsSince, history, commitFiles, parentOf, showFile,
   stage, stageAll, unstage, unstageAll, discard, commit, push, pull, addWorktree, removeWorktree, pruneWorktrees, deleteBranch,
-  unpushedCount, gitDir, sanitizeForPath,
+  unpushedCount, gitDir, sanitizeForPath, stashList, stashFiles, stashPush, stashApply, stashDrop, stashClear,
 };

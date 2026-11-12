@@ -90,7 +90,7 @@ export class EditorTab extends Tab {
     this.banner = h('div.editor-banner.hidden');
     this.host = h('div.editor-host');
     this.el.append(this.banner, this.host);
-    this.editor = monaco.editor.create(this.host, { ...editorOptions(), model: this.entry.model });
+    this.editor = monaco.editor.create(this.host, { ...editorOptions(), model: this.entry.model, readOnly: this.entry.notUtf8 });
     bindSave(this.editor, () => this.save());
     this.unsub = models.onModelState(e => {
       if (e !== this.entry) return;
@@ -117,6 +117,9 @@ export class EditorTab extends Tab {
       this.banner.classList.remove('hidden');
     } else if (e.missing) {
       clear(this.banner, 'This file was deleted on disk.', h('button.btn.small', { onclick: () => models.save(e, { force: true }) }, 'Save it again'));
+      this.banner.classList.remove('hidden');
+    } else if (e.notUtf8) {
+      clear(this.banner, 'This file isn’t UTF-8, so it opens read-only.');
       this.banner.classList.remove('hidden');
     } else this.banner.classList.add('hidden');
   }
@@ -204,7 +207,7 @@ class DiffView {
     this.entry = entry;
     this.gitModels = git;
     this.tmpModels = tmp;
-    this.editor.getModifiedEditor().updateOptions({ readOnly: right !== 'live' });
+    this.editor.getModifiedEditor().updateOptions({ readOnly: right !== 'live' || entry.notUtf8 });
     this.path = path;
   }
   /** Leaving this file now would drop unsaved edits (no other tab holds it). */
@@ -532,6 +535,9 @@ export class TerminalTab extends Tab {
   }
   updateBanner() {
     const s = this.session;
+    // So the workspace attaches again when the session runs again. Not on the exit frame: the store says 'ended' later,
+    // and a session change in between would attach to the dead session.
+    if (this.ended && s && s.state === 'ended') this.attached = false;
     if (this.ended && s) {
       const claude = s.kind === 'claude';
       clear(this.banner, icon('circle'),
@@ -603,6 +609,8 @@ export class TerminalTab extends Tab {
    * Without bracketed paste every line runs as it arrives, so several lines are confirmed first.
    */
   async pasteText(text) {
+    // A pasted ESC [201~ ends bracketed paste early, and the rest would run as typed keys.
+    text = String(text || '').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, '');
     if (!text) return;
     const modes = this.term.modes;
     const lines = text.replace(/\r?\n$/, '').split(/\r\n|\r|\n/).length;

@@ -4,6 +4,7 @@
 import { basename, dirname } from './util.js';
 import { call, sendInput } from './rpc.js';
 import { confirmDialog, toast } from './dialogs.js';
+import { move as moveModels } from './models.js';
 
 export const INTERNAL = 'application/x-skiffcode-path';
 
@@ -11,14 +12,23 @@ export const hasType = (e, t) => !!(e.dataTransfer && [...e.dataTransfer.types].
 export const isInternal = e => hasType(e, INTERNAL);
 export const isExternal = e => !isInternal(e) && hasType(e, 'Files');
 
+// Any page can put INTERNAL data on a drag, so a drop is ours only if it matches the drag started here.
+let dragging = null;
+
 /** Start dragging a file or folder out of the Files panel. */
 export function startInternal(e, root, entry) {
+  dragging = { root, path: entry.path, type: entry.type };
   e.dataTransfer.effectAllowed = 'copyMove';
-  e.dataTransfer.setData(INTERNAL, JSON.stringify({ root, path: entry.path, type: entry.type }));
+  e.dataTransfer.setData(INTERNAL, JSON.stringify(dragging));
   e.dataTransfer.setData('text/plain', `${root}/${entry.path}`);
 }
 export function readInternal(e) {
-  try { return JSON.parse(e.dataTransfer.getData(INTERNAL)); } catch { return null; }
+  let it;
+  try { it = JSON.parse(e.dataTransfer.getData(INTERNAL)); } catch { return null; }
+  const d = dragging;
+  if (it && d && it.root === d.root && it.path === d.path && it.type === d.type) return d;
+  toast('Drag files within one SkiffCode window.');
+  return null;
 }
 
 /**
@@ -97,12 +107,16 @@ export async function moveInto(ws, from, dir) {
   const to = dir ? `${dir}/${basename(from)}` : basename(from);
   try {
     await call('fs.rename', { root: ws.root, from, to });
+    moveModels(ws.root, from, to);
   } catch (err) {
     toast(err.message, { kind: 'error' });
   }
 }
 
 const shellQuote = p => (/^[\w@%+=:,./-]+$/.test(p) ? p : `'${p.replace(/'/g, `'\\''`)}'`);
+// Typed at a prompt, a control character in a name acts as a key (Ctrl+U, Enter…), even inside quotes.
+const hasControl = p => /[\x00-\x1f\x7f-\x9f]/.test(p);
+const refuseControl = () => toast('That name has control characters, so it isn’t typed in.', { kind: 'error' });
 
 /** Something dropped on a Claude session or shell: type the path(s) at its prompt. */
 export async function dropOnTerminal(tab, e, getExternal) {
@@ -112,6 +126,7 @@ export async function dropOnTerminal(tab, e, getExternal) {
   const inner = isInternal(e) ? readInternal(e) : null;
   let text = '';
   if (inner) {
+    if (hasControl(`${inner.root}/${inner.path}`)) return refuseControl();
     // Claude takes @path for a file in the project; a shell gets the full path
     text = claude && inner.root === tab.ws.root ? `@${inner.path}${inner.type === 'dir' ? '/' : ''} ` : `${shellQuote(`${inner.root}/${inner.path}`)} `;
   } else if (getExternal) {
@@ -120,7 +135,8 @@ export async function dropOnTerminal(tab, e, getExternal) {
     for (const i of items) {
       try {
         const r = await call('drops.save', { name: basename(i.rel), data: await toBase64(i.file) });
-        paths.push(shellQuote(r.path));
+        if (hasControl(r.path)) refuseControl();
+        else paths.push(shellQuote(r.path));
       } catch (err) {
         toast(`${i.rel}: ${err.message}`, { kind: 'error' });
       }

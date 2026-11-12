@@ -390,6 +390,51 @@ const G = {};
     await page.waitForSelector(`${W} .scm-item:has-text("multi-a.txt")`, { state: 'detached' });
   });
 
+  await step('source control: stash all with a message, view its files and diff, pop it, stash again and drop it', async () => {
+    const W = '.workspace:not(.hidden)';
+    const stashes = `${W} .scm-section:has(.scm-section-title:text-is("Stashes"))`;
+    const appPath = path.join(repo, 'src/app.py');
+    const orig = fs.readFileSync(appPath, 'utf8');
+    fs.writeFileSync(appPath, orig + '# stashed edit\n');
+    fs.writeFileSync(path.join(repo, 'stash-new.txt'), 'only in the stash\n');
+    await page.waitForSelector(`${W} .scm-item:has-text("stash-new.txt")`);
+    await page.click(`${W} .view-toolbar button[title=Stash]`);
+    await page.click('.menu-item >> text=Stash all changes');
+    await page.fill('.modal input', 'wip greeting');
+    await page.click('.modal-buttons .btn.primary');
+    await page.waitForSelector(`${stashes} .scm-item:has-text("wip greeting")`);
+    await page.waitForSelector(`${W} .scm-item:has-text("stash-new.txt")`, { state: 'detached' });
+    assert.equal(fs.readFileSync(appPath, 'utf8'), orig, 'the tree is clean');
+    await page.click(`${stashes} .scm-item:has-text("wip greeting")`);
+    await page.waitForSelector(`${stashes} .commit-file:has-text("stash-new.txt")`);
+    await page.click(`${stashes} .commit-file:has-text("app.py")`);
+    await page.waitForSelector(`${W} .tab.active >> text=/app\\.py \\(stash@\\{0\\} [0-9a-f]{7}\\)/`);
+    await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; const m = t.view && t.view.editor.getModel(); return m && m.modified && /# stashed edit/.test(m.modified.getValue()) && !/# stashed edit/.test(m.original.getValue()); });
+    await page.click(`${stashes} .commit-file:has-text("stash-new.txt")`);
+    await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; const m = t.view && t.view.editor.getModel(); return t.spec.path === 'stash-new.txt' && m && m.modified && m.modified.getValue() === 'only in the stash\n' && m.original.getValue() === ''; });
+    await page.click(`${stashes} .scm-item:has-text("wip greeting")`, { button: 'right' });
+    await page.click('.menu-item >> text=Pop');
+    await page.waitForSelector(`${W} .scm-section-title:text-is("Stashes")`, { state: 'detached' });
+    await page.waitForSelector(`${W} .scm-item:has-text("stash-new.txt")`);
+    assert.ok(fs.readFileSync(appPath, 'utf8').endsWith('# stashed edit\n'), 'pop restores the edit');
+    assert.equal(sh('git stash list', repo).trim(), '');
+    // stash again from the file menu, then drop it
+    await page.click(`${W} .scm-item:has-text("stash-new.txt")`, { button: 'right' });
+    await page.click('.menu-item >> text=Stash');
+    await page.fill('.modal input', '');
+    await page.click('.modal-buttons .btn.primary');
+    await page.waitForSelector(`${stashes} .scm-item`);
+    assert.ok(!fs.existsSync(path.join(repo, 'stash-new.txt')), 'only the chosen file was stashed');
+    assert.ok(fs.readFileSync(appPath, 'utf8').endsWith('# stashed edit\n'));
+    await page.click(`${stashes} .scm-item`, { button: 'right' });
+    await page.click('.menu-item >> text=Drop');
+    await page.click('.modal-buttons .btn.danger');
+    await page.waitForSelector(`${W} .scm-section-title:text-is("Stashes")`, { state: 'detached' });
+    assert.equal(sh('git stash list', repo).trim(), '');
+    fs.writeFileSync(appPath, orig);
+    await page.waitForSelector(`${W} .scm-item:has-text("app.py")`, { state: 'detached' });
+  });
+
   await step('source control: merge conflicts can be staged but not discarded; staging several asks first', async () => {
     const W = '.workspace:not(.hidden)';
     const conf = `${W} .scm-section:has(.scm-section-title:text-is("Merge conflicts")) .scm-item`;
@@ -404,6 +449,7 @@ const G = {};
     await page.click(`${conf}:has-text("c1.txt")`, { button: 'right' });
     await page.waitForSelector('.menu-item span:text-is("Stage")');
     assert.equal(await page.locator('.menu-item:has-text("Discard")').count(), 0, 'no Discard in the menu');
+    assert.equal(await page.locator('.menu-item:has-text("Stash")').count(), 0, 'no Stash in the menu');
     await page.evaluate(() => import('/js/dialogs.js').then(m => m.closeMenu()));
     await page.click(`${conf}:has-text("c2.txt")`, { modifiers: ['Shift'] });
     assert.equal(await page.locator(`${conf}.selected`).count(), 2);
@@ -661,11 +707,11 @@ const G = {};
   await step('drag and drop files: from Explorer into a folder, within the Files panel, onto an editor pane and onto sessions', async () => {
     const W = '.workspace:not(.hidden)';
     const wt = await page.evaluate(() => window.skiffcode.active.root);
-    const drop = (sel, { files, internal, at } = {}) => page.evaluate(({ sel, files, internal, at }) => {
+    const drop = (sel, { files, internal, at } = {}) => page.evaluate(async ({ sel, files, internal, at }) => {
       const el = typeof sel === 'string' ? document.querySelector(sel) : sel;
       const dt = new DataTransfer();
       for (const f of files || []) dt.items.add(new File([f.text], f.name, { type: f.type || 'text/plain' }));
-      if (internal) { dt.setData('application/x-skiffcode-path', JSON.stringify(internal)); dt.setData('text/plain', internal.path); }
+      if (internal) (await import('/js/dnd.js')).startInternal({ dataTransfer: dt }, internal.root, internal);
       const r = el.getBoundingClientRect();
       const p = { clientX: r.left + r.width * (at ? at[0] : 0.5), clientY: r.top + r.height * (at ? at[1] : 0.5) };
       for (const type of ['dragenter', 'dragover', 'drop']) el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt, ...p }));
@@ -701,14 +747,29 @@ const G = {};
     await page.waitForFunction(p => (window.skiffcode.active.activeTab.term.text || '').includes(p), `${wt}/notes.txt`);
     // a Claude session gets @path (checked through the shell, which echoes what's typed)
     await page.evaluate(async () => {
-      const { dropOnTerminal } = await import('/js/dnd.js');
+      const { dropOnTerminal, startInternal } = await import('/js/dnd.js');
       const t = window.skiffcode.active.activeTab;
       const dt = new DataTransfer();
-      dt.setData('application/x-skiffcode-path', JSON.stringify({ root: t.ws.root, path: 'src/app.py', type: 'file' }));
+      startInternal({ dataTransfer: dt }, t.ws.root, { path: 'src/app.py', type: 'file' });
       const fake = { session: { id: t.sessionId, kind: 'claude' }, ws: t.ws, focus() {} };
       await dropOnTerminal(fake, new DragEvent('drop', { dataTransfer: dt }), null);
     });
     await page.waitForFunction(() => (window.skiffcode.active.activeTab.term.text || '').includes('@src/app.py'));
+    // a name with control characters (Ctrl+U, Enter) is refused, and a drag that didn't start here (another page) types nothing
+    await page.evaluate(async () => {
+      const { dropOnTerminal, startInternal } = await import('/js/dnd.js');
+      const t = window.skiffcode.active.activeTab;
+      const dt = new DataTransfer();
+      startInternal({ dataTransfer: dt }, t.ws.root, { path: 'x\x15echo ctl-pwned\r', type: 'file' });
+      await dropOnTerminal(t, new DragEvent('drop', { dataTransfer: dt }), null);
+      const foreign = new DataTransfer();
+      foreign.setData('application/x-skiffcode-path', JSON.stringify({ root: t.ws.root, path: 'foreign-drag.txt', type: 'file' }));
+      await dropOnTerminal(t, new DragEvent('drop', { dataTransfer: foreign }), null);
+    });
+    await page.waitForSelector('.toast >> text=control characters');
+    await page.waitForSelector('.toast >> text=Drag files within one SkiffCode window');
+    await sleep(300);
+    assert.ok(!/ctl-pwned|foreign-drag/.test(await page.evaluate(() => window.skiffcode.active.activeTab.term.text || '')), 'nothing typed');
     // from Explorer onto a session → saved under SkiffCode's drops folder, path typed
     await drop(shellSel, { files: [{ name: 'screen shot.png', text: 'PNG', type: 'image/png' }] });
     await page.waitForFunction(() => /\/drops\/\d{4}-\d\d-\d\d\/screen-shot\.png/.test(window.skiffcode.active.activeTab.term.text || ''));
@@ -1692,8 +1753,74 @@ const G = {};
     });
     assert.equal(await page.evaluate(() => window.skiffcode.active.dragTab || null), null);
     const root = await page.evaluate(() => window.skiffcode.active.root);
-    await dnd(`${W} .row-top .pane-body`, ['dragenter', 'dragover', 'drop'], { data: { [INTERNAL]: JSON.stringify({ root, path: 'src/site.css', type: 'file' }) }, at: [0.4, 0.4] });
+    const entry = { path: 'src/site.css', type: 'file' };
+    await page.evaluate(([r, e]) => import('/js/dnd.js').then(m => m.startInternal({ dataTransfer: new DataTransfer() }, r, e)), [root, entry]);
+    await dnd(`${W} .row-top .pane-body`, ['dragenter', 'dragover', 'drop'], { data: { [INTERNAL]: JSON.stringify({ root, ...entry }) }, at: [0.4, 0.4] });
     await page.waitForSelector(`${W} .row-top .tab.active >> text=site.css`);
+  });
+
+  await step('files: a file moved by dragging keeps its open tab and unsaved edits', async () => {
+    const W = '.workspace:not(.hidden)';
+    await freshMain();
+    fs.writeFileSync(path.join(repo, 'moved.txt'), 'one\n');
+    const r = await page.evaluate(async () => {
+      const ws = window.skiffcode.active;
+      const t = await ws.openFile('moved.txt');
+      t.entry.model.setValue('two\n');
+      await (await import('/js/dnd.js')).moveInto(ws, 'moved.txt', 'src');
+      return { path: t.path, text: t.entry.model.getValue(), dirty: t.dirty() };
+    });
+    assert.deepEqual(r, { path: 'src/moved.txt', text: 'two\n', dirty: true });
+    await sleep(300);
+    assert.equal(await page.locator(`${W} .editor-banner:not(.hidden)`).count(), 0, 'not "deleted on disk"');
+    await page.evaluate(() => window.skiffcode.active.activeTab.save());
+    assert.equal(fs.readFileSync(path.join(repo, 'src', 'moved.txt'), 'utf8'), 'two\n');
+    assert.ok(!fs.existsSync(path.join(repo, 'moved.txt')));
+    fs.rmSync(path.join(repo, 'src', 'moved.txt'));
+  });
+
+  await step('editor: typing while a reload reads the file keeps what you typed', async () => {
+    await freshMain();
+    await spySend();
+    const r = await page.evaluate(async () => {
+      const models = await import('/js/models.js');
+      const t = await window.skiffcode.active.openFile('src/app.py');
+      const e = t.entry;
+      window.__held = [];
+      window.__drop = m => m.method === 'fs.read' && !!window.__held.push(m);
+      const done = models.reload(e);
+      while (!window.__held.length) await new Promise(res => setTimeout(res, 10));
+      window.__drop = null;
+      e.model.setValue('typed during the read\n');
+      window.__ws.send(JSON.stringify(window.__held[0]));
+      await done;
+      const out = { text: e.model.getValue(), dirty: models.isDirty(e), conflict: e.conflict };
+      await models.reload(e, true);
+      return out;
+    });
+    assert.deepEqual(r, { text: 'typed during the read\n', dirty: true, conflict: false });
+  });
+
+  await step('editor: a file that is not UTF-8 opens read-only; a UTF-8 BOM is kept on save', async () => {
+    const W = '.workspace:not(.hidden)';
+    await freshMain();
+    fs.writeFileSync(path.join(repo, 'latin1.txt'), Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]));
+    fs.writeFileSync(path.join(repo, 'bom.txt'), Buffer.from('\ufeffhi\n'));
+    await page.evaluate(() => window.skiffcode.active.openFile('latin1.txt'));
+    await page.waitForSelector(`${W} .editor-banner:not(.hidden) >> text=isn’t UTF-8`);
+    assert.equal(await page.evaluate(() => !!window.skiffcode.active.activeTab.editor._opts.readOnly), true);
+    await page.evaluate(() => window.skiffcode.active.activeTab.save());
+    assert.deepEqual([...fs.readFileSync(path.join(repo, 'latin1.txt'))], [0x63, 0x61, 0x66, 0xe9, 0x0a], 'not overwritten');
+    const text = await page.evaluate(async () => {
+      const t = await window.skiffcode.active.openFile('bom.txt');
+      const before = t.entry.model.getValue();
+      t.entry.model.setValue('hi there\n');
+      await t.save();
+      return before;
+    });
+    assert.equal(text, 'hi\n');
+    assert.equal(fs.readFileSync(path.join(repo, 'bom.txt'), 'utf8'), '\ufeffhi there\n');
+    for (const f of ['latin1.txt', 'bom.txt']) fs.rmSync(path.join(repo, f));
   });
 
   await step('tabs: dropping a tab before a later one in the same pane puts it right before that tab', async () => {
@@ -2153,6 +2280,10 @@ const G = {};
     await page.click('.modal .btn >> text=Cancel');
     await sleep(200);
     assert.equal(await pasted(), 3);
+    // control characters are taken out: a pasted ESC [201~ would end bracketed paste early, and Ctrl+U would act as a key
+    await paste('x\x1b[201~\x15\x9becho ctl\tok');
+    await page.waitForFunction(() => window.__pasted.length === 4);
+    assert.equal(await page.evaluate(() => window.__pasted[3]), 'x[201~echo ctl\tok');
   });
 
   await step('sidebar: dragging a repo does not put text on the drag (a terminal would paste it)', async () => {
@@ -2522,6 +2653,21 @@ const G = {};
       return sent.filter(x => /\x1b\[\d+;\d+R/.test(x));
     }, id);
     assert.deepEqual(replies, [], 'no answers sent for queries in the saved output');
+    await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.forget', { id: i })), id);
+  });
+
+  await step('terminals: a Claude session that ended and runs again attaches again', async () => {
+    plan('SessionStart,hang');
+    await freshMain();
+    const id = await page.evaluate(p => import('/js/rpc.js').then(r => r.call('sessions.create', { kind: 'claude', worktreePath: p, name: 'rerun', cols: 80, rows: 24 })).then(x => x.id), repo);
+    const when = (cond, opts) => page.waitForFunction(new Function('i', `const t = window.skiffcode.active.find(x => x.kind === 'session' && x.sessionId === i); return !!t && (${cond});`), id, opts);
+    await page.waitForSelector('.session-row >> text=rerun');
+    await page.evaluate(i => { window.skiffcode.active.openSession(i); }, id);
+    await when('t.attached');
+    await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.stop', { id: i })), id);
+    await when('t.ended && t.session.state === "ended"');
+    await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.resume', { id: i, cols: 80, rows: 24 })), id);
+    await when('t.attached && !t.ended && t.banner.classList.contains("hidden")', { timeout: 5000 });
     await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.forget', { id: i })), id);
   });
 

@@ -38,6 +38,8 @@ export async function acquire(root, p) {
     }
     e.binary = !!r.binary;
     e.tooLarge = !!r.tooLarge;
+    e.notUtf8 = !!r.notUtf8;
+    e.bom = !!r.bom;
     e.mtime = r.mtime || 0;
     const uri = fileUri(root, p);
     e.model = monaco.editor.getModel(uri) || monaco.editor.createModel(r.text || '', languageOf(p), uri);
@@ -67,12 +69,12 @@ export function anyDirty() {
 }
 
 export async function save(e, { force = false } = {}) {
-  if (!e || e.binary || e.tooLarge) return false;
+  if (!e || e.binary || e.tooLarge || e.notUtf8) return false;
   // What is written, taken together: typing during the write must leave the file unsaved.
   const text = e.model.getValue();
   const version = e.model.getAlternativeVersionId();
   try {
-    const r = await call('fs.write', { root: e.root, path: e.path, text, mtime: e.mtime, force });
+    const r = await call('fs.write', { root: e.root, path: e.path, text, mtime: e.mtime, force, bom: e.bom });
     e.mtime = r.mtime;
     e.savedVersion = version;
     e.conflict = false;
@@ -103,7 +105,7 @@ export async function reload(e, discard = false) {
   await e.ready;
   if (!e.model || e.model.isDisposed()) return;
   const p = e.path;
-  const dirty = isDirty(e) && !discard;
+  const version = e.model.getAlternativeVersionId();
   let r;
   try {
     r = await call('fs.read', { root: e.root, path: p });
@@ -115,7 +117,8 @@ export async function reload(e, discard = false) {
   }
   if (e.path !== p || e.model.isDisposed()) return;
   e.missing = false;
-  if (dirty) {
+  // Typing during the read counts too: replacing the model now would drop those keys.
+  if (e.model.getAlternativeVersionId() !== version || (isDirty(e) && !discard)) {
     // Same mtime: the content on disk didn't change (a rename, your own save), so no conflict.
     if (r.mtime !== e.mtime) e.conflict = true;
     fire(e);
@@ -128,6 +131,8 @@ export async function reload(e, discard = false) {
   // pushEditOperations keeps undo history and the cursor where it was.
   e.model.pushEditOperations([], [{ range: e.model.getFullModelRange(), text: r.text }], () => null);
   e.mtime = r.mtime;
+  e.notUtf8 = !!r.notUtf8;
+  e.bom = !!r.bom;
   e.savedVersion = e.model.getAlternativeVersionId();
   e.conflict = false;
   fire(e);

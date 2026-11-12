@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const { spawn } = require('child_process');
-const { run, which, within, safeToDelete, realpath, isGitDir } = require('./util');
+const { run, which, within, safeToDelete, realpath, isGitDir, psQuote } = require('./util');
 const { isWSL, powershell } = require('./notify');
 
 const MAX_EDIT_SIZE = 8 * 1024 * 1024;
@@ -95,12 +95,32 @@ async function read(root, rel) {
   if (st.size > MAX_EDIT_SIZE) return { tooLarge: true, size: st.size, mtime: st.mtimeMs };
   const buf = await fs.promises.readFile(abs);
   const binary = buf.subarray(0, 8000).includes(0);
-  return { text: binary ? '' : buf.toString('utf8'), binary, size: st.size, mtime: st.mtimeMs };
+  if (binary) return { text: '', binary, size: st.size, mtime: st.mtimeMs };
+  // The decoder drops a BOM (write puts it back). Text that is not UTF-8 is lossy, for display only: write refuses it.
+  const res = { text: new TextDecoder().decode(buf), binary, size: st.size, mtime: st.mtimeMs };
+  if (hasBOM(buf)) res.bom = true;
+  if (!isUtf8(buf)) res.notUtf8 = true;
+  return res;
 }
 
-/** Write a file; refuses when it changed on disk since `expectMtime` (unless force). */
-async function write(root, rel, text, expectMtime, force) {
+const hasBOM = buf => buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf;
+function isUtf8(buf) {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(buf);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Write a file; refuses when it changed on disk since `expectMtime` (unless force), and always over a file
+ * that is not UTF-8, which the editor only shows lossily. `bom` puts back the UTF-8 BOM that read took off.
+ */
+async function write(root, rel, text, expectMtime, force, bom) {
   const abs = guard(root, rel);
+  const old = await fs.promises.stat(abs).then(st => (st.isFile() ? fs.promises.readFile(abs) : null), () => null);
+  if (old && !isUtf8(old)) throw new Error('This file isn’t UTF-8, so SkiffCode won’t overwrite it.');
   if (!force && expectMtime) {
     try {
       const st = await fs.promises.stat(abs);
@@ -114,7 +134,7 @@ async function write(root, rel, text, expectMtime, force) {
     }
   }
   await fs.promises.mkdir(path.dirname(abs), { recursive: true });
-  await fs.promises.writeFile(abs, text);
+  await fs.promises.writeFile(abs, bom ? `\uFEFF${text}` : text);
   return { mtime: (await fs.promises.stat(abs)).mtimeMs };
 }
 
@@ -164,16 +184,46 @@ async function remove(root, rel) {
 class Watcher {
   constructor(onChange) {
     this.onChange = onChange; // (absPath) => void
-    this.watchers = new Map(); // abs -> { w, refs }
+    this.watchers = new Map(); // abs -> { w, refs, ino, dir }
   }
   add(abs) {
     const e = this.watchers.get(abs);
     if (e) return void e.refs++;
+    const entry = { refs: 1 };
+    if (this.attach(abs, entry)) this.watchers.set(abs, entry);
+  }
+  attach(abs, entry) {
     try {
-      const w = fs.watch(abs, { persistent: false }, (_ev, name) => this.onChange(abs, name ? String(name) : undefined));
-      w.on('error', () => this.drop(abs));
-      this.watchers.set(abs, { w, refs: 1 });
-    } catch { /* gone */ }
+      const st = fs.statSync(abs);
+      const w = fs.watch(abs, { persistent: false }, (ev, name) => {
+        if (entry.w !== w) return;
+        this.onChange(abs, name ? String(name) : undefined);
+        if (ev === 'rename' || !entry.dir) this.follow(abs, entry, ev === 'rename' && !entry.dir);
+      });
+      w.on('error', () => { if (entry.w === w) this.drop(abs); });
+      const old = entry.w;
+      Object.assign(entry, { w, ino: st.ino, dir: st.isDirectory() });
+      if (old) try { old.close(); } catch { /* ignore */ }
+      return true;
+    } catch {
+      return false; // gone
+    }
+  }
+  /**
+   * A watch follows an inode, so it goes deaf once the path names a new file: a save by rename, or a delete
+   * and create (git checkout). Watch the new one then. On a file, 'rename' means its inode left the path, even
+   * if the new file got the same inode number; in a folder it is mostly an entry coming or going.
+   */
+  follow(abs, entry, left, tries = 0) {
+    if (this.watchers.get(abs) !== entry) return;
+    let ino;
+    try { ino = fs.statSync(abs).ino; } catch { /* not there (yet) */ }
+    if (!left && ino === entry.ino) return;
+    if (ino !== undefined && this.attach(abs, entry)) {
+      if (tries) this.onChange(abs); // it was gone: report the new file
+      return;
+    }
+    if (tries < 10) setTimeout(() => this.follow(abs, entry, true, tries + 1), 200).unref();
   }
   remove(abs) {
     const e = this.watchers.get(abs);
@@ -187,12 +237,6 @@ class Watcher {
     this.watchers.delete(abs);
   }
 }
-
-/**
- * A string for a PowerShell script in single quotes. PowerShell also treats the curly single quotes as
- * quotes, and a doubled quote is the only escape: this is what keeps a file name from ending the string.
- */
-const psQuote = s => `'${String(s).replace(/['\u2018\u2019\u201A\u201B]/g, q => q + q)}'`;
 
 /**
  * A PowerShell script that shows `windowsPath` in Explorer and brings the window to the front.

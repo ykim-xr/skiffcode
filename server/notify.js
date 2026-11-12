@@ -4,7 +4,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { which, run } = require('./util');
+const { which, run, psQuote } = require('./util');
 
 let wsl;
 function isWSL() {
@@ -37,8 +37,8 @@ function runPS(script) {
   quiet(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', enc], fs.existsSync('/mnt/c') ? '/mnt/c' : undefined);
 }
 
-const psq = s => String(s).replace(/'/g, "''");
-const xml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+// XML 1.0 forbids these characters: LoadXml would throw and the toast would be lost.
+const xml = s => String(s).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 let winSoundDir; // a promise of the Windows temp folder for sounds, or null
 function windowsSoundDir() {
@@ -81,7 +81,7 @@ function playFile(file, volume = 0.7) {
       runPS([
         'Add-Type -AssemblyName PresentationCore',
         '$p = New-Object System.Windows.Media.MediaPlayer',
-        `$p.Open([Uri]'${psq(win)}')`,
+        `$p.Open([Uri]${psQuote(win)})`,
         `$p.Volume = ${v.toFixed(2)}`,
         'Start-Sleep -Milliseconds 250',
         '$p.Play()',
@@ -96,16 +96,21 @@ function playFile(file, volume = 0.7) {
   if (which('aplay') && file.endsWith('.wav')) return quiet(which('aplay'), ['-q', file]);
 }
 
+/** The PowerShell script that shows a Windows toast. Session, branch and repo names end up in it. */
+function toastScript(title, body) {
+  const t = `<toast><visual><binding template="ToastGeneric"><text>${xml(title)}</text><text>${xml(body)}</text></binding></visual><audio silent="true"/></toast>`;
+  return [
+    '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null',
+    '[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null',
+    '$x = New-Object Windows.Data.Xml.Dom.XmlDocument',
+    `$x.LoadXml(${psQuote(t)})`,
+    "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))",
+  ].join('; ');
+}
+
 function desktopNotify(title, body) {
   if (isWSL()) {
-    const t = `<toast><visual><binding template="ToastGeneric"><text>${xml(title)}</text><text>${xml(body)}</text></binding></visual><audio silent="true"/></toast>`;
-    runPS([
-      '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null',
-      '[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null',
-      '$x = New-Object Windows.Data.Xml.Dom.XmlDocument',
-      `$x.LoadXml('${psq(t)}')`,
-      "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))",
-    ].join('; '));
+    runPS(toastScript(title, body));
     return;
   }
   const ns = which('notify-send');
@@ -129,4 +134,4 @@ function alertWithoutWindow({ session, kind, repoName, settings, muted, soundFil
   if (settings.desktopNotifications !== false) desktopNotify(title, body);
 }
 
-module.exports = { alertWithoutWindow, playFile, desktopNotify, isWSL, powershell };
+module.exports = { alertWithoutWindow, playFile, desktopNotify, toastScript, isWSL, powershell };

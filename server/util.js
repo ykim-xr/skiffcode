@@ -162,4 +162,10 @@ async function pool(items, limit, fn) {
   return out;
 }
 
-module.exports = { run, shq, skiffcodeHome, writeFileAtomic, writeFileReplacing, privateDir, which, userShell, realpath, isGitDir, TERM_SIZE, within, safeToDelete, pool };
+/**
+ * A string for a PowerShell script in single quotes. PowerShell also treats the curly single quotes as
+ * quotes, and a doubled quote is the only escape: this is what keeps a file name from ending the string.
+ */
+const psQuote = s => `'${String(s).replace(/['\u2018\u2019\u201A\u201B]/g, q => q + q)}'`;
+
+module.exports = { run, shq, psQuote, skiffcodeHome, writeFileAtomic, writeFileReplacing, privateDir, which, userShell, realpath, isGitDir, TERM_SIZE, within, safeToDelete, pool };

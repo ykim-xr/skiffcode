@@ -378,7 +378,58 @@ function startServer() {
     await assert.rejects(c.call('fs.read', { root: '/etc', path: 'passwd' }), /doesn’t know|Not a worktree/);
   });
 
-  await step('symlinks: only into folders SkiffCode knows; deleting a link keeps its target; `..name` files; FIFOs', async () => {
+  await step('files: a file that is not UTF-8 is never saved over; a UTF-8 BOM is kept', async () => {
+    const d = path.join(tmp, 'code', 'encodings');
+    fs.mkdirSync(d);
+    await c.call('repos.add', { path: d });
+    const cp949 = Buffer.from([0x68, 0x69, 0x20, 0xc7, 0xd1, 0xb1, 0xdb, 0x0a]); // "hi 한글" in CP949
+    fs.writeFileSync(path.join(d, 'kr.txt'), cp949);
+    const kr = await c.call('fs.read', { root: d, path: 'kr.txt' });
+    assert.equal(kr.notUtf8, true);
+    assert.ok(kr.text.startsWith('hi '), 'still shown');
+    for (const force of [false, true]) {
+      await assert.rejects(c.call('fs.write', { root: d, path: 'kr.txt', text: kr.text + 'x', mtime: kr.mtime, force }), /isn’t UTF-8/);
+    }
+    assert.ok(fs.readFileSync(path.join(d, 'kr.txt')).equals(cp949), 'bytes unchanged');
+    fs.writeFileSync(path.join(d, 'bom.txt'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('a\n')]));
+    const b = await c.call('fs.read', { root: d, path: 'bom.txt' });
+    assert.deepEqual([b.text, b.bom, b.notUtf8], ['a\n', true, undefined]);
+    await c.call('fs.write', { root: d, path: 'bom.txt', text: 'b\n', mtime: b.mtime, bom: b.bom });
+    assert.deepEqual([...fs.readFileSync(path.join(d, 'bom.txt'))], [0xef, 0xbb, 0xbf, 0x62, 0x0a]);
+    assert.equal((await c.call('fs.read', { root: d, path: 'bom.txt' })).bom, true);
+    await c.call('repos.remove', { path: d });
+  });
+
+  await step('file watches: a watched file replaced again and again keeps reporting', async () => {
+    const d = path.join(tmp, 'code', 'replaced');
+    fs.mkdirSync(d);
+    await c.call('repos.add', { path: d });
+    const f = path.join(d, 'f.txt');
+    fs.writeFileSync(f, '0');
+    await c.call('fs.watch', { root: d, path: 'f.txt' });
+    const changed = () => c.events.some(e => e.event === 'fs.changed' && e.data.root === d && e.data.path === 'f.txt');
+    for (const n of [1, 2, 3]) {
+      await sleep(200);
+      c.events.length = 0;
+      fs.writeFileSync(`${f}.tmp`, String(n));
+      fs.renameSync(`${f}.tmp`, f); // how editors and git replace a file: a new inode
+      await until(changed, `change ${n} reported`, 3000);
+    }
+    await sleep(200);
+    c.events.length = 0;
+    fs.rmSync(f);
+    await sleep(50);
+    fs.writeFileSync(f, 'again'); // deleted and made again, as git checkout does
+    await until(changed, 'the remade file reported', 3000);
+    await sleep(200);
+    c.events.length = 0;
+    fs.appendFileSync(f, '!');
+    await until(changed, 'an edit of the remade file reported', 3000);
+    await c.call('fs.unwatch', { root: d, path: 'f.txt' });
+    await c.call('repos.remove', { path: d });
+  });
+
+  await step('symlinks:only into folders SkiffCode knows; deleting a link keeps its target; `..name` files; FIFOs', async () => {
     const outside = path.join(tmp, 'outside');
     fs.mkdirSync(outside, { recursive: true });
     fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret');
@@ -514,6 +565,25 @@ function startServer() {
     assert.deepEqual(s.staged.map(x => x.path), ['src/app.py']);
     await c.call('git.discard', { root: wt, files: ['new.txt'] });
     assert.ok(!fs.existsSync(path.join(wt, 'new.txt')), 'discarding an untracked file deletes it');
+    {
+      // names that look like pathspec magic or globs name only themselves
+      const d = path.join(tmp, 'code', 'pathspecs');
+      fs.mkdirSync(d);
+      const names = [':!x', 'f[1].txt', 'f1.txt', 'other.txt'];
+      for (const n of names) fs.writeFileSync(path.join(d, n), 'old\n');
+      sh('git init -q -b main && git config user.email t@t && git config user.name t && git add -A && git commit -qm x', d);
+      for (const n of names) fs.writeFileSync(path.join(d, n), 'new\n');
+      await c.call('repos.add', { path: d });
+      const list = args => sh(`git diff ${args} --name-only`, d).split('\n').filter(Boolean).sort();
+      await c.call('git.discard', { root: d, files: [':!x'] });
+      assert.deepEqual(list(''), ['f1.txt', 'f[1].txt', 'other.txt'], 'discard: only that file');
+      await c.call('git.stage', { root: d, files: ['f[1].txt'] });
+      assert.deepEqual(list('--cached'), ['f[1].txt'], 'stage: only that file');
+      await c.call('git.stage', { root: d, files: ['f1.txt'] });
+      await c.call('git.unstage', { root: d, files: ['f[1].txt'] });
+      assert.deepEqual(list('--cached'), ['f1.txt'], 'unstage: only that file');
+      await c.call('repos.remove', { path: d });
+    }
     await assert.rejects(c.call('git.commit', { root: wt, message: '  ' }), /message/);
     await c.call('git.commit', { root: wt, message: 'greet callers\n\nlonger body' });
     fs.writeFileSync(path.join(wt, 'README.md'), 'line1\nline2 changed\n');
@@ -541,6 +611,129 @@ function startServer() {
     assert.equal(stt.ahead, 1);
     assert.equal(stt.dirty, 1);
     assert.ok(stt.insertions >= 2);
+  });
+
+  await step('git: stash modes, files, apply/pop, drop by sha, stale-list guard, conflicts', async () => {
+    const made = await c.call('worktrees.create', { repo, newBranch: 'stash-t', base: 'main', startClaude: false });
+    const sw = made.path;
+    const W = f => path.join(sw, f);
+    const list = async () => (await c.call('git.stashList', { root: sw })).stashes;
+    const isClean = async () => { const s = await c.call('git.status', { root: sw }); return s.changes.length + s.staged.length + s.untracked.length === 0; };
+    const stash = (mode, extra) => c.call('git.stash', { root: sw, mode, ...extra });
+    assert.deepEqual(await list(), []);
+
+    // all: a tracked edit plus an untracked file, with a message
+    fs.writeFileSync(W('README.md'), 'line1\nline2\nline3\n');
+    fs.writeFileSync(W('fresh.txt'), 'brand new\n');
+    assert.deepEqual(await stash('all', { message: ' my stash ' }), { stashed: true });
+    assert.ok(await isClean(), 'stash all leaves a clean worktree, untracked files included');
+    let st = await list();
+    assert.equal(st.length, 1);
+    assert.deepEqual([st[0].index, st[0].message, st[0].branch], [0, 'my stash', 'stash-t']);
+    assert.match(st[0].sha, /^[0-9a-f]{40,64}$/);
+    const sha1 = st[0].sha;
+
+    // files: tracked with counts, untracked flagged and readable at ^3
+    const sf = await c.call('git.stashFiles', { root: sw, sha: sha1 });
+    assert.equal(sf.base, sh('git rev-parse HEAD', sw).trim());
+    const byPath = Object.fromEntries(sf.files.map(f => [f.path, f]));
+    assert.deepEqual([byPath['README.md'].status, byPath['README.md'].added, byPath['README.md'].deleted], ['M', 1, 0]);
+    assert.deepEqual([byPath['fresh.txt'].status, byPath['fresh.txt'].untracked], ['A', true]);
+    assert.equal((await c.call('git.show', { root: sw, ref: `${sha1}^3`, path: 'fresh.txt' })).text, 'brand new\n');
+
+    // apply keeps the stash and restores the files; pop removes it
+    const applied = await c.call('git.stashApply', { root: sw, sha: sha1 });
+    assert.equal(applied.conflicts, false);
+    assert.equal(fs.readFileSync(W('fresh.txt'), 'utf8'), 'brand new\n');
+    assert.equal((await list()).length, 1, 'apply keeps the stash');
+    sh('git reset -q --hard && git clean -fdq', sw);
+    assert.equal((await c.call('git.stashApply', { root: sw, sha: sha1, pop: true })).conflicts, false);
+    assert.equal(fs.readFileSync(W('README.md'), 'utf8'), 'line1\nline2\nline3\n');
+    assert.deepEqual(await list(), [], 'pop removes the stash');
+    sh('git reset -q --hard && git clean -fdq', sw);
+
+    // modes stash only what they should
+    const cases = [
+      { mode: 'tracked', left: ['u.txt'], gone: ['README.md'] },
+      { mode: 'staged', left: ['u.txt', 'src/site.css'], gone: ['README.md'] },
+      { mode: 'files', files: ['src/site.css', 'u.txt'], left: ['README.md'], gone: ['src/site.css', 'u.txt'] },
+    ];
+    for (const k of cases) {
+      fs.writeFileSync(W('README.md'), `edit for ${k.mode}\n`);
+      fs.writeFileSync(W('src/site.css'), `.a { color: ${k.mode}; }\n`);
+      fs.writeFileSync(W('u.txt'), 'untracked\n');
+      if (k.mode === 'staged') sh('git add README.md', sw); else if (k.mode === 'tracked') sh('git checkout -q -- src/site.css', sw);
+      const before = (await list()).length;
+      assert.deepEqual(await stash(k.mode, k.files ? { files: k.files } : {}), { stashed: true }, k.mode);
+      assert.equal((await list()).length, before + 1, k.mode);
+      const s = await c.call('git.status', { root: sw });
+      const left = [...s.changes, ...s.staged, ...s.untracked].map(x => x.path);
+      for (const f of k.left) assert.ok(left.includes(f), `${k.mode}: ${f} stays`);
+      for (const f of k.gone) assert.ok(!left.includes(f), `${k.mode}: ${f} is stashed`);
+      if (k.mode === 'files') assert.equal(fs.readFileSync(W('README.md'), 'utf8'), `edit for files\n`);
+      sh('git reset -q --hard && git clean -fdq', sw);
+    }
+    assert.equal((await list()).length, 3);
+    // file names are literal paths, not globs
+    fs.writeFileSync(W('f[1].txt'), 'bracket\n');
+    fs.writeFileSync(W('f1.txt'), 'plain\n');
+    await stash('files', { files: ['f[1].txt'] });
+    assert.ok(fs.existsSync(W('f1.txt')) && !fs.existsSync(W('f[1].txt')), 'only the named file is stashed');
+    const lit = (await list())[0];
+    assert.deepEqual((await c.call('git.stashFiles', { root: sw, sha: lit.sha })).files.map(f => f.path), ['f[1].txt']);
+    await c.call('git.stashDrop', { root: sw, sha: lit.sha });
+    sh('git clean -fdq', sw);
+    // nothing to stash; --staged with nothing staged
+    assert.deepEqual(await stash('all'), { stashed: false });
+    fs.writeFileSync(W('README.md'), 'unstaged only\n');
+    assert.deepEqual(await stash('staged'), { stashed: false });
+    sh('git reset -q --hard', sw);
+    await assert.rejects(stash('bogus'), /mode/i);
+    await assert.rejects(stash('files', { files: [] }), /files/i);
+
+    // drop by sha removes exactly that stash, even when it is not stash@{0}
+    st = await list();
+    const [top, mid, last] = st;
+    await c.call('git.stashDrop', { root: sw, sha: mid.sha });
+    assert.deepEqual((await list()).map(s => s.sha), [top.sha, last.sha]);
+    // a sha no longer in the list is refused and nothing changes
+    for (const call of [
+      () => c.call('git.stashDrop', { root: sw, sha: mid.sha }),
+      () => c.call('git.stashApply', { root: sw, sha: mid.sha, pop: true }),
+    ]) {
+      await assert.rejects(call(), /stash list changed/);
+      assert.deepEqual((await list()).map(s => s.sha), [top.sha, last.sha]);
+    }
+    // clear refuses a stale list, then clears the current one
+    await assert.rejects(c.call('git.stashClear', { root: sw, shas: [top.sha] }), /stash list changed/);
+    assert.equal((await list()).length, 2);
+    await c.call('git.stashClear', { root: sw, shas: [top.sha, last.sha] });
+    assert.deepEqual(await list(), []);
+
+    // pop with a conflict keeps the stash
+    fs.writeFileSync(W('README.md'), 'line1\nstashed side\n');
+    await stash('all');
+    fs.writeFileSync(W('README.md'), 'line1\ncommitted side\n');
+    sh('git commit -qam other', sw);
+    const [kept] = await list();
+    const res = await c.call('git.stashApply', { root: sw, sha: kept.sha, pop: true });
+    assert.equal(res.conflicts, true);
+    assert.match(res.output, /CONFLICT/);
+    assert.deepEqual((await list()).map(s => s.sha), [kept.sha], 'a conflicted pop keeps the stash');
+    sh('git reset -q --hard && git clean -fdq', sw);
+    await c.call('git.stashDrop', { root: sw, sha: kept.sha });
+    assert.deepEqual(await list(), []);
+
+    // a sha that is really an option is refused everywhere
+    const bad = '--output=x';
+    for (const [m, extra] of [['git.stashFiles', {}], ['git.stashApply', {}], ['git.stashApply', { pop: true }], ['git.stashDrop', {}]]) {
+      await assert.rejects(c.call(m, { root: sw, sha: bad, ...extra }), /Not a valid stash/, m);
+    }
+    await assert.rejects(c.call('git.stashClear', { root: sw, shas: [bad] }), /Not a valid stash/);
+    await assert.rejects(c.call('git.stashClear', { root: sw, shas: [] }), /Not a valid stash list/);
+    assert.ok(!fs.existsSync(W('x')) && !fs.existsSync(path.join(sw, '--output=x')));
+
+    await c.call('worktrees.remove', { repo, path: sw, deleteBranch: true, forceBranch: true });
   });
 
   await step('push / pull against a local remote', async () => {
@@ -1288,6 +1481,24 @@ function startServer() {
     await assert.rejects(c.call('fs.reveal', { cwd: wt, path: 'no/such/file.txt' }), /Not found: no\/such\/file\.txt/);
     await assert.rejects(c.call('fs.reveal', { cwd: '/etc', path: '/etc/passwd' }), /Not a worktree/);
     await assert.rejects(c.call('fs.reveal', { cwd: wt, path: '' }), /Bad path/);
+  });
+
+  await step('desktop toast on Windows: quotes in session, branch or repo names stay inside the string', async () => {
+    const { toastScript } = require('../server/notify'); // pure: starts nothing
+    const name = "x’);calc;(’ ‘a’ 'b' ‚c‛";
+    const script = toastScript(`${name} finished`, `${name} — open SkiffCode`);
+    // read the LoadXml argument the way PowerShell does: any of these quotes ends it unless doubled
+    const Q = "'‘’‚‛";
+    let i = script.indexOf('$x.LoadXml(') + '$x.LoadXml('.length;
+    assert.ok(Q.includes(script[i]), 'a quoted string');
+    let text = '';
+    for (i++; i < script.length; i++) {
+      if (!Q.includes(script[i])) text += script[i];
+      else if (Q.includes(script[i + 1])) text += script[++i];
+      else break;
+    }
+    assert.equal(script[i + 1], ')', 'the string ends where LoadXml does');
+    assert.ok(text.includes(`<text>${name} finished</text><text>${name} — open SkiffCode</text>`), text);
   });
 
   await step('delete a session completely: its Claude conversation is gone from /resume; folders can be purged', async () => {

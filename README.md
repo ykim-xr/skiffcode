@@ -22,6 +22,7 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 - **Instant switching**: each worktree keeps its own tabs, splits, terminals and bottom panel
 - New worktree from any base branch with your branch name, or one command: `skiffcode new`
 - Stage, discard, commit, push / pull (Ctrl/Shift+click selects several changed files), editable diffs, review vs base; commits expand to their files; a History pane below lists the whole branch log
+- **Stash** all, tracked or staged changes, or just the files you pick, with an optional message; a Stashes section lists every stash with its files and diffs, and applies, pops or drops it
 - Plain folders work too (no git); `git init` there and git features turn on
 
 **Editor and app**

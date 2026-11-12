@@ -826,9 +826,9 @@ const api = {
       clearTimeout(timer);
     }
   },
-  async 'fs.write'({ root, path: p, text, mtime, force }) {
+  async 'fs.write'({ root, path: p, text, mtime, force, bom }) {
     const r = rootOf(root);
-    const res = await fsops.write(r, p, text, mtime, force);
+    const res = await fsops.write(r, p, text, mtime, force, !!bom);
     gitChanged(r);
     return res;
   },
@@ -918,6 +918,28 @@ const api = {
   },
   async 'git.push'({ root }) { const r = rootOf(root); const out = await git.push(r); gitChanged(r); return { output: out }; },
   async 'git.pull'({ root }) { const r = rootOf(root); const out = await git.pull(r); gitChanged(r); broadcast('fs.changed', { root: r, path: null }); return { output: out }; },
+  async 'git.stashList'({ root }) {
+    const r = rootOf(root);
+    if (!isGitDir(r)) return { stashes: [] };
+    return { stashes: await git.stashList(r) };
+  },
+  async 'git.stashFiles'({ root, sha }) { return git.stashFiles(rootOf(root), sha); },
+  async 'git.stash'({ root, mode, message, files }) {
+    const r = rootOf(root);
+    try { return await git.stashPush(r, { mode, message, files }); } finally { gitChanged(r); broadcast('fs.changed', { root: r, path: null }); }
+  },
+  async 'git.stashApply'({ root, sha, pop }) {
+    const r = rootOf(root);
+    try { return await git.stashApply(r, sha, !!pop); } finally { gitChanged(r); broadcast('fs.changed', { root: r, path: null }); }
+  },
+  async 'git.stashDrop'({ root, sha }) {
+    const r = rootOf(root);
+    try { await git.stashDrop(r, sha); return {}; } finally { gitChanged(r); }
+  },
+  async 'git.stashClear'({ root, shas }) {
+    const r = rootOf(root);
+    try { await git.stashClear(r, shas); return {}; } finally { gitChanged(r); }
+  },
 
   // search
   async 'search.files'({ root }) { return search.files(rootOf(root)); },

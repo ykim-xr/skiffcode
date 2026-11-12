@@ -4,7 +4,7 @@
 import { h, icon, clear, basename, dirname, relTime, readStored, dirtyCount, STATUS_LETTER, STATUS_LABEL } from './util.js';
 import { call, on } from './rpc.js';
 import { store, loadStatus } from './store.js';
-import { confirmDialog, toast, outputDialog, contextMenu } from './dialogs.js';
+import { confirmDialog, promptDialog, toast, outputDialog, contextMenu } from './dialogs.js';
 
 const HISTORY_PAGE = 50;
 const HISTORY_HEIGHT_KEY = 'skiffcode.scmHistoryHeight';
@@ -42,6 +42,11 @@ export class ScmView {
         h('span.view-title', 'Source control'),
         h('button.icon-btn.scm-sync', { title: 'Pull', onclick: () => this.sync('pull') }, icon('pull')),
         h('button.icon-btn.scm-sync', { title: 'Push', onclick: () => this.sync('push') }, icon('push')),
+        h('button.icon-btn.scm-sync', { title: 'Stash', onclick: e => contextMenu(e, [
+          { label: 'Stash all changes', action: () => this.stashPush('all') },
+          { label: 'Stash tracked changes only', action: () => this.stashPush('tracked') },
+          { label: 'Stash staged changes', action: () => this.stashPush('staged') },
+        ]) }, icon('stash')),
         h('button.icon-btn', { title: 'Refresh', onclick: () => this.refresh() }, icon('refresh'))),
       h('div.scm-top',
         this.header,
@@ -63,6 +68,9 @@ export class ScmView {
     this.sectionPaths = {}; // section id -> file paths in display order
     this.openCommits = new Set(); // commits expanded to show their files
     this.commitFiles = new Map(); // sha -> { files, parent } | 'loading' | { error }
+    this.stashes = [];
+    this.openStashes = new Set(); // stashes (by sha) expanded to show their files
+    this.stashFiles = new Map(); // sha -> { files, base } | 'loading' | { error }
     this.off = on('git.changed', e => { if (e.root === this.ws.root) this.refreshSoon(); });
   }
 
@@ -81,14 +89,16 @@ export class ScmView {
   async refresh() {
     const root = this.ws.root;
     try {
-      const [s, commits, st, hist] = await Promise.all([
+      const [s, commits, st, hist, stashes] = await Promise.all([
         call('git.status', { root }),
         call('git.commits', { root }).catch(() => ({ commits: [] })),
         loadStatus(root, true),
         // reload as many as are showing so an expanded list doesn't snap back
         call('git.log', { root, skip: 0, max: Math.max(HISTORY_PAGE, this.hist.commits.length) }).catch(() => ({ commits: [], more: false })),
+        call('git.stashList', { root }).catch(() => ({ stashes: [] })),
       ]);
       this.status = s;
+      this.stashes = stashes.stashes;
       this.hist = hist;
       this.setCount(dirtyCount(s));
       this.render(s, commits, st || store.status.get(root));
@@ -134,6 +144,13 @@ export class ScmView {
       changes.length ? h('button.icon-btn', { title: 'Discard all', onclick: () => this.discard(changes.map(f => f.path)) }, icon('refresh')) : null,
       changes.length ? h('button.icon-btn', { title: 'Stage all', onclick: () => this.run('git.stageAll') }, icon('plus')) : null,
     ]));
+    if (this.stashes.length) {
+      sections.push(h('div.scm-section',
+        this.sectionHead('stashes', 'Stashes', [
+          h('button.icon-btn', { title: 'Drop all stashes', onclick: () => this.stashClear() }, icon('trash')),
+        ], this.stashes.length),
+        this.collapsed.has('stashes') ? null : h('div', this.stashes.flatMap(st => this.stashRows(st)))));
+    }
 
     // Branch overview
     const branch = [];
@@ -288,6 +305,108 @@ export class ScmView {
     });
   }
 
+  /** A stash: click to show/hide its files; click a file for its diff against the commit the stash was made on. */
+  stashRows(st) {
+    const open = this.openStashes.has(st.sha);
+    const row = h(`div.scm-item.commit-item${open ? '.open' : ''}`, {
+      title: `${st.message}\n${st.ref} · ${st.branch || 'no branch'}\nClick to show the files it holds`,
+      onclick: () => this.toggleStash(st),
+      oncontextmenu: e => contextMenu(e, [
+        { label: 'Apply', action: () => this.stashApply(st, false) },
+        { label: 'Pop', action: () => this.stashApply(st, true) },
+        { label: 'Drop', icon: 'trash', danger: true, action: () => this.stashDrop(st) },
+        { separator: true },
+        { label: open ? 'Hide files' : 'Show files', action: () => this.toggleStash(st) },
+      ]),
+    },
+    icon(open ? 'chevronDown' : 'chevronRight', 'twisty'),
+    icon('stash'), h('span.scm-name', st.message),
+    h('span.scm-dir', `${st.ref} · ${st.branch || 'no branch'} · ${relTime(st.time)}`));
+    if (!open) return [row];
+    const info = this.stashFiles.get(st.sha);
+    if (!info || info === 'loading') return [row, h('div.muted.commit-file.pad-s', 'Loading…')];
+    if (info.error) return [row, h('div.error.commit-file.pad-s', info.error)];
+    if (!info.files.length) return [row, h('div.muted.commit-file.pad-s', 'No file changes.')];
+    return [row, ...info.files.map(f => {
+      const letter = STATUS_LETTER(f.status);
+      return h(`div.scm-item.commit-file.g-${letter}`, {
+        title: `${f.path}${f.oldPath ? ` (from ${f.oldPath})` : ''} — ${f.untracked ? 'Untracked' : STATUS_LABEL[f.status] || f.status} in ${st.ref}`,
+        onclick: () => this.openStashFile(st, info, f),
+      },
+      icon('file', 'file-type'),
+      h('span.scm-name', basename(f.path)),
+      h('span.scm-dir', dirname(f.path)),
+      typeof f.added === 'number' ? h('span.commit-stat', h('span.add', `+${f.added}`), ' ', h('span.del', `−${f.deleted}`)) : null,
+      h('span.git-letter', f.untracked ? 'U' : letter));
+    })];
+  }
+
+  async toggleStash(st) {
+    if (this.openStashes.has(st.sha)) this.openStashes.delete(st.sha);
+    else {
+      this.openStashes.add(st.sha);
+      if (!this.stashFiles.has(st.sha) || this.stashFiles.get(st.sha).error) {
+        this.stashFiles.set(st.sha, 'loading');
+        this.rerender();
+        try {
+          this.stashFiles.set(st.sha, await call('git.stashFiles', { root: this.ws.root, sha: st.sha }));
+        } catch (e) {
+          this.stashFiles.set(st.sha, { error: e.message });
+        }
+      }
+    }
+    this.rerender();
+  }
+
+  openStashFile(st, info, f) {
+    this.ws.openDiff({
+      path: f.path,
+      oldPath: f.oldPath,
+      left: f.untracked || f.status === 'A' ? null : { ref: info.base },
+      right: f.status === 'D' ? null : { ref: f.untracked ? `${st.sha}^3` : st.sha },
+      label: `${st.ref} ${st.sha.slice(0, 7)}`,
+    });
+  }
+
+  /** Runs a stash call; whatever the outcome, the tree or the stash list may have changed, so it ends with a refresh. */
+  async stashCall(method, args, failTitle) {
+    try {
+      return await call(method, { root: this.ws.root, ...args });
+    } catch (e) {
+      toast(failTitle, { kind: 'error', timeout: 0, actions: [{ label: 'Details', action: () => outputDialog(failTitle, e.message) }] });
+    } finally {
+      this.refresh();
+    }
+  }
+
+  async stashPush(mode, files) {
+    const message = await promptDialog({ title: 'Stash message', placeholder: 'Optional', okLabel: 'Stash', validate: () => undefined });
+    if (message === undefined) return;
+    const r = await this.stashCall('git.stash', { mode, files, message }, 'git stash failed');
+    if (!r) return;
+    toast(r.stashed ? 'Stashed.' : 'No local changes to stash.', r.stashed ? { icon: 'check', timeout: 3000 } : { timeout: 4000 });
+  }
+
+  async stashApply(st, pop) {
+    const r = await this.stashCall('git.stashApply', { sha: st.sha, pop }, `git stash ${pop ? 'pop' : 'apply'} failed`);
+    if (!r) return;
+    if (r.conflicts) toast('Applied with conflicts. The stash was kept.', { kind: 'error', timeout: 0, actions: [{ label: 'Details', action: () => outputDialog('git stash', r.output) }] });
+    else toast(pop ? 'Popped.' : 'Applied.', { icon: 'check', timeout: 3000 });
+  }
+
+  async stashDrop(st) {
+    const ok = await confirmDialog({ title: `Drop ${st.ref}?`, detail: 'This can’t be undone.', buttons: [{ label: 'Drop', value: true, danger: true }] });
+    if (!ok) return;
+    await this.stashCall('git.stashDrop', { sha: st.sha }, 'git stash drop failed');
+  }
+
+  async stashClear() {
+    const shas = this.stashes.map(s => s.sha);
+    const ok = await confirmDialog({ title: `Drop all ${shas.length} stash${shas.length === 1 ? '' : 'es'}?`, detail: 'This can’t be undone.', buttons: [{ label: 'Drop all', value: true, danger: true }] });
+    if (!ok) return;
+    await this.stashCall('git.stashClear', { shas }, 'git stash clear failed');
+  }
+
   rerender() {
     if (this.last) this.render(...this.last);
   }
@@ -339,6 +458,7 @@ export class ScmView {
           { label: 'Open diff', icon: 'diff', action: () => this.openDiff(f, staged, conflict) },
           f.status !== 'D' ? { label: 'Open file', icon: 'file', action: () => this.ws.openFile(f.path) } : null,
           { separator: true },
+          !conflict ? { label: `Stash${many}`, action: () => this.stashPush('files', t) } : null,
           staged ? { label: `Unstage${many}`, action: () => this.run('git.unstage', t) } : { label: `Stage${many}`, action: () => this.stage(t, conflict) },
           !staged && !conflict ? { label: many ? `Discard${many}` : 'Discard changes', icon: 'refresh', danger: true, action: () => this.discard(t) } : null,
         ]);
