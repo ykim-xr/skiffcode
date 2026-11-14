@@ -1001,7 +1001,7 @@ const VIEW_TYPES = {
 const viewKey = root => crypto.createHmac('sha256', TOKEN).update(`view:${root}`).digest('hex').slice(0, 32);
 // Files outside the worktrees (a report in /tmp, a build folder…), opened from a path you clicked:
 // key -> { root: its folder, only: the one file, unless it is a page that needs its neighbours (CSS, images)
-// and the folder isn't too broad to share (/, ~, a drive) }
+// and the folder isn't too broad to share (/, ~, the temp folder, a drive) }
 const externalViews = new Map();
 const encodeRel = rel => rel.split('/').map(encodeURIComponent).join('/');
 
@@ -1022,13 +1022,24 @@ function knownRootOf(abs) {
   for (const r of knownRoots) if ((abs === r || within(r, abs)) && (!best || r.length > best.length)) best = r;
   return best;
 }
+// fs.viewUrl resolves links first: home may be reached through one, and macOS keeps the temp folders under /private.
+const TMP_REAL = realpath(os.tmpdir()), HOME_REAL = realpath(os.homedir());
+/** Too broad to share as a whole: /, a top-level folder, home, the temp folder, a drive. */
+function broadFolder(dir) {
+  const mac = process.platform === 'darwin';
+  // macOS: /tmp, /var and /etc are links into /private
+  const d = mac ? dir.replace(/^\/private(?=\/)/, '') : dir;
+  return d.split('/').filter(Boolean).length < 2 || dir === os.homedir() || dir === HOME_REAL || dir === TMP_REAL
+    || /^\/mnt\/[a-z]\/Users\/[^/]+$/i.test(dir)
+    // a disk, and the per-user temp folders (the server's own TMPDIR may not point there)
+    || (mac && /^\/(Volumes\/[^/]+|private\/var\/folders\/[^/]+\/[^/]+\/[^/]+)$/.test(dir));
+}
 /** A /view URL for any file: inside a worktree via its key, otherwise its own folder (or just the file). */
 function viewUrlFor(abs) {
   const root = knownRootOf(abs);
   if (root) return `/view/${viewKey(root)}/${encodeRel(path.relative(root, abs).split(path.sep).join('/'))}`;
   const dir = path.dirname(abs);
-  const broad = dir.split('/').filter(Boolean).length < 2 || dir === os.homedir() || /^\/mnt\/[a-z]\/Users\/[^/]+$/i.test(dir);
-  const only = broad || !/\.html?$/i.test(abs) ? path.basename(abs) : null;
+  const only = broadFolder(dir) || !/\.html?$/i.test(abs) ? path.basename(abs) : null;
   const key = viewKey(`external:${dir}:${only || ''}`);
   externalViews.set(key, { root: dir, only });
   return `/view/${key}/${encodeRel(path.basename(abs))}`;

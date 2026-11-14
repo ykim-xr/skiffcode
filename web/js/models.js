@@ -101,7 +101,13 @@ export async function save(e, { force = false } = {}) {
 }
 
 /** Reload from disk; keeps your edits unless `discard`. */
-export async function reload(e, discard = false) {
+export function reload(e, discard = false) {
+  // One at a time: a second read in flight would take the first one's update for typing.
+  const run = (e.reloading || Promise.resolve()).then(() => reloadNow(e, discard));
+  e.reloading = run.catch(() => {});
+  return run;
+}
+async function reloadNow(e, discard) {
   await e.ready;
   if (!e.model || e.model.isDisposed()) return;
   const p = e.path;

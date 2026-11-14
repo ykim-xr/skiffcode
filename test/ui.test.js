@@ -273,6 +273,36 @@ const G = {};
     await closeExt();
   });
 
+  await step('a file changed on disk: overlapping reloads of a clean file show no banner', async () => {
+    await spySend();
+    await openExt('one\n');
+    const hold = () => page.evaluate(() => { window.__drop = m => m.method === 'fs.read' && m.params.path === 'src/ext.txt' && !!window.__held.push(m); });
+    const unhold = () => page.evaluate(() => { window.__drop = null; });
+    try {
+      await page.evaluate(() => { window.__held = []; });
+      await hold();
+      fs.writeFileSync(extPath, 'two\n');
+      await page.waitForFunction(() => window.__held.length > 0);
+      await sleep(300);
+      await unhold();
+      // Not awaited: with reloads one at a time it waits for the held read.
+      await page.evaluate(`import('/js/models.js').then(m => { void m.reload(${extTab}.entry); })`);
+      await sleep(300);
+      await hold();
+      const t = new Date(Date.now() - 3600e3);
+      fs.utimesSync(extPath, t, t);
+      await sleep(300);
+      await unhold();
+      await page.evaluate(() => { for (const m of window.__held) window.__ws.send(JSON.stringify(m)); });
+      await page.waitForFunction(`${extTab}.entry.model.getValue() === 'two\\n'`);
+      await sleep(300);
+      assert.deepEqual(await extState(), { text: 'two\n', dirty: false, banner: false });
+    } finally {
+      await page.evaluate(() => { window.__drop = null; window.__held = []; });
+      await closeExt();
+    }
+  });
+
   await step('saving a file that changed on disk asks: Overwrite with mine, or Load their version', async () => {
     const W = '.workspace:not(.hidden)';
     await openExt('base\n');

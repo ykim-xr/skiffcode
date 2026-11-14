@@ -128,7 +128,20 @@ PLIST
     printf "#!/bin/sh\nSKIFFCODE_BIN='%s'\n" "$quoted"
     cat <<'LAUNCHER'
 export LANG="${LANG:-en_US.UTF-8}"
-exec "${SHELL:-/bin/zsh}" -lic 'exec "$0" "$@"' "$SKIFFCODE_BIN" "$@" </dev/null
+# Older Launch Services versions add a process serial number argument.
+case "${1:-}" in -psn_*) shift ;; esac
+shell="${SHELL:-/bin/zsh}"
+case "${shell##*/}" in
+  zsh|bash) exec "$shell" -lic 'exec "$0" "$@"' "$SKIFFCODE_BIN" "$@" </dev/null ;;
+esac
+# Other shells (fish, nushell, tcsh) don't take sh syntax, so only their PATH is used.
+# tcsh refuses -l next to another flag, hence the second try.
+for flags in "-l -c" "-c"; do
+  # The last line, in case a startup file prints a greeting.
+  p="$("$shell" $flags 'printenv PATH' 2>/dev/null </dev/null | tail -n 1)"
+  case "$p" in /*) PATH="$p"; export PATH; break ;; esac
+done
+exec "$SKIFFCODE_BIN" "$@" </dev/null
 LAUNCHER
   } >"$dir.new/Contents/MacOS/SkiffCode" || return 1
   chmod 755 "$dir.new/Contents/MacOS/SkiffCode" || return 1

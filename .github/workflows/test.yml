@@ -95,6 +95,14 @@ jobs:
           u=$(/bin/bash "$sk" url "$ko" 2>/dev/null)
           echo "url: $(printf '%s' "$u" | sed 's/tkn=[^&]*/tkn=<hidden>/')"
           check "url keeps a non-ASCII folder" node -e 'const [u, d] = process.argv.slice(1); process.exit(new URL(u).searchParams.get("folder") === require("fs").realpathSync(d) ? 0 : 1)' "$u" "$ko"
+          # The app's launcher finds skiffcode through the login shell, and through a shell without sh syntax.
+          if [ "$RUNNER_OS" = macOS ]; then
+            app="$SKIFFCODE_MAC_APP_DIR/SkiffCode.app/Contents/MacOS/SkiffCode"
+            out=$("$app" url 2>/dev/null)
+            check "app launcher runs skiffcode" grep -q '^http://127.0.0.1:3419/' <<<"$out"
+            out=$(SHELL=/bin/tcsh "$app" -psn_0_1 url 2>/dev/null)
+            check "app launcher with tcsh" grep -q '^http://127.0.0.1:3419/' <<<"$out"
+          fi
 
           out=$(/bin/bash "$sk" status 2>&1); echo "$out"
           check "status is running" grep -q running <<<"$out"
