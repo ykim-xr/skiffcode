@@ -43,8 +43,6 @@ jobs:
           python3 --version
           ps -o etimes= -p $$ || echo no-etimes
           command -v rg || echo no-rg
-          # The server finds its terminal hosts in ps output where there is no /proc: shows whether ps escapes non-ASCII paths.
-          python3 -c 'import time; time.sleep(2)' '/tmp/프로젝트 a/x.sock' & /bin/ps -ww -o command= -p $! | od -c | head -n 6; wait
 
       - name: Install Playwright
         run: |
@@ -95,6 +93,7 @@ jobs:
           # A non-ASCII folder reaches the window intact (percent-encoded UTF-8)
           ko="$RUNNER_TEMP/프로젝트 a"; mkdir -p "$ko"
           u=$(/bin/bash "$sk" url "$ko" 2>/dev/null)
+          echo "url: $(printf '%s' "$u" | sed 's/tkn=[^&]*/tkn=<hidden>/')"
           check "url keeps a non-ASCII folder" node -e 'const [u, d] = process.argv.slice(1); process.exit(new URL(u).searchParams.get("folder") === require("fs").realpathSync(d) ? 0 : 1)' "$u" "$ko"
 
           out=$(/bin/bash "$sk" status 2>&1); echo "$out"

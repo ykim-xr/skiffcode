@@ -139,11 +139,13 @@ stop() {
 }
 
 urlencode() {
-  local LC_ALL=C   # byte by byte, so a non-ASCII name becomes its UTF-8 bytes
-  local s="$1" out="" c i
-  for ((i = 0; i < ${#s}; i++)); do
-    c="${s:i:1}"
-    case "$c" in [a-zA-Z0-9.~_/-]) out+="$c" ;; *) printf -v c '%%%02X' "'$c"; out+="$c" ;; esac
+  # Bytes come from od: bash 3.2 (macOS) can't be trusted to split a string into bytes.
+  local out="" b c
+  for b in $(printf '%s' "$1" | od -An -v -tx1 | tr a-f A-F); do
+    case "$b" in
+      2[DEF]|3[0-9]|4[1-9A-F]|5[0-9AF]|6[1-9A-F]|7[0-9AE]) printf -v c "\\x$b"; out+="$c" ;;
+      *) out+="%$b" ;;
+    esac
   done
   printf '%s' "$out"
 }

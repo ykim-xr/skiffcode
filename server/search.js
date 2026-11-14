@@ -215,10 +215,20 @@ async function definition(root, { symbol, lang, fromFile }) {
   if (!symbol || !/^[\w$-]+$/.test(symbol)) return [];
   const pats = definitionPatterns(symbol, lang);
   const results = [];
-  for (const p of pats) {
-    const r = await text(root, { query: p, regex: true, caseSensitive: true });
-    for (const f of r.results) for (const m of f.matches) results.push({ file: f.file, line: m.line, col: Math.max(1, m.text.indexOf(symbol) + 1), text: m.text.trim() });
-    if (results.length > 50) break;
+  const add = r => { for (const f of r.results) for (const m of f.matches) results.push({ file: f.file, line: m.line, col: Math.max(1, m.text.indexOf(symbol) + 1), text: m.text.trim() }); };
+  if (which('rg')) {
+    for (const p of pats) {
+      add(await text(root, { query: p, regex: true, caseSensitive: true }));
+      if (results.length > 50) break;
+    }
+  } else {
+    // grep's -E dialect differs by platform (BSD grep lacks \b, \s, \w): search the plain symbol, match the patterns here
+    const r = await text(root, { query: symbol, caseSensitive: true });
+    for (const p of pats) {
+      const re = new RegExp(p);
+      add({ results: r.results.map(f => ({ file: f.file, matches: f.matches.filter(m => re.test(m.text)) })) });
+      if (results.length > 50) break;
+    }
   }
   const seen = new Set();
   const uniq = results.filter(r => {

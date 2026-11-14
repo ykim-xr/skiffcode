@@ -2018,7 +2018,7 @@ function startServer() {
     fs.writeFileSync(path.join(base, '.git', 'refs', 'heads', 'stuck.lock'), '');
     const r1 = await c.call('worktrees.remove', { repo: base, path: stuck.path, deleteBranch: true });
     assert.equal(r1.branch, 'error');
-    assert.match(r1.branchError, /could not remove reference/);
+    assert.match(r1.branchError, /could not (remove|delete) reference/);
     fs.rmSync(path.join(base, '.git', 'refs', 'heads', 'stuck.lock'));
     const wip = await c.call('worktrees.create', { repo: base, newBranch: 'wip', base: 'main', startClaude: false });
     sh('git commit -q --allow-empty -m unmerged', wip.path);

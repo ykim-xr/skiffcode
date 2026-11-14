@@ -9,7 +9,12 @@ window.Terminal = class {
     this.pre.addEventListener('keydown', e => { if (this.kh && this.kh(e) === false) return; if (e.key.length === 1) this._d && this._d(e.key); else if (e.key === 'Enter') this._d && this._d('\r'); e.preventDefault(); }); }
   write(d, cb) {
     const s = typeof d === 'string' ? d : this.dec.decode(d, { stream: true });
-    this.text += s;
+    // like xterm: an OSC sequence is consumed, not shown; an unfinished one waits for its terminator
+    const all = (this.oscTail || '') + s;
+    const text = all.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '');
+    const open = text.search(/\x1b\](?:[^\x07\x1b]|\x1b(?!\\))*$|\x1b$/);
+    this.oscTail = open < 0 ? '' : text.slice(open);
+    this.text += open < 0 ? text : text.slice(0, open);
     this.pre.textContent = this.text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').slice(-20000);
     // like xterm: a cursor-position query is answered while the data is parsed
     for (let i = s.indexOf('\x1b[6n'); i !== -1 && this._d; i = s.indexOf('\x1b[6n', i + 1)) this._d('\x1b[1;1R');
