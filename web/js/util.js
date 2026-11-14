@@ -1,5 +1,11 @@
 // Small DOM + formatting helpers.
 
+/** Detected once from the browser: Cmd is the primary modifier on a Mac. */
+export const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
+
+/** 'Ctrl+click' → '⌘-click' and 'Ctrl+V' → '⌘V' on a Mac; unchanged elsewhere. */
+export const platformHint = text => (isMac ? text.replace('Ctrl+click', '⌘-click').replace('Ctrl+', '⌘') : text);
+
 /** h('div.cls#id', {attrs, onclick}, ...children) */
 export function h(tag, attrs, ...children) {
   const m = /^([a-z0-9-]+)?((?:[.#][\w-]+)*)$/i.exec(tag) || [];

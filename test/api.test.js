@@ -12,7 +12,8 @@ const crypto = require('crypto');
 const { Client } = require('./client');
 
 const APP = path.resolve(__dirname, '..');
-const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'skiffcode-api-')));
+// macOS's default tmpdir makes pty socket paths longer than its 104-byte limit
+const tmp = fs.realpathSync(fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/tmp' : os.tmpdir(), 'skiffcode-api-')));
 const HOME = path.join(tmp, 'home');
 const PORT = 3600 + Math.floor(Math.random() * 300);
 const sh = (cmd, cwd) => execFileSync('bash', ['-c', cmd], { cwd, encoding: 'utf8' });
@@ -28,6 +29,10 @@ async function until(fn, what, ms = 8000) {
 }
 let passed = 0;
 const step = async (name, fn) => { await fn(); passed++; console.log(`  ✓ ${name}`); };
+const MAC = process.platform === 'darwin';
+const skipped = what => console.log(`  - skipped on macOS (no account switching or sign-in there): ${what}`);
+/** A step that needs account switching, sign-in or .credentials.json, which SkiffCode doesn't do on macOS. */
+const switchingStep = (name, fn) => (MAC ? skipped(name) : step(name, fn));
 
 process.env.FAKE_LOG = path.join(tmp, 'claude-calls.jsonl');
 process.env.FAKE_SCRIPT_FILE = path.join(tmp, 'plan.txt');
@@ -253,7 +258,7 @@ function startServer() {
     await c.call('term.open', { id: s.id, cols: 80, rows: 24 });
     await sleep(400);
     await c.call('term.resize', { id: s.id, cols: 70000, rows: 70000 });
-    c.input(s.id, 'stty -echo; wc -c | sed s/^/count=/; stty echo\r');
+    c.input(s.id, 'stty -echo; wc -c | tr -d " " | sed s/^/count=/; stty echo\r');
     await sleep(400);
     c.input(s.id, ('a'.repeat(99) + '\n').repeat(3000) + '\x04');
     await until(() => /count=300000/.test(c.term.get(s.id) || ''), 'all of the paste reached the program', 15000);
@@ -1028,7 +1033,7 @@ function startServer() {
     return { session };
   };
 
-  await step('accounts: Add account signs in from a private folder and saves the login; the same login again updates it', async () => {
+  await switchingStep('accounts: Add account signs in from a private folder and saves the login; the same login again updates it', async () => {
     fs.writeFileSync(SHARED_CRED, JSON.stringify(login('x')), { mode: 0o600 });
     fs.writeFileSync(SHARED_GLOBAL, JSON.stringify({ numStartups: 5, oauthAccount: oauthOf('x') }));
     fs.chmodSync(SHARED_GLOBAL, 0o644);
@@ -1060,7 +1065,7 @@ function startServer() {
     assert.deepEqual((await c.call('hello')).accounts.map(a => a.name), ['Client A', 'Client B']);
   });
 
-  await step('accounts: a switch saves the login in use first, then swaps the shared files under Claude’s lock', async () => {
+  await switchingStep('accounts: a switch saves the login in use first, then swaps the shared files under Claude’s lock', async () => {
     const sharedX = readJ(SHARED_CRED);
     let h = await c.call('hello');
     const [A, B] = h.accounts.map(a => a.id);
@@ -1099,7 +1104,7 @@ function startServer() {
     assert.deepEqual(readJ(path.join(slot(A), 'account.json')), oauthOf('alpha'), 'A keeps its identity');
   });
 
-  await step('accounts: refused switches change nothing; a broken shared file is never saved over a login', async () => {
+  await switchingStep('accounts: refused switches change nothing; a broken shared file is never saved over a login', async () => {
     const h = await c.call('hello');
     const ids = h.accounts.map(a => a.id);
     const [A, B] = ids;
@@ -1144,7 +1149,7 @@ function startServer() {
     fs.writeFileSync(SHARED_GLOBAL, JSON.stringify({ numStartups: 5, oauthAccount: oauthOf('alpha') }));
   });
 
-  await step('accounts: a refreshed login is saved into its own account; the shared file keeps its other keys', async () => {
+  await switchingStep('accounts: a refreshed login is saved into its own account; the shared file keeps its other keys', async () => {
     const h = await c.call('hello');
     const A = h.accounts.find(a => a.name === 'Client A').id;
     const B = h.accounts.find(a => a.name === 'Client B').id;
@@ -1180,7 +1185,7 @@ function startServer() {
     const rename = fs.renameSync;
     process.env.CLAUDE_CONFIG_DIR = cfg;
     try {
-      const acc = new Accounts(st, h);
+      const acc = new Accounts(st, h, { platform: 'linux' });
       for (const [saves, kept] of [[3, 3], [7, 5]]) {
         const base = login(`bk${saves}`).claudeAiOauth;
         const { id } = acc.saveLogin(base, oauthOf(`bk${saves}`));
@@ -1213,6 +1218,45 @@ function startServer() {
     }
   });
 
+  await step('accounts on macOS: the login shows from .claude.json; use, sign-in and save are refused and write nothing', async () => {
+    assert.equal((await c.call('hello')).platform, process.platform);
+    const { Accounts } = require('../server/accounts');
+    const h = path.join(tmp, 'h-mac');
+    const cfg = path.join(tmp, 'claude-mac');
+    fs.mkdirSync(path.join(h, 'accounts'), { recursive: true });
+    fs.mkdirSync(cfg);
+    const data = { prefs: {}, sessions: [] };
+    const st = { data, get prefs() { return data.prefs; }, get sessions() { return data.sessions; }, update(fn) { fn(data); } };
+    const envDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    const refused = { message: 'Switching Claude accounts isn’t available on macOS yet.' };
+    const files = dir => fs.readdirSync(dir).sort().map(n => [n, fs.statSync(path.join(dir, n)).isFile() ? fs.readFileSync(path.join(dir, n), 'utf8') : 'dir']);
+    try {
+      for (const t of [
+        { name: 'signed in', global: { numStartups: 1, oauthAccount: oauthOf('mac') }, want: { email: 'mac@example.test', org: 'Org mac', plan: undefined, saved: false, expired: false } },
+        { name: 'no oauthAccount', global: { numStartups: 1 }, want: null },
+        { name: 'no .claude.json', want: null },
+      ]) {
+        if (t.global) fs.writeFileSync(path.join(cfg, '.claude.json'), JSON.stringify(t.global));
+        else fs.rmSync(path.join(cfg, '.claude.json'), { force: true });
+        const acc = new Accounts(st, h, { platform: 'darwin' });
+        const saved = acc.saveLogin(login('saved').claudeAiOauth, oauthOf('saved')).id;
+        assert.deepEqual(acc.currentLogin(), t.want, t.name);
+        assert.equal(acc.list().find(a => a.id === saved).inUse, false, `${t.name}: no saved login is in use`);
+        const before = [files(cfg), files(path.join(h, 'accounts'))];
+        assert.throws(() => acc.startSignIn('Work'), refused, `${t.name}: sign-in`);
+        assert.throws(() => acc.saveCurrent('Work'), refused, `${t.name}: save`);
+        await assert.rejects(acc.use(saved), refused, `${t.name}: use`);
+        assert.deepEqual([files(cfg), files(path.join(h, 'accounts'))], before, `${t.name}: nothing written`);
+        acc.recordUsage({ five_hour: { used_percentage: 12, resets_at: Date.now() / 1000 + 600 } });
+        assert.equal(acc.usage.current.fiveHour.used, 12, `${t.name}: usage under "current"`);
+      }
+    } finally {
+      if (envDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = envDir;
+    }
+  });
+
   await step('fake claude: auth without CLAUDE_CONFIG_DIR fails and writes nothing', async () => {
     const home = path.join(tmp, 'fake-home');
     fs.mkdirSync(home);
@@ -1225,10 +1269,11 @@ function startServer() {
   });
 
   await step('accounts: remove deletes only that saved login', async () => {
+    await assert.rejects(c.call('accounts.remove', { id: '../accounts' }), /Unknown account/);
+    if (MAC) return skipped('removing logins saved by sign-in');
     const h = await c.call('hello');
     const X = h.accounts.find(a => a.email === 'x@example.test');
     const shared = [fs.readFileSync(SHARED_CRED, 'utf8'), fs.readFileSync(SHARED_GLOBAL, 'utf8')];
-    await assert.rejects(c.call('accounts.remove', { id: '../accounts' }), /Unknown account/);
     await c.call('accounts.remove', { id: X.id });
     assert.ok(!fs.existsSync(slot(X.id)));
     const rest = (await c.call('hello')).accounts;
@@ -1244,6 +1289,7 @@ function startServer() {
       [undefined, REAL], ['http://127.0.0.1:9/usage', 'http://127.0.0.1:9/usage'], ['http://localhost:9/u', 'http://localhost:9/u'], ['http://[::1]:9/u', 'http://[::1]:9/u'],
       ['https://evil.example/usage', REAL], ['http://10.0.0.1/usage', REAL], ['file:///etc/passwd', REAL], ['http://127.0.0.1@evil.example/', REAL], ['https://127.0.0.1/u', REAL],
     ]) assert.equal(usageUrl({ SKIFFCODE_USAGE_URL: v }), want, String(v));
+    if (MAC) return skipped('usage refresh for logins saved by sign-in');
     const h = await c.call('hello');
     const A = h.accounts.find(a => a.inUse).id;
     const B = h.accounts.find(a => !a.inUse).id;
@@ -1284,7 +1330,8 @@ function startServer() {
   });
 
   await step('accounts: sessions run on the shared folder and report usage for the account in use', async () => {
-    const A = (await c.call('hello')).accounts.find(a => a.inUse).id;
+    // On macOS no saved login is in use, so usage is the current login's
+    const A = MAC ? 'current' : (await c.call('hello')).accounts.find(a => a.inUse).id;
     plan('SessionStart,UserPromptSubmit,Status:42.4:17,Stop,hang');
     const before = calls().length;
     const s2 = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, cols: 80, rows: 24 });
@@ -1305,7 +1352,7 @@ function startServer() {
     assert.equal(calls()[0].configDir, CLAUDE_HOME, 'your CLAUDE_CONFIG_DIR is kept');
   });
 
-  await step('Add account runs a Claude command whose path has spaces', async () => {
+  await switchingStep('Add account runs a Claude command whose path has spaces', async () => {
     const dir = path.join(tmp, 'my tools');
     fs.mkdirSync(dir);
     fs.symlinkSync(path.join(__dirname, 'fake-claude.js'), path.join(dir, 'claude'));
@@ -1478,6 +1525,7 @@ function startServer() {
     assert.equal(dbus.args.at(-2), 'array:string:file:///home/me/my%20docs/a%2Cb.txt', 'spaces and commas are escaped');
     assert.equal(dbus.args.at(-1), 'string:');
     assert.deepEqual(open, { file: 'xdg-open', args: ['/home/me/my docs'] });
+    assert.deepEqual(revealCommands('/Users/me/my docs/a,b.txt', { wsl: false, mac: true }), [{ file: 'open', args: ['-R', '/Users/me/my docs/a,b.txt'] }], 'macOS: Finder selects the item');
     await assert.rejects(c.call('fs.reveal', { cwd: wt, path: 'no/such/file.txt' }), /Not found: no\/such\/file\.txt/);
     await assert.rejects(c.call('fs.reveal', { cwd: '/etc', path: '/etc/passwd' }), /Not a worktree/);
     await assert.rejects(c.call('fs.reveal', { cwd: wt, path: '' }), /Bad path/);
@@ -1499,6 +1547,55 @@ function startServer() {
     }
     assert.equal(script[i + 1], ')', 'the string ends where LoadXml does');
     assert.ok(text.includes(`<text>${name} finished</text><text>${name} — open SkiffCode</text>`), text);
+  });
+
+  await step('desktop notification on macOS: names reach osascript as arguments after --, never as script', async () => {
+    const { macNotifyArgs } = require('../server/notify'); // pure: starts nothing
+    const script = ['-e', 'on run argv', '-e', 'display notification (item 2 of argv) with title (item 1 of argv)', '-e', 'end run', '--'];
+    for (const [name, title, body] of [
+      ['quotes and backslash', `say "hi" it's \\ done`, `"); do shell script "touch /tmp/x`],
+      ['newline and end run', 'a\nend run\non run argv', 'b\n-e\nend run'],
+      ['a title that looks like -e', '-e do shell script "x" --', '-e'],
+      ['a title that looks like -l', '-lJavaScript', '-l JavaScript'],
+    ]) {
+      const args = macNotifyArgs(title, body);
+      assert.deepEqual(args.slice(0, -2), script, `${name}: the script is fixed`);
+      assert.deepEqual(args.slice(-2), [title, body], `${name}: title and body are the last two arguments, right after --`);
+      if (process.platform === 'darwin') {
+        // The real osascript, with the display line swapped for one that echoes argv: -- must end its options.
+        const echo = args.map(a => (a.startsWith('display notification') ? 'return (item 1 of argv) & "|" & (item 2 of argv)' : a));
+        assert.equal(execFileSync('/usr/bin/osascript', echo, { encoding: 'utf8' }).replace(/\n$/, ''), `${title}|${body}`, `${name}: osascript reads both as plain text`);
+      }
+    }
+  });
+
+  await step('terminal host check without /proc: only the first ptyhost.py argument names the socket', async () => {
+    const { hostCommandMatches } = require('../server/pty'); // pure
+    const sock = '/Users/me/Library/Sky Code/pty/abc.sock';
+    const host = `/usr/bin/python3 /opt/skiffcode/server/ptyhost.py ${sock} 80 24 /Users/me/my app -- claude`;
+    for (const [name, command, want] of [
+      ['the host, socket path with spaces', host, true],
+      ['the host with a prompt after it', `${host} --session-id x "fix /ptyhost.py ${sock}2 please"`, true],
+      ['another socket with this one as prefix', `/usr/bin/python3 /opt/skiffcode/server/ptyhost.py ${sock}2 80 24 /x -- bash`, false],
+      ['this socket only in later prompt text', `/usr/bin/python3 /opt/skiffcode/server/ptyhost.py /other.sock 80 24 /x -- claude "/ptyhost.py ${sock} 80"`, false],
+      ['not a host', `/bin/sleep 60 ${sock} `, false],
+      ['a zombie', '(python3)', false],
+      ['empty', '', false],
+    ]) assert.equal(hostCommandMatches(command, sock), want, name);
+  });
+
+  await step('BSD ps elapsed time ([[dd-]hh:]mm:ss) in seconds', async () => {
+    const { parseEtime } = require('../server/pty'); // pure
+    for (const [etime, secs] of [['01:05', 65], ['02:01:05', 7265], ['3-02:01:05', 3 * 86400 + 7265]]) assert.equal(parseEtime(etime), secs, etime);
+    assert.ok(Number.isNaN(parseEtime('soon')), 'not a time');
+  });
+
+  await step('a data folder path too long for terminal sockets: the server says so and exits', async () => {
+    const long = path.join(tmp, 'x'.repeat(120));
+    const r = spawnSync('node', [path.join(APP, 'server', 'main.js')], { env: { ...process.env, SKIFFCODE_HOME: long, SKIFFCODE_PORT: String(PORT + 7) }, encoding: 'utf8', timeout: 8000 });
+    assert.equal(r.status, 1, 'exits');
+    assert.match(r.stderr, /data folder path is too long for terminal sockets\. Set SKIFFCODE_HOME to a shorter folder\./);
+    assert.equal(fs.existsSync(long), false, 'nothing created');
   });
 
   await step('delete a session completely: its Claude conversation is gone from /resume; folders can be purged', async () => {
@@ -1686,9 +1783,10 @@ function startServer() {
     assert.equal(r.branch, 'deleted');
     assert.equal(sh('git branch --list feat/login', repo).trim(), '');
     assert.equal((await c.call('hello')).sessions.length, 0);
-    // only this run's fake Claude processes: its cmdline has no HOME, so match FAKE_LOG in its environ
-    const mine = sh(`for p in $(pgrep -f "^node [^ ]*fake-claude[.]js" || true); do tr '\\0' '\\n' < /proc/$p/environ 2>/dev/null | grep -qxF "FAKE_LOG=$FAKE_LOG" && echo $p; done; true`).trim();
-    assert.equal(mine, '', 'Claude process stopped');
+    const pidFile = `${process.env.FAKE_LOG}.pids`;
+    const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+    const mine = (fs.existsSync(pidFile) ? fs.readFileSync(pidFile, 'utf8').split('\n').filter(Boolean).map(Number) : []).filter(alive);
+    assert.deepEqual(mine, [], 'Claude process stopped');
   });
 
   await step('delete repo from disk: wrong name refused, worktree folders deleted', async () => {

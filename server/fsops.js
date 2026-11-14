@@ -280,7 +280,8 @@ if(-not $h){exit 0}
  * The commands that show `abs` in the system file manager, in the order to try them.
  * `windowsPath` (WSL only) is `abs` as Windows names it.
  */
-function revealCommands(abs, { wsl, windowsPath }) {
+function revealCommands(abs, { wsl, windowsPath, mac }) {
+  if (mac) return [{ file: 'open', args: ['-R', abs] }];
   if (wsl) {
     const enc = Buffer.from(revealScript(windowsPath), 'utf16le').toString('base64');
     return [{ file: 'powershell.exe', args: ['-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand', enc] }];
@@ -323,7 +324,7 @@ async function reveal(abs) {
   let windowsPath;
   if (wsl) windowsPath = (await run('wslpath', ['-w', abs], { timeout: 5000 }).catch(() => '')).trim();
   if (wsl && !windowsPath) throw new Error('Could not open a file manager.');
-  for (const cmd of revealCommands(abs, { wsl, windowsPath })) {
+  for (const cmd of revealCommands(abs, { wsl, windowsPath, mac: process.platform === 'darwin' })) {
     const exe = wsl ? powershell() : which(cmd.file);
     if (!exe) continue;
     if (await startCommand({ ...cmd, file: exe }, { killOnWait: cmd.file === 'dbus-send' })) return;

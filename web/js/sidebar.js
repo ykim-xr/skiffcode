@@ -1,5 +1,5 @@
 // Left sidebar: groups → repos → worktrees → sessions, Orca style.
-import { h, icon, clear } from './util.js';
+import { h, icon, clear, isMac } from './util.js';
 import { store, subscribe, sessionsIn, needsYou } from './store.js';
 import { call } from './rpc.js';
 import { contextMenu } from './dialogs.js';
@@ -64,7 +64,7 @@ function render() {
     list.append(h('div.sidebar-empty',
       h('p', 'Add a git repository or any folder to get started.'),
       h('button.btn.primary', { onclick: () => A.addRepo() }, icon('plus'), 'Add repository'),
-      h('p.muted', 'Or from WSL: ', h('code', 'skiffcode ~/code/my-repo'))));
+      h('p.muted', isMac ? 'Or from a terminal: ' : 'Or from WSL: ', h('code', 'skiffcode ~/code/my-repo'))));
   }
   // The tree is rebuilt on every change: keep where you'd scrolled to.
   const oldTree = root.querySelector('.tree');

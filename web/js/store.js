@@ -14,6 +14,7 @@ export const store = {
   accounts: [],
   currentLogin: null, // the login in the shared Claude folder: { email, org, plan, saved, expired }
   usage: {},
+  platform: '', // the server's process.platform
   worktrees: new Map(), // repo path -> { list: [...], missing, error }
   status: new Map(), // worktree path -> BranchStatus
   active: null, // worktree path shown in the main area
@@ -48,6 +49,7 @@ export function applySnapshot(s) {
   if (s.layouts) store.layouts = s.layouts;
   if (s.home) store.home = s.home;
   if (s.version) store.version = s.version;
+  if (s.platform) store.platform = s.platform;
   notify();
 }
 

@@ -12,7 +12,7 @@
 #   skiffcode update         get the latest version from GitHub and reinstall (sessions keep running)
 #   skiffcode version
 #
-# The server runs in WSL/Linux next to your repos and only listens on 127.0.0.1.
+# The server runs in WSL/Linux/macOS next to your repos and only listens on 127.0.0.1.
 set -euo pipefail
 
 SKIFFCODE_HOME="${SKIFFCODE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/skiffcode}"
@@ -58,8 +58,21 @@ status_json() {
   ' "$PORT"
 }
 # Time-limited: under WSL mirrored networking a closed loopback port can stay silent, and a plain connect then waits about 2 minutes.
-port_busy() { timeout --foreground 1 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0"' "$PORT" 2>/dev/null; }
-port_owner() { command -v ss >/dev/null && ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'users:(([^)]*' | sed 's/users:((//' | head -1; }
+# macOS has no `timeout`: the plain probe is fine there (loopback refuses at once).
+port_busy() {
+  local t=""
+  if command -v timeout >/dev/null; then t="timeout --foreground 1"; fi
+  $t bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$0"' "$PORT" 2>/dev/null
+}
+port_owner() {
+  if command -v ss >/dev/null; then
+    ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'users:(([^)]*' | sed 's/users:((//' | head -1
+  elif command -v lsof >/dev/null; then
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR == 2 { printf "\"%s\",pid=%s\n", $1, $2; f = 1 } END { exit !f }'
+  else
+    return 1
+  fi
+}
 running() { [[ -n "$(status_json 2>/dev/null || true)" ]]; }
 
 start() {
@@ -76,7 +89,13 @@ Stop it, or run SkiffCode on another port:  SKIFFCODE_PORT=3418 skiffcode"
   (umask 077; : >>"$LOG"); chmod 600 "$LOG"
   # Always from the home folder: started from a Windows folder (/mnt/c/…, slow in WSL) the server can hang or fail.
   # SKIFFCODE_USAGE_URL is for tests only: a shell's leftover value must never get a real token.
-  ( cd "$HOME" 2>/dev/null || cd /; exec setsid nohup env -u SKIFFCODE_USAGE_URL node "$APP/server/main.js" >>"$LOG" 2>&1 </dev/null ) &
+  if command -v setsid >/dev/null; then
+    ( cd "$HOME" 2>/dev/null || cd /; exec setsid nohup env -u SKIFFCODE_USAGE_URL node "$APP/server/main.js" >>"$LOG" 2>&1 </dev/null ) &
+  else
+    # macOS has no setsid, and nohup doesn't detach: Node starts the server in a session of its own,
+    # so Ctrl-C here and prompts that read the terminal (ssh) can't reach or stop it.
+    ( cd "$HOME" 2>/dev/null || cd /; exec env -u SKIFFCODE_USAGE_URL node -e 'require("child_process").spawn(process.execPath, [process.argv[1]], { detached: true, stdio: "inherit" }).unref()' "$APP/server/main.js" >>"$LOG" 2>&1 </dev/null ) &
+  fi
   for _ in $(seq 1 150); do
     running && return 0
     sleep 0.1
@@ -90,12 +109,20 @@ Stop it, or run SkiffCode on another port:  SKIFFCODE_PORT=3418 skiffcode"
 # and leave nothing running once the old one finished exiting.
 # Only a pid SkiffCode itself reports, or one whose command line is a SkiffCode server: a stale
 # server.pid may name an unrelated process by now.
+# Without /proc (macOS) the command line comes from ps; a failed or unmatched lookup counts as "not ours".
+is_server() {
+  if [[ -d /proc/self ]]; then
+    tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | grep -Eq '(^|/)server/main\.js$'
+  else
+    /bin/ps -ww -o command= -p "$1" 2>/dev/null | grep -Eq '(^|[ /])server/main\.js( |$)'
+  fi
+}
 server_pid() {
   local pid
   pid="$(status_json 2>/dev/null | grep -o '"pid":[0-9]*' | cut -d: -f2 || true)"
   if [[ -z "$pid" ]]; then
     pid="$(cat "$SKIFFCODE_HOME/server.pid" 2>/dev/null || true)"
-    [[ "$pid" =~ ^[0-9]+$ ]] && tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | grep -Eq '(^|/)server/main\.js$' || pid=""
+    [[ "$pid" =~ ^[0-9]+$ ]] && is_server "$pid" || pid=""
   fi
   printf '%s' "$pid"
 }
@@ -112,6 +139,7 @@ stop() {
 }
 
 urlencode() {
+  local LC_ALL=C   # byte by byte, so a non-ASCII name becomes its UTF-8 bytes
   local s="$1" out="" c i
   for ((i = 0; i < ${#s}; i++)); do
     c="${s:i:1}"
@@ -139,6 +167,15 @@ open_url() { # url, app(1/0)
     else
       winps "Start-Process '$u'"
     fi
+  elif [[ "$(uname -s)" == Darwin ]]; then
+    local a
+    if ((app)); then
+      # open's exit status tells whether the app exists; -n starts a new instance so --app is honoured.
+      for a in "Google Chrome" "Microsoft Edge" "Brave Browser" "Chromium"; do
+        open -na "$a" --args --app="$u" >/dev/null 2>&1 && return 0
+      done
+    fi
+    open "$u" >/dev/null 2>&1 || echo "Open this in your browser: $u"
   elif command -v xdg-open >/dev/null; then
     local b
     if ((app)) && b="$(command -v google-chrome || command -v chromium || command -v microsoft-edge || true)" && [[ -n "$b" ]]; then
@@ -156,8 +193,8 @@ cli() {
   local -a pos=()
   local base="" name="" prompt="" claude=1 show=1 json=0
   while (($#)); do
+    case "$1" in -b|--base|-n|--name|-p|--prompt) (($# >= 2)) || die "$1 needs a value" ;; esac
     case "$1" in
-      -b|--base|-n|--name|-p|--prompt) (($# >= 2)) || die "$1 needs a value" ;;&
       -b|--base) base="$2"; shift 2 ;;
       --base=*) base="${1#*=}"; shift ;;
       -n|--name) name="$2"; shift 2 ;;
@@ -215,6 +252,13 @@ case "${1:-}" in
   -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
+# Sortable by time. BSD date prints a literal N for %N: use seconds padded to nanosecond width.
+stamp() {
+  local n; n="$(date +%s%N)"
+  case "$n" in *N) n="$(date +%s)000000000" ;; esac
+  printf '%s' "$n"
+}
+
 dir=""
 if [[ -n "${1:-}" ]]; then
   [[ -d "$1" ]] || die "not a folder: $1"
@@ -223,7 +267,7 @@ fi
 start
 clients="$(status_json | grep -o '"clients":[0-9]*' | cut -d: -f2 || echo 0)"
 if [[ -n "$dir" ]]; then
-  printf '%s\n' "$dir" >"$SKIFFCODE_HOME/inbox/$(date +%s%N)-$$.path"
+  printf '%s\n' "$dir" >"$SKIFFCODE_HOME/inbox/$(stamp)-$$.path"
 fi
 if [[ "${clients:-0}" -gt 0 ]]; then
   [[ -n "$dir" ]] && echo "SkiffCode: showing $dir in your open SkiffCode window." || echo "SkiffCode is already open."

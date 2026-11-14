@@ -1,6 +1,6 @@
 // Tab types shown in a worktree's panes: file editor, single-file diff,
 // review (all changes vs base, or one commit) and terminal (Claude / shell).
-import { h, icon, basename, dirname, STATUS_LETTER, STATUS_LABEL, TERM_SIZE, clear } from './util.js';
+import { h, icon, basename, dirname, platformHint, isMac, STATUS_LETTER, STATUS_LABEL, TERM_SIZE, clear } from './util.js';
 import { call, on, onTerminal, sendInput } from './rpc.js';
 import * as models from './models.js';
 import { store, session } from './store.js';
@@ -15,7 +15,7 @@ import { contextMenu } from './dialogs.js';
 export const editorOptions = () => ({
   theme: 'skiffcode-dark',
   fontSize: store.settings.fontSize || 13,
-  fontFamily: "'Cascadia Code', 'JetBrains Mono', Consolas, 'DejaVu Sans Mono', monospace",
+  fontFamily: "'Cascadia Code', 'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace",
   automaticLayout: true,
   minimap: { enabled: true, scale: 1, renderCharacters: false },
   scrollBeyondLastLine: false,
@@ -388,7 +388,7 @@ export class TerminalTab extends Tab {
     this.banner = h('div.term-banner.hidden');
     this.el.append(this.banner, this.host);
     this.term = new Terminal({
-      fontFamily: "'Cascadia Mono', 'JetBrains Mono', Consolas, 'DejaVu Sans Mono', monospace",
+      fontFamily: "'Cascadia Mono', 'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace",
       fontSize: store.settings.fontSize || 13,
       lineHeight: 1.15,
       cursorBlink: true,
@@ -588,7 +588,7 @@ export class TerminalTab extends Tab {
   show() { requestAnimationFrame(() => this.layout()); }
   focus() { this.term.focus(); }
   hoverUrl(uri) {
-    if (/^file:/i.test(uri)) { this.host.title = 'Click: open · Ctrl+click: open in SkiffCode'; return; }
+    if (/^file:/i.test(uri)) { this.host.title = platformHint('Click: open · Ctrl+click: open in SkiffCode'); return; }
     this.hoverLink = { kind: 'url', text: uri };
     this.host.title = `${LINK_HINT} · right-click for more`;
   }
@@ -630,7 +630,7 @@ export class TerminalTab extends Tab {
     try {
       void this.pasteText(await navigator.clipboard.readText());
     } catch {
-      toast('Allow clipboard access to paste with right-click (or press Ctrl+V).', { kind: 'warn', timeout: 4000 });
+      toast('Allow clipboard access to paste with right-click (or press ' + platformHint('Ctrl+V') + ').', { kind: 'warn', timeout: 4000 });
     }
   }
   title() { const s = this.session; return s ? s.name : 'session'; }

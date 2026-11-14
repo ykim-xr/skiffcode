@@ -8,6 +8,7 @@
 set -euo pipefail
 SKIFFCODE_HOME="${SKIFFCODE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/skiffcode}"
 BIN_DIR="${SKIFFCODE_BIN_DIR:-$HOME/.local/bin}"
+MAC_APP_DIR="${SKIFFCODE_MAC_APP_DIR:-$HOME/Applications}"
 
 [[ -x "$BIN_DIR/skiffcode" ]] && "$BIN_DIR/skiffcode" stop >/dev/null 2>&1 || true
 # Stop the terminal hosts (Claude sessions and shells) SkiffCode started: "python3 …/ptyhost.py <home>/pty/<id>.sock …".
@@ -21,6 +22,7 @@ if [[ -n "$pids" ]]; then
 fi
 rm -f "$BIN_DIR/skiffcode"
 rm -rf "$SKIFFCODE_HOME/app" "$SKIFFCODE_HOME/pty" "$SKIFFCODE_HOME/src"
+if [[ "$(uname -s)" == Darwin ]]; then rm -rf "$MAC_APP_DIR/SkiffCode.app"; fi
 if grep -qi microsoft /proc/version 2>/dev/null && command -v powershell.exe >/dev/null; then
   # --foreground: WSL suspends Windows programs started outside the terminal's foreground (plain `timeout`).
   timeout --foreground 30 powershell.exe -NoProfile -NonInteractive -Command "Remove-Item -ErrorAction SilentlyContinue (Join-Path \$env:APPDATA 'Microsoft\Windows\Start Menu\Programs\SkiffCode.lnk'); Remove-Item -Recurse -ErrorAction SilentlyContinue (Join-Path \$env:LOCALAPPDATA 'SkiffCode')" </dev/null >/dev/null 2>&1 || true

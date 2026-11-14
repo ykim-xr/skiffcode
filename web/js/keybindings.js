@@ -1,49 +1,58 @@
 // Keyboard shortcuts: the actions, their default keys, the user's changes
 // (settings.keybindings: { id: spec | '' }) and Settings → Keyboard shortcuts.
-import { h, icon, clear } from './util.js';
+import { h, icon, clear, isMac } from './util.js';
 import { call } from './rpc.js';
 import { store, notify } from './store.js';
 import { modal } from './dialogs.js';
 
-/** [id, label, default key ('' = none)]. Ids are saved in settings, so keep them stable. */
+/**
+ * [id, label, default key ('' = none), optional default on a Mac]. Ids are saved in settings, so keep them stable.
+ * 'ctrl' is the primary modifier (Cmd on a Mac); 'control' is the Control key on a Mac and the same as 'ctrl' elsewhere.
+ */
 export const KEY_ACTIONS = [
   ['quickOpen', 'Open file…', 'ctrl+p'],
   ['commands', 'Show all commands', 'ctrl+shift+p'],
   ['jump', 'Jump to session or worktree', 'ctrl+alt+j'],
   ['nextNeedsYou', 'Go to next session that needs you', 'ctrl+alt+k'],
   ['newClaude', 'New Claude session', 'ctrl+alt+n'],
-  ['newShell', 'New shell', 'ctrl+`'],
-  ['togglePanel', 'Toggle bottom panel', 'ctrl+shift+`'],
-  ['review', 'Review changes vs base', 'ctrl+alt+d'],
+  ['newShell', 'New shell', 'ctrl+`', 'control+`'],
+  ['togglePanel', 'Toggle bottom panel', 'ctrl+shift+`', 'control+shift+`'],
+  ['review', 'Review changes vs base', 'ctrl+alt+d', 'ctrl+alt+r'],
   ['search', 'Search in worktree', 'ctrl+shift+f'],
   ['files', 'Show files', 'ctrl+shift+e'],
   ['scm', 'Show source control', 'ctrl+shift+g'],
   ['settings', 'Settings', 'ctrl+,'],
   ['toggleSidebar', 'Toggle sidebar', ''],
-  ['closeTab', 'Close tab', 'alt+w'],
-  ['closeTabOutsideTerminals', 'Close tab (not in terminals)', 'ctrl+w'],
+  ['closeTab', 'Close tab', 'alt+w', ''],
+  ['closeTabOutsideTerminals', isMac ? 'Close tab (also in terminals)' : 'Close tab (not in terminals)', 'ctrl+w'],
   ['nextWorktree', 'Next worktree', 'alt+arrowdown'],
   ['prevWorktree', 'Previous worktree', 'alt+arrowup'],
-  ['nextTab', 'Next tab', 'alt+]'],
-  ['prevTab', 'Previous tab', 'alt+['],
-  ['nextTabAlt', 'Next tab (second key)', 'ctrl+tab'],
-  ['prevTabAlt', 'Previous tab (second key)', 'ctrl+shift+tab'],
+  ['nextTab', 'Next tab', 'alt+]', 'ctrl+shift+]'],
+  ['prevTab', 'Previous tab', 'alt+[', 'ctrl+shift+['],
+  ['nextTabAlt', 'Next tab (second key)', 'ctrl+tab', 'control+tab'],
+  ['prevTabAlt', 'Previous tab (second key)', 'ctrl+shift+tab', 'control+shift+tab'],
 ];
 /** Actions that leave the key to a focused terminal (Ctrl+W deletes a word in shells). */
-export const NOT_IN_TERMINALS = new Set(['closeTabOutsideTerminals']);
+// On a Mac this key is Cmd+W, which would close the app window, so it works in terminals too.
+export const NOT_IN_TERMINALS = new Set(isMac ? [] : ['closeTabOutsideTerminals']);
 
-// Keys the terminal, the editor or SkiffCode itself handle: copy/paste, save, undo, Alt+1–9 worktree jump.
+/** Punctuation by physical key: Option and Shift change e.key. */
+export const PUNCT = { '`': 'Backquote', '[': 'BracketLeft', ']': 'BracketRight', ',': 'Comma', '.': 'Period', '/': 'Slash',
+  '\\': 'Backslash', ';': 'Semicolon', "'": 'Quote', '-': 'Minus', '=': 'Equal' };
+
+// Keys the terminal, the editor or SkiffCode itself handle: copy/paste, save, undo, worktree jump (Alt+1–9, Cmd+1–9 on a Mac).
 const RESERVED = new Set(['ctrl+c', 'ctrl+v', 'ctrl+x', 'ctrl+shift+c', 'ctrl+shift+v', 'ctrl+s', 'ctrl+z',
-  ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => `alt+digit${n}`)]);
+  ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => `${isMac ? 'ctrl' : 'alt'}+digit${n}`),
+  ...(isMac ? ['control+c'] : [])]); // on a Mac the Control key's ^C must always reach the terminal
 
-const DEFAULTS = Object.fromEntries(KEY_ACTIONS.map(([id, , key]) => [id, key]));
+const DEFAULTS = Object.fromEntries(KEY_ACTIONS.map(([id, , key, mac]) => [id, isMac && mac !== undefined ? mac : key]));
 const LABELS = Object.fromEntries(KEY_ACTIONS.map(([id, label]) => [id, label]));
 
 /** Modifiers in the order ctrl, alt, shift: settings can be edited by hand, in any order or case. */
 const norm = spec => {
   const parts = spec.toLowerCase().split('+');
   const key = parts.pop();
-  return [...['ctrl', 'alt', 'shift'].filter(m => parts.includes(m)), key].join('+');
+  return [...['ctrl', 'control', 'alt', 'shift'].filter(m => parts.includes(m)), key].join('+');
 };
 
 /** The key an action has now: the user's choice, else the default. '' = none. */
@@ -76,16 +85,17 @@ export async function setShortcutsOn(on) {
 }
 
 const NAMES = { arrowdown: '↓', arrowup: '↑', arrowleft: '←', arrowright: '→', space: 'Space', escape: 'Esc' };
-/** 'ctrl+shift+p' → 'Ctrl+Shift+P' */
+const MAC_MODS = { ctrl: '⌘', control: '⌃', alt: '⌥', shift: '⇧' };
+/** 'ctrl+shift+p' → 'Ctrl+Shift+P', or '⌘⇧P' on a Mac */
 export function keyLabel(spec) {
   if (!spec) return '';
   return spec.split('+').map((p, i, all) => {
-    if (i < all.length - 1) return p.charAt(0).toUpperCase() + p.slice(1);
+    if (i < all.length - 1) return isMac ? MAC_MODS[p] || p : p === 'control' ? 'Ctrl' : p.charAt(0).toUpperCase() + p.slice(1);
     if (NAMES[p]) return NAMES[p];
     const digit = /^digit(\d)$/.exec(p);
     if (digit) return digit[1];
     return p.length === 1 || /^f\d+$/.test(p) ? p.toUpperCase() : p.charAt(0).toUpperCase() + p.slice(1);
-  }).join('+');
+  }).join(isMac ? '' : '+');
 }
 
 /** A key press → { spec } in the form isKey() matches, { error }, or null for a lone modifier. */
@@ -93,17 +103,18 @@ function specFromEvent(e) {
   if (['Control', 'Alt', 'Shift', 'Meta', 'AltGraph', 'CapsLock'].includes(e.key)) return null;
   if (!(e.ctrlKey || e.metaKey || e.altKey)) {
     if (e.key === 'F12') return { error: 'F12 is reserved for go to definition.' };
-    if (!/^F(?:[1-9]|1[0-2])$/.test(e.key)) return { error: 'Use Ctrl or Alt with the key, so typing still works.' };
+    if (!/^F(?:[1-9]|1[0-2])$/.test(e.key)) return { error: isMac ? 'Use ⌘, ⌃ or ⌥ with the key, so typing still works.' : 'Use Ctrl or Alt with the key, so typing still works.' };
   }
   let key;
   // Letters and digits by physical key: with Shift or Alt, e.key can be another character.
   if (/^Key[A-Z]$/.test(e.code)) key = e.code.slice(3).toLowerCase();
   else if (/^Digit\d$/.test(e.code)) key = e.code.toLowerCase();
-  else if (e.code === 'Backquote') key = '`';
+  else if (Object.values(PUNCT).includes(e.code)) key = Object.keys(PUNCT).find(c => PUNCT[c] === e.code);
   else if (e.key === ' ') key = 'space';
   else if (['+', 'Dead', 'Unidentified'].includes(e.key)) key = e.code.toLowerCase(); // '+' is the spec's separator
   else key = e.key.toLowerCase();
-  const spec = [(e.ctrlKey || e.metaKey) && 'ctrl', e.altKey && 'alt', e.shiftKey && 'shift', key].filter(Boolean).join('+');
+  const mods = isMac ? [e.metaKey && 'ctrl', e.ctrlKey && 'control'] : [(e.ctrlKey || e.metaKey) && 'ctrl'];
+  const spec = [...mods, e.altKey && 'alt', e.shiftKey && 'shift', key].filter(Boolean).join('+');
   if (RESERVED.has(spec)) return { error: `${keyLabel(spec)} is reserved for copy, paste, save, undo or worktree jumps.` };
   return { spec };
 }

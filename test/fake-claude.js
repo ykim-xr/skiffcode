@@ -48,6 +48,8 @@ if (args[0] === 'auth') {
   return;
 }
 fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ args, cwd: process.cwd(), env: process.env.SKIFFCODE_SESSION_ID, configDir: process.env.CLAUDE_CONFIG_DIR || null, userStatusLine: process.env.SKIFFCODE_USER_STATUSLINE || null }) + '\n');
+// pids of this run's fake Claudes, so a test can check none survive (no /proc on macOS)
+fs.appendFileSync(`${process.env.FAKE_LOG}.pids`, `${process.pid}\n`);
 const settings = JSON.parse(fs.readFileSync(args[args.indexOf('--settings') + 1], 'utf8'));
 // the id SkiffCode passed, so hooks carry the session's real Claude id
 const sessionId = args[args.findIndex(a => a === '--session-id' || a === '--resume') + 1];

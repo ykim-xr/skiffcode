@@ -1,6 +1,6 @@
 'use strict';
 // Alerts from the server itself, for when no SkiffCode window is open:
-// on WSL through Windows (PowerShell sound + toast), on Linux via paplay/notify-send.
+// on WSL through Windows (PowerShell sound + toast), on macOS via afplay/osascript, on Linux via paplay/notify-send.
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -69,7 +69,7 @@ async function windowsSoundPath(file) {
   }
 }
 
-/** Play a sound file at a volume (0–1): Windows (from WSL) or PipeWire / PulseAudio / ALSA. */
+/** Play a sound file at a volume (0–1): Windows (from WSL), macOS, or PipeWire / PulseAudio / ALSA. */
 function playFile(file, volume = 0.7) {
   if (!file) return;
   const v = Math.max(0, Math.min(1, Number(volume)));
@@ -91,6 +91,7 @@ function playFile(file, volume = 0.7) {
     });
     return;
   }
+  if (process.platform === 'darwin') return quiet('/usr/bin/afplay', ['-v', v.toFixed(2), file]);
   if (which('pw-play')) return quiet(which('pw-play'), ['--volume', v.toFixed(2), file]);
   if (which('paplay')) return quiet(which('paplay'), [`--volume=${Math.round(v * 65536)}`, file]);
   if (which('aplay') && file.endsWith('.wav')) return quiet(which('aplay'), ['-q', file]);
@@ -108,11 +109,20 @@ function toastScript(title, body) {
   ].join('; ');
 }
 
+/**
+ * osascript arguments that show a macOS notification. Session, branch and repo names reach the script only as
+ * argv, never as script text; `--` keeps a title starting with "-" from being read as an option (-e, -l).
+ */
+function macNotifyArgs(title, body) {
+  return ['-e', 'on run argv', '-e', 'display notification (item 2 of argv) with title (item 1 of argv)', '-e', 'end run', '--', String(title), String(body)];
+}
+
 function desktopNotify(title, body) {
   if (isWSL()) {
     runPS(toastScript(title, body));
     return;
   }
+  if (process.platform === 'darwin') return quiet('/usr/bin/osascript', macNotifyArgs(title, body));
   const ns = which('notify-send');
   if (ns) quiet(ns, ['-a', 'SkiffCode', title, body]);
 }
@@ -134,4 +144,4 @@ function alertWithoutWindow({ session, kind, repoName, settings, muted, soundFil
   if (settings.desktopNotifications !== false) desktopNotify(title, body);
 }
 
-module.exports = { alertWithoutWindow, playFile, desktopNotify, toastScript, isWSL, powershell };
+module.exports = { alertWithoutWindow, playFile, desktopNotify, toastScript, macNotifyArgs, isWSL, powershell };

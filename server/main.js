@@ -13,7 +13,7 @@ const fsops = require('./fsops');
 const search = require('./search');
 const { State } = require('./state');
 const { Sessions } = require('./sessions');
-const { PtyClient, hostPids } = require('./pty');
+const { PtyClient, hostPids, procfs, psProcess } = require('./pty');
 const notify = require('./notify');
 const { Accounts, claudeBin } = require('./accounts');
 const history = require('./history');
@@ -42,11 +42,23 @@ const PID_FILE = path.join(HOME, 'server.pid');
   try { pid = Number(fs.readFileSync(PID_FILE, 'utf8').trim()); } catch { return; }
   if (!pid || pid === process.pid) return;
   let args;
-  try { args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0'); } catch { return; }
+  if (procfs) {
+    try { args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0'); } catch { return; }
+  } else {
+    const p = psProcess(pid);
+    if (!p) return;
+    args = p.command.split(' ');
+  }
   if (!args.some(a => a.endsWith(path.join('server', 'main.js')))) return;
   console.error(`skiffcode: a SkiffCode server (pid ${pid}) is already running for ${HOME}. Stop it first: skiffcode stop`);
   process.exit(1);
 })();
+
+// A Unix socket path has a size limit (macOS 104 bytes, Linux 108, each with the final NUL): terminals would fail to start.
+if (Buffer.byteLength(path.join(HOME, 'pty', `${crypto.randomUUID()}.sock`)) > (process.platform === 'darwin' ? 103 : 107)) {
+  console.error('SkiffCode’s data folder path is too long for terminal sockets. Set SKIFFCODE_HOME to a shorter folder.');
+  process.exit(1);
+}
 
 // Private folders, made one by one: a umask would pass to terminals, shells and Claude and make your own files private too.
 for (const d of ['', 'status', 'inbox', 'drops', 'accounts']) privateDir(path.join(HOME, d));
@@ -149,6 +161,7 @@ function snapshot() {
     currentLogin: accounts.currentLogin(),
     usage: accounts.usage,
     settings: settings(),
+    platform: process.platform,
   };
 }
 
@@ -1173,7 +1186,7 @@ const server = http.createServer((req, res) => {
   }
   if (!authed(req)) {
     res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
-    return res.end('<!doctype html><meta charset=utf-8><title>SkiffCode</title><body style="font:14px system-ui;background:#1e1e1e;color:#ccc;padding:40px">Open SkiffCode with the <code>skiffcode</code> command in your WSL terminal.</body>');
+    return res.end('<!doctype html><meta charset=utf-8><title>SkiffCode</title><body style="font:14px system-ui;background:#1e1e1e;color:#ccc;padding:40px">Open SkiffCode with the <code>skiffcode</code> command in a terminal.</body>');
   }
   if (url.pathname === '/') return serveFile(res, path.join(WEB, 'index.html'));
   if (url.pathname.startsWith('/custom-sounds/')) {

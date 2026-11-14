@@ -7,7 +7,7 @@ const { execFile } = require('child_process');
 const path = require('path');
 const crypto = require('crypto');
 const { EventEmitter } = require('events');
-const { spawnHost, hostAlive, hostPids, isHost, PtyClient } = require('./pty');
+const { spawnHost, hostAlive, hostPids, isHost, psSnapshot, procfs, PtyClient } = require('./pty');
 const { shq, userShell, TERM_SIZE } = require('./util');
 const { userStatusLine, quotedPath } = require('./accounts');
 const { UUID } = require('./history');
@@ -241,7 +241,7 @@ class Sessions extends EventEmitter {
 
   async killHost(id) {
     const sock = this.sock(id);
-    const { host } = hostPids(sock);
+    const { host } = hostPids(sock, { fresh: true });
     if (!host) return;
     try {
       const c = await new PtyClient(sock).connect();
@@ -251,7 +251,7 @@ class Sessions extends EventEmitter {
     } catch { /* gone */ }
     // Checked again: the child may have exited meanwhile, and its pid gone to another process.
     const signal = sig => {
-      const { child } = hostPids(sock);
+      const { child } = hostPids(sock, { fresh: true });
       if (child) {
         try { process.kill(-child, sig === 'SIGKILL' ? sig : 'SIGHUP'); } catch { /* not a group leader */ }
         try { process.kill(child, sig); } catch { /* gone */ }
@@ -261,7 +261,8 @@ class Sessions extends EventEmitter {
     signal('SIGTERM');
     // Wait for the old host to finish cleaning up before anything reuses its socket path.
     const end = Date.now() + 3000;
-    while (isHost(host, sock) && Date.now() < end) await new Promise(r => setTimeout(r, 30));
+    // without /proc each check runs ps, so check less often
+    while (isHost(host, sock) && Date.now() < end) await new Promise(r => setTimeout(r, procfs ? 30 : 100));
     if (isHost(host, sock)) signal('SIGKILL');
   }
 
@@ -508,15 +509,21 @@ class Sessions extends EventEmitter {
     if (this.scanning) return;
     this.scanning = true;
     try {
-      const out = await new Promise(res => execFile('ps', ['-eo', 'pid=,ppid=,etimes=,args='], { maxBuffer: 16 << 20 }, (e, so) => res(e ? '' : so)));
-      if (!out) return;
+      let procs; // [pid, ppid, age in seconds, args]
+      if (procfs) {
+        const out = await new Promise(res => execFile('ps', ['-eo', 'pid=,ppid=,etimes=,args='], { maxBuffer: 16 << 20 }, (e, so) => res(e ? '' : so)));
+        if (!out) return;
+        procs = out.split('\n').map(line => line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/)).filter(Boolean).map(m => [Number(m[1]), Number(m[2]), Number(m[3]), m[4]]);
+      } else {
+        // BSD ps has no etimes: the shared snapshot has etime, already in seconds
+        const snap = await psSnapshot();
+        if (!snap) return;
+        procs = [...snap].map(([pid, p]) => [pid, p.ppid, p.age, p.command]);
+      }
       const kids = new Map();
       const info = new Map();
-      for (const line of out.split('\n')) {
-        const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/);
-        if (!m) continue;
-        const [pid, ppid, age] = [Number(m[1]), Number(m[2]), Number(m[3])];
-        info.set(pid, { age, args: m[4] });
+      for (const [pid, ppid, age, args] of procs) {
+        info.set(pid, { age, args });
         if (!kids.has(ppid)) kids.set(ppid, []);
         kids.get(ppid).push(pid);
       }

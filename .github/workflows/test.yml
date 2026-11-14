@@ -1,0 +1,126 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      GIT_AUTHOR_NAME: ci
+      GIT_AUTHOR_EMAIL: ci@example.invalid
+      GIT_COMMITTER_NAME: ci
+      GIT_COMMITTER_EMAIL: ci@example.invalid
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The suites make temp dirs with os.tmpdir(); macOS defaults to a long /var/folders path.
+      - name: Short TMPDIR on macOS
+        if: runner.os == 'macOS'
+        run: echo "TMPDIR=/tmp" >> "$GITHUB_ENV"
+
+      - name: Tool versions
+        run: |
+          bash --version | head -n 1
+          /bin/bash --version | head -n 1
+          python3 --version
+          ps -o etimes= -p $$ || echo no-etimes
+          command -v rg || echo no-rg
+          # The server finds its terminal hosts in ps output where there is no /proc: shows whether ps escapes non-ASCII paths.
+          python3 -c 'import time; time.sleep(2)' '/tmp/프로젝트 a/x.sock' & /bin/ps -ww -o command= -p $! | od -c | head -n 6; wait
+
+      - name: Install Playwright
+        run: |
+          npm i -g playwright@1.64.1
+          if [ "$RUNNER_OS" = Linux ]; then
+            playwright install --with-deps chromium
+          else
+            playwright install chromium
+          fi
+
+      - name: Server suite
+        id: api
+        run: node test/api.test.js
+
+      # always() so one run shows the failures of every suite.
+      - name: UI suite
+        id: ui
+        if: always()
+        env:
+          SKIFFCODE_VENDOR: test/stub-vendor
+          # the runner context isn't available in the job-level env
+          SHOTS: ${{ runner.temp }}/shots
+        run: |
+          PLAYWRIGHT_PATH="$(npm root -g)/playwright" node test/ui.test.js
+
+      # /bin/bash is bash 3.2 on macOS, which is what the launcher must run under.
+      # No -e: every check runs, and the step fails at the end if any did.
+      - name: Launcher smoke
+        id: smoke
+        if: always()
+        shell: /bin/bash {0}
+        env:
+          SKIFFCODE_HOME: ${{ runner.temp }}/skh
+          SKIFFCODE_BIN_DIR: ${{ runner.temp }}/skh/bin
+          SKIFFCODE_PORT: "3419"
+          SKIFFCODE_MAC_APP_DIR: ${{ runner.temp }}/apps
+        run: |
+          fail=0
+          check() { # check <label> <command...>
+            local label=$1; shift
+            if "$@"; then echo "ok: $label"; else echo "FAIL: $label"; fail=1; fi
+          }
+          sk=$SKIFFCODE_BIN_DIR/skiffcode
+
+          check install /bin/bash ./install.sh
+          check url /bin/bash "$sk" url
+
+          # A non-ASCII folder reaches the window intact (percent-encoded UTF-8)
+          ko="$RUNNER_TEMP/프로젝트 a"; mkdir -p "$ko"
+          u=$(/bin/bash "$sk" url "$ko" 2>/dev/null)
+          check "url keeps a non-ASCII folder" node -e 'const [u, d] = process.argv.slice(1); process.exit(new URL(u).searchParams.get("folder") === require("fs").realpathSync(d) ? 0 : 1)' "$u" "$ko"
+
+          out=$(/bin/bash "$sk" status 2>&1); echo "$out"
+          check "status is running" grep -q running <<<"$out"
+
+          out=$(/bin/bash "$sk" stop 2>&1); echo "$out"
+          check "stop says stopped" grep -q stopped <<<"$out"
+
+          out=$(/bin/bash "$sk" new /tmp x -n 2>&1); rc=$?; echo "$out"
+          check "new -n fails" test "$rc" -ne 0
+          check "new -n says needs a value" grep -q 'needs a value' <<<"$out"
+
+          if [ "$RUNNER_OS" = macOS ]; then
+            check "Info.plist is valid" plutil -lint "$SKIFFCODE_MAC_APP_DIR/SkiffCode.app/Contents/Info.plist"
+          fi
+
+          check uninstall /bin/bash ./uninstall.sh
+          exit $fail
+
+      - name: Upload screenshots and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ matrix.os }}
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/shots
+            ${{ runner.temp }}/skh/server.log
+            /tmp/skiffcode-*/home/server.log

@@ -15,6 +15,8 @@ const SIGN_IN_WAIT = 30 * 60e3;
 const LOCK_STALE = 10e3;
 const LOCK_WAIT = 5e3;
 const BACKUPS = 5;
+// On macOS Claude keeps its login in the Keychain, not in .credentials.json. SkiffCode never reads or writes the Keychain.
+const NO_SWITCHING_MAC = 'Switching Claude accounts isn’t available on macOS yet.';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function readJson(file) {
@@ -88,8 +90,9 @@ async function withClaudeLock(file, fn) {
 }
 
 class Accounts {
-  constructor(state, home) {
+  constructor(state, home, { platform = process.platform } = {}) {
     this.state = state;
+    this.mac = platform === 'darwin';
     this.home = home;
     this.dir = path.join(home, 'accounts');
     this.lastSwitchFile = path.join(this.dir, 'last-switch.json');
@@ -157,8 +160,9 @@ class Accounts {
    */
   inUseId() {
     const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } };
-    const cred = this.sharedCredentialsFile();
     const global = globalConfigFile();
+    if (this.mac) return this.macLogin(global, mtime(global));
+    const cred = this.sharedCredentialsFile();
     const key = `${mtime(cred)}:${mtime(global)}:${this.version}`;
     if (key === this.current.key) return this.current.inUse;
     const o = oauthOf(readJson(cred));
@@ -172,6 +176,17 @@ class Accounts {
     // A half-written .claude.json is read again next time
     this.current = { key: g || !fs.existsSync(global) ? key : null, inUse, login };
     return inUse;
+  }
+
+  /** On macOS: who is signed in, from .claude.json alone. No saved account is ever in use there. */
+  macLogin(global, mtime) {
+    const key = `mac:${mtime}`;
+    if (key === this.current.key) return null;
+    const g = readJson(global);
+    const acct = g && g.oauthAccount;
+    const login = acct ? { email: acct.emailAddress, org: acct.organizationName, plan: undefined, saved: false, expired: false } : null;
+    this.current = { key: g || !fs.existsSync(global) ? key : null, inUse: null, login };
+    return null;
   }
 
   /**
@@ -245,6 +260,7 @@ class Accounts {
 
   /** Save the login in use now as an account (it keeps its account if it already has one). */
   saveCurrent(name) {
+    if (this.mac) throw new Error(NO_SWITCHING_MAC);
     const o = oauthOf(readJson(this.sharedCredentialsFile()));
     if (!o) throw new Error('No Claude login to save');
     const g = readJson(globalConfigFile());
@@ -290,6 +306,7 @@ class Accounts {
   }
 
   async switchTo(id) {
+    if (this.mac) throw new Error(NO_SWITCHING_MAC);
     if (!this.has(id)) throw new Error('Unknown account');
     this.switchTarget(id);
     const credFile = this.sharedCredentialsFile();
@@ -338,6 +355,7 @@ class Accounts {
 
   /** A private folder for `claude auth login`; its login is kept once it's done. */
   startSignIn(name) {
+    if (this.mac) throw new Error(NO_SWITCHING_MAC);
     const clean = String(name || '').trim();
     if (!clean) throw new Error('Enter a name');
     const scratch = path.join(this.dir, `.login-${crypto.randomUUID()}`);

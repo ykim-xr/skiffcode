@@ -1,7 +1,7 @@
 // Right panel: Source Control for this worktree — stage/unstage/discard,
 // commit, push/pull, changes vs base, commits on this branch, and the full
 // commit history of HEAD in a resizable pane below.
-import { h, icon, clear, basename, dirname, relTime, readStored, dirtyCount, STATUS_LETTER, STATUS_LABEL } from './util.js';
+import { h, icon, clear, platformHint, basename, dirname, relTime, readStored, dirtyCount, STATUS_LETTER, STATUS_LABEL } from './util.js';
 import { call, on } from './rpc.js';
 import { store, loadStatus } from './store.js';
 import { confirmDialog, promptDialog, toast, outputDialog, contextMenu } from './dialogs.js';
@@ -25,7 +25,7 @@ export class ScmView {
     this.badge = h('span.count-badge.hidden');
     this.el = h('div.right-view.scm-view');
     this.msg = h('textarea.input.commit-msg', {
-      placeholder: 'Message (Ctrl+Enter to commit)',
+      placeholder: platformHint('Message (Ctrl+Enter to commit)'),
       rows: '3',
       onkeydown: e => {
         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {

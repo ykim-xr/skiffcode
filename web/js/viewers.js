@@ -1,7 +1,7 @@
 // Viewers shown in a worktree's panes: images, PDFs, HTML previews and web pages.
 // Files are served read-only at /view/<key>/<path> (see server/main.js): pages run sandboxed,
 // with their own origin, so a previewed page's scripts can't reach SkiffCode.
-import { h, icon, basename, clear, debounce } from './util.js';
+import { h, icon, basename, clear, debounce, isMac, platformHint } from './util.js';
 import { call, on } from './rpc.js';
 import { toast } from './dialogs.js';
 
@@ -191,7 +191,7 @@ export class WebTab extends ViewerBase {
     this.ready = url ? this.navigate(url) : this.blank();
   }
   blank() {
-    this.input.placeholder = 'A web address (localhost:3000, https://…) or a file path (/home/…, C:\\…, \\\\wsl.localhost\\…)';
+    this.input.placeholder = `A web address (localhost:3000, https://…) or a file path (${isMac ? '/Users/…' : '/home/…, C:\\…, \\\\wsl.localhost\\…'})`;
     clear(this.stage, h('div.viewer-blocked', icon('globe'), h('div.muted', 'Type a web address, or paste the path of a file (an HTML report, an image, a PDF…), and press Enter.')));
     setTimeout(() => this.input.focus(), 0);
   }
@@ -285,7 +285,7 @@ export class WebTab extends ViewerBase {
   serialize() { return this.url ? { kind: 'web', url: this.url } : null; }
 }
 
-export const LINK_HINT = 'Click: open in your browser · Ctrl+click: open in SkiffCode';
+export const LINK_HINT = platformHint('Click: open in your browser · Ctrl+click: open in SkiffCode');
 /**
  * A link clicked in a terminal or the editor: Ctrl+click (Cmd+click) opens it in a SkiffCode tab,
  * a plain click in your browser. (In the editor, following a link always takes Ctrl+click: a tab here.)

@@ -44,7 +44,7 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 |---|---|
 | **Windows** | in **WSL** (where Claude Code runs); opens as an Edge app window, with Windows notifications and a Start menu entry |
 | **Linux** | natively; opens in Chrome / Chromium / Edge as an app window (or any browser), notifications via `notify-send`, sounds via PipeWire / PulseAudio |
-| macOS | not yet |
+| **macOS** | natively, experimental (not yet tried on a real Mac); same install command (needs Node.js 18+, git and the Xcode Command Line Tools); opens as a Chrome / Edge / Brave app window, and `SkiffCode` is added to `~/Applications`; no account switching yet; started from the app, macOS may ask for access to Documents, Desktop and Downloads the first time |
 
 ## Install
 
@@ -82,6 +82,8 @@ Defaults; change or switch them off in Settings → Keyboard shortcuts. F12 · S
 | Ctrl+Shift+F · E · G | search · files · source control |
 | Ctrl+Alt+D | review changes vs base |
 | F12 · Shift+F12 | go to definition · references |
+
+On macOS, ⌘ takes the place of Ctrl, and the Control key belongs to the terminal (⌃C always interrupts). Different there: new shell ⌃\`, bottom panel ⌃⇧\`, review ⌘⌥R, next / previous tab ⌘⇧] · ⌘⇧[, worktrees ⌘1–9.
 
 ## How it works
 

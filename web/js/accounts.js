@@ -20,6 +20,9 @@ function currentUsage() {
   return (store.usage || {})[a ? a.id : 'current'];
 }
 
+/** On macOS Claude keeps its login in the Keychain, which SkiffCode leaves alone: no switching there. */
+const noSwitching = () => store.platform === 'darwin';
+
 function whoText(x) {
   return [x.email, x.org, x.plan].filter(Boolean).join(' · ');
 }
@@ -79,7 +82,7 @@ export function usageItem() {
     five ? `5-hour: ${Math.round(five.used)}% used, ${resetText(five.resetsAt)}` : noFiveHour(u) ? '5-hour: no limit reported' : '5-hour: not reported yet',
     week ? `Weekly: ${Math.round(week.used)}% used, ${resetText(week.resetsAt)}` : 'Weekly: not reported yet',
     u ? `Updated ${timeText(u.at)} (Claude reports usage while a session is working)` : 'Usage appears once a Claude session talks to Claude (Pro/Max logins).',
-    'Click to switch account or refresh usage',
+    noSwitching() ? 'Click for details' : 'Click to switch account or refresh usage',
   ].join('\n');
   return h('span.sb-item.click.usage', { title: tip, onclick: () => accountsDialog() },
     icon('claude', 'st-claude'),
@@ -92,15 +95,18 @@ export function usageItem() {
 
 /** The account panel. */
 export async function accountsDialog() {
+  const mac = noSwitching();
   const current = h('div.accounts-current');
   const body = h('div.accounts-list');
   const m = modal([
     h('div.modal-title', 'Claude accounts'),
-    h('div.modal-detail.muted', 'Every Claude session uses the login in use. Pick a saved login to switch all of them, like /login does.'),
+    mac
+      ? h('div.modal-detail.muted.accounts-mac', 'Switching accounts isn’t available on macOS yet. Usage still shows while Claude sessions run.')
+      : h('div.modal-detail.muted', 'Every Claude session uses the login in use. Pick a saved login to switch all of them, like /login does.'),
     current,
     body,
     h('div.modal-buttons',
-      h('button.btn', { onclick: addAccount }, icon('plus'), 'Add account…'),
+      mac ? null : h('button.btn', { onclick: addAccount }, icon('plus'), 'Add account…'),
       h('button.btn.primary', { onclick: () => m.close() }, 'Done')),
   ]);
   m.box.classList.add('accounts-modal');
@@ -111,7 +117,7 @@ export async function accountsDialog() {
     clear(current,
       h('span.accounts-current-text', cur ? `Signed in now: ${whoText(cur) || 'unknown login'}` : 'Not signed in to Claude'),
       cur && cur.expired ? h('span.account-warn', 'expired') : null,
-      cur && !cur.saved ? h('button.btn.small', { onclick: saveCurrent }, 'Save as account…') : null);
+      cur && !cur.saved && !mac ? h('button.btn.small', { onclick: saveCurrent }, 'Save as account…') : null);
     clear(body, store.accounts.length ? store.accounts.map(a => {
       const u = (store.usage || {})[a.id];
       const five = live(u && u.fiveHour);
@@ -124,11 +130,11 @@ export async function accountsDialog() {
           h('div.account-usage', meter('wk', week), week ? h('span.muted', ` ${resetText(week.resetsAt)}`) : null),
           u ? h('div.account-updated', `Updated ${timeText(u.at)}`) : null),
         h('div.account-actions',
-          a.inUse ? null : h('button.btn.small', { onclick: () => use(a) }, 'Use'),
+          a.inUse || mac ? null : h('button.btn.small', { onclick: () => use(a) }, 'Use'),
           h('button.icon-btn.account-refresh', { title: 'Refresh usage', disabled: loading.has(a.id), onclick: () => refresh(a) }, icon('refresh')),
           h('button.icon-btn', { title: 'Rename', onclick: () => rename(a) }, icon('edit')),
           h('button.icon-btn', { title: 'Forget this saved login', onclick: () => remove(a) }, icon('trash'))));
-    }) : h('div.muted.accounts-empty', 'No saved logins yet. Add one to switch between logins and orgs.'));
+    }) : mac ? null : h('div.muted.accounts-empty', 'No saved logins yet. Add one to switch between logins and orgs.'));
   };
   render();
 

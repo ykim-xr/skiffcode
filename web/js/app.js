@@ -1,5 +1,5 @@
 // SkiffCode app: wires the sidebar, workspaces, palettes, shortcuts and alerts.
-import { h, icon, clear, basename, dirname, tildify, languageOf, readStored, TERM_SIZE } from './util.js';
+import { h, icon, clear, isMac, basename, dirname, tildify, languageOf, readStored, TERM_SIZE } from './util.js';
 import { call, connect, on, connected } from './rpc.js';
 import { store, applySnapshot, loadAll, loadWorktrees, loadStatus, allWorktrees, worktree, sessionsIn, session, needsYou, subscribe, notify as sidebarRefresh } from './store.js';
 import { initSidebar, stateLabel, sessionIcon } from './sidebar.js';
@@ -13,7 +13,7 @@ import { resumeDialog, offerPastConversations } from './resume-dialog.js';
 import { applyColors, colorsDialog, defineEditorTheme } from './colors.js';
 import { addRepoDialog } from './add-repo-dialog.js';
 import { soundsDialog } from './sounds-dialog.js';
-import { activeKeys, keyHint, withKey, keybindingsDialog, shortcutsOn, setShortcutsOn, NOT_IN_TERMINALS } from './keybindings.js';
+import { activeKeys, keyHint, withKey, keybindingsDialog, shortcutsOn, setShortcutsOn, NOT_IN_TERMINALS, PUNCT } from './keybindings.js';
 import { openLink } from './viewers.js';
 
 const app = {
@@ -554,7 +554,7 @@ const actions = {
   async openWebPage() {
     const ws = app.active;
     if (!ws) return toast('Open a worktree first.');
-    const url = await promptDialog({ title: 'Open web page or file', placeholder: 'localhost:3000, https://…, or a file path (/home/…, C:\\…, \\\\wsl.localhost\\…)', okLabel: 'Open' });
+    const url = await promptDialog({ title: 'Open web page or file', placeholder: `localhost:3000, https://…, or a file path (${isMac ? '/Users/…' : '/home/…, C:\\…, \\\\wsl.localhost\\…'})`, okLabel: 'Open' });
     if (url && url.trim()) ws.openWeb(url.trim());
   },
   async commands() {
@@ -777,10 +777,14 @@ function isKey(e, spec) {
   if (e.getModifierState && e.getModifierState('AltGraph')) return false; // AltGr reports Ctrl+Alt but types a character
   const parts = spec.toLowerCase().split('+');
   const key = parts.pop();
-  const want = { ctrl: parts.includes('ctrl'), alt: parts.includes('alt'), shift: parts.includes('shift') };
-  if ((e.ctrlKey || e.metaKey) !== want.ctrl || e.altKey !== want.alt || e.shiftKey !== want.shift) return false;
+  const want = { ctrl: parts.includes('ctrl'), control: parts.includes('control'), alt: parts.includes('alt'), shift: parts.includes('shift') };
+  // On a Mac 'ctrl' is Cmd and 'control' the Control key; elsewhere both mean Ctrl.
+  const mods = isMac
+    ? e.metaKey === want.ctrl && e.ctrlKey === want.control
+    : (e.ctrlKey || e.metaKey) === (want.ctrl || want.control);
+  if (!mods || e.altKey !== want.alt || e.shiftKey !== want.shift) return false;
   const k = e.key.toLowerCase();
-  return k === key || e.code.toLowerCase() === `key${key}` || (key === '`' && e.code === 'Backquote') || e.code.toLowerCase() === key;
+  return k === key || e.code.toLowerCase() === `key${key}` || (PUNCT[key] && e.code === PUNCT[key]) || e.code.toLowerCase() === key;
 }
 
 /** What each shortcut does, by action id (keys: keybindings.js). */
@@ -821,6 +825,10 @@ function stepTab(d) {
   setTimeout(() => p.active.focus(), 0);
 }
 
+// Alt+1–9, or Cmd+1–9 on a Mac, where Option+digit types characters on many layouts.
+const isWorktreeJump = e => /^Digit[1-9]$/.test(e.code)
+  && (isMac ? e.metaKey && !e.ctrlKey && !e.altKey : e.altKey && !e.ctrlKey);
+
 function globalKey(e) {
   const inTerminal = e.target instanceof Element && e.target.closest('.term-host');
   for (const [id, spec] of activeKeys()) {
@@ -832,7 +840,7 @@ function globalKey(e) {
       return true;
     }
   }
-  if (shortcutsOn() && e.altKey && !e.ctrlKey && /^Digit[1-9]$/.test(e.code)) {
+  if (shortcutsOn() && isWorktreeJump(e)) {
     const list = orderedWorktrees();
     const w = list[Number(e.code.slice(5)) - 1];
     if (w) {
@@ -858,10 +866,15 @@ app.terminalKey = (e, tab) => {
     t.copySelection();
     return false;
   }
+  if (isMac && isKey(e, 'ctrl+c')) return false; // Cmd+C with nothing selected does nothing; Ctrl+C is a different key here
   if (isKey(e, 'ctrl+shift+c')) return false;
   if (isKey(e, 'ctrl+v') || isKey(e, 'ctrl+shift+v')) return false; // the browser's paste event reaches xterm
   for (const [id, spec] of activeKeys()) if (!NOT_IN_TERMINALS.has(id) && isKey(e, spec)) return false;
-  if (shortcutsOn() && e.altKey && /^Digit[1-9]$/.test(e.code)) return false;
+  if (shortcutsOn() && (isMac ? isWorktreeJump(e) : e.altKey && /^Digit[1-9]$/.test(e.code))) return false;
+  if (isMac && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && ['KeyW', 'KeyT', 'KeyN'].includes(e.code)) {
+    e.preventDefault(); // keep the browser from closing or opening windows
+    return false;
+  }
   return true;
 };
 

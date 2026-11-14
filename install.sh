@@ -5,7 +5,8 @@
 #   ./install.sh                      (from a copy of the repo)
 #
 # Puts the app in ~/.local/share/skiffcode/app, the `skiffcode` command in ~/.local/bin,
-# and (on WSL) "SkiffCode" in the Windows Start menu. Update later with: skiffcode update
+# (on WSL) "SkiffCode" in the Windows Start menu, or (on macOS) SkiffCode.app in ~/Applications.
+# Update later with: skiffcode update
 set -euo pipefail
 
 REPO="${SKIFFCODE_REPO:-https://github.com/ykim-xr/skiffcode.git}"
@@ -13,6 +14,10 @@ DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 SKIFFCODE_HOME="${SKIFFCODE_HOME:-$DATA/skiffcode}"
 APP="$SKIFFCODE_HOME/app"
 BIN_DIR="${SKIFFCODE_BIN_DIR:-$HOME/.local/bin}"
+MAC_APP_DIR="${SKIFFCODE_MAC_APP_DIR:-$HOME/Applications}"
+DARWIN=0
+if [[ "$(uname -s)" == Darwin ]]; then DARWIN=1; fi
+if ((DARWIN)); then INSTALL_GIT="xcode-select --install"; PKG_INSTALL="brew install"; else INSTALL_GIT="sudo apt install git"; PKG_INSTALL="sudo apt install"; fi
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m!!\033[0m %s\n' "$*"; }
@@ -25,7 +30,7 @@ winps() { timeout --foreground 60 powershell.exe -NoProfile -NonInteractive -Com
 HERE=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; fi
 if [[ -z "$HERE" || ! -f "$HERE/server/main.js" ]]; then
-  command -v git >/dev/null || die "git is required (sudo apt install git)"
+  command -v git >/dev/null || die "git is required ($INSTALL_GIT)"
   SRC="$SKIFFCODE_HOME/src"
   (umask 077; mkdir -p "$SKIFFCODE_HOME")
   if [[ -d "$SRC/.git" ]]; then
@@ -45,10 +50,15 @@ if ! command -v node >/dev/null; then
 fi
 major="$(node -p 'process.versions.node.split(".")[0]')"
 (( major >= 18 )) || die "Node.js $(node -v) is too old; SkiffCode needs 18+ (nvm install --lts)"
-command -v python3 >/dev/null || die "python3 is required (sudo apt install python3)"
-command -v git >/dev/null || die "git is required (sudo apt install git)"
+if ((DARWIN)); then
+  # Apple's /usr/bin/python3 passes `command -v` without the Command Line Tools, and running it pops an install dialog.
+  python3 -c 'import pty' >/dev/null 2>&1 || die "python3 is required (xcode-select --install, or brew install python)"
+else
+  command -v python3 >/dev/null || die "python3 is required (sudo apt install python3)"
+fi
+command -v git >/dev/null || die "git is required ($INSTALL_GIT)"
 command -v claude >/dev/null || warn "'claude' isn't on PATH yet — install Claude Code, or set the command in SkiffCode's Settings."
-command -v rg >/dev/null || warn "ripgrep makes search much faster: sudo apt install ripgrep (SkiffCode falls back to git grep)"
+command -v rg >/dev/null || warn "ripgrep makes search much faster: $PKG_INSTALL ripgrep (SkiffCode falls back to git grep)"
 
 # ---- app files
 say "Installing SkiffCode $(node -p "require('$HERE/package.json').version") → $APP"
@@ -91,6 +101,46 @@ if "$BIN_DIR/skiffcode" status 2>/dev/null </dev/null | grep -q '^running'; then
 fi
 rm -rf "$APP.old"
 
+# ---- SkiffCode.app (macOS)
+# A GUI app gets no user PATH and no LANG, so the launcher runs skiffcode through a login shell.
+make_mac_app() {
+  local dir="$MAC_APP_DIR/SkiffCode.app" bin quoted
+  bin="$(cd "$BIN_DIR" && pwd)/skiffcode" || return 1
+  # Single-quote the path for sh; it never goes inside the -lic string.
+  quoted="$(printf '%s' "$bin" | sed "s/'/'\\\\''/g")"
+  rm -rf "$dir.new"
+  mkdir -p "$dir.new/Contents/MacOS" "$dir.new/Contents/Resources" || return 1
+  cat >"$dir.new/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>SkiffCode</string>
+  <key>CFBundleIdentifier</key><string>io.github.ykim-xr.skiffcode</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleExecutable</key><string>SkiffCode</string>
+  <key>CFBundleIconFile</key><string>skiffcode</string>
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+PLIST
+  {
+    printf "#!/bin/sh\nSKIFFCODE_BIN='%s'\n" "$quoted"
+    cat <<'LAUNCHER'
+export LANG="${LANG:-en_US.UTF-8}"
+exec "${SHELL:-/bin/zsh}" -lic 'exec "$0" "$@"' "$SKIFFCODE_BIN" "$@" </dev/null
+LAUNCHER
+  } >"$dir.new/Contents/MacOS/SkiffCode" || return 1
+  chmod 755 "$dir.new/Contents/MacOS/SkiffCode" || return 1
+  cp "$APP/web/icons/skiffcode.icns" "$dir.new/Contents/Resources/skiffcode.icns" || return 1
+  rm -rf "$dir"
+  mv "$dir.new" "$dir"
+}
+if ((DARWIN)); then
+  say "Adding SkiffCode.app to $MAC_APP_DIR"
+  make_mac_app || warn "couldn't create SkiffCode.app (you can still run: skiffcode)"
+fi
+
 # ---- Windows Start menu (WSL)
 if grep -qi microsoft /proc/version 2>/dev/null && command -v powershell.exe >/dev/null && [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
   say "Adding “SkiffCode” to the Windows Start menu"
@@ -108,7 +158,13 @@ if grep -qi microsoft /proc/version 2>/dev/null && command -v powershell.exe >/d
 fi
 
 echo
-say "Done. Start SkiffCode:   skiffcode              (or “SkiffCode” in the Start menu)"
+if ((DARWIN)); then
+  say "Done. Start SkiffCode:   skiffcode              (or “SkiffCode” in $MAC_APP_DIR)"
+else
+  say "Done. Start SkiffCode:   skiffcode              (or “SkiffCode” in the Start menu)"
+fi
 say "Open at a repo:          skiffcode ~/code/my-repo"
 say "Get the latest version:  skiffcode update"
-case ":$PATH:" in *":$BIN_DIR:"*) ;; *) warn "$BIN_DIR is not on your PATH — add it:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc" ;; esac
+rc=.bashrc
+if ((DARWIN)); then rc=.zprofile; fi   # zsh is the login shell on macOS
+case ":$PATH:" in *":$BIN_DIR:"*) ;; *) warn "$BIN_DIR is not on your PATH — add it:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/$rc && source ~/$rc" ;; esac

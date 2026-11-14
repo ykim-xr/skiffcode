@@ -10,7 +10,7 @@ const assert = require('assert/strict');
 const { chromium } = require(process.env.PLAYWRIGHT_PATH || 'playwright');
 
 const APP = path.resolve(__dirname, '..');
-const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'skiffcode-ui-')));
+const tmp = fs.realpathSync(fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/tmp' : os.tmpdir(), 'skiffcode-ui-')));
 const HOME = path.join(tmp, 'home');
 const PORT = 3950 + Math.floor(Math.random() * 40);
 const SHOTS = process.env.SHOTS || path.join(tmp, 'shots');
@@ -73,6 +73,8 @@ const G = {};
 
   const browser = (G.browser = await chromium.launch());
   const context = await browser.newContext({ viewport: { width: 1500, height: 900 } });
+  // Fixed platform: labels, Ctrl presses and shortcuts behave the same on a Mac runner.
+  await context.addInitScript(() => Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64' }));
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `http://localhost:${PORT}` });
   const page = (G.page = await context.newPage());
   const errors = (G.errors = []);
@@ -1031,6 +1033,8 @@ const G = {};
     assert.match(await page.textContent('.sb-item.usage .usage-reset'), /^↻ (1h 5\dm|2h 0m)$/);
     assert.match(await page.getAttribute('.sb-item.usage', 'title'), /5-hour: 63% used, resets in/);
     await shot('07-usage');
+    // The real server on macOS refuses switching and sign-in; the panel's Mac view is checked in the next step
+    if (process.platform === 'darwin') return console.log('  - skipped on macOS (no account switching or sign-in there): account panel add, use, refresh');
     // account panel: Add account signs in through a tab; the login is saved when it's done
     const claudeHome = path.join(tmp, 'claude-home');
     fs.mkdirSync(claudeHome, { recursive: true });
@@ -1075,6 +1079,27 @@ const G = {};
     assert.equal(await page.locator('.sb-item.usage .usage-meter.unknown').count(), 2, 'no usage reported for Home yet');
     const st = JSON.parse(fs.readFileSync(path.join(HOME, 'state.json'), 'utf8'));
     assert.deepEqual(st.prefs.accounts.map(a => a.name), ['Work', 'Home']);
+  });
+
+  await step('account panel on macOS: no Add, Use or Save as account; a note says why', async () => {
+    // Set and opened in one go: a state push in between would bring the server's platform back
+    const tip = await page.evaluate(async () => {
+      const [{ store }, a] = await Promise.all([import('/js/store.js'), import('/js/accounts.js')]);
+      const was = store.platform;
+      store.platform = 'darwin';
+      try {
+        void a.accountsDialog();
+        return a.usageItem().title;
+      } finally {
+        store.platform = was;
+      }
+    });
+    assert.match(tip, /\nClick for details$/);
+    await page.waitForSelector('.accounts-modal .accounts-mac >> text=Switching accounts isn’t available on macOS yet. Usage still shows while Claude sessions run.');
+    if (process.platform !== 'darwin') assert.ok(await page.locator('.accounts-modal .account').count() > 0, 'saved logins are listed');
+    for (const label of ['Add account…', 'Use', 'Save as account…']) assert.equal(await page.locator(`.accounts-modal .btn >> text="${label}"`).count(), 0, label);
+    await page.click('.accounts-modal .btn >> text=Done');
+    assert.match(await page.getAttribute('.sb-item.usage', 'title'), process.platform === 'darwin' ? /Click for details$/ : /Click to switch account or refresh usage$/);
   });
 
   await step('usage: a plan with no 5-hour limit shows only the weekly meter', async () => {
@@ -2688,6 +2713,70 @@ const G = {};
       await pg.waitForSelector('.wt-row.active', { timeout: 15000 });
       await sleep(500);
       assert.equal(await pg.locator(banner).count(), 0, 'not asked again after the site data is cleared');
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  await step('Mac keys: Cmd is the primary key, Control goes to the terminal, labels use ⌘', async () => {
+    const ctx = await browser.newContext({ viewport: { width: 1500, height: 900 } });
+    await ctx.addInitScript(() => Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' }));
+    await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `http://localhost:${PORT}` });
+    const pg = await ctx.newPage();
+    const pick = async (keys, text) => {
+      await pg.keyboard.press(keys);
+      await pg.waitForSelector('.qp-input');
+      await pg.keyboard.type(text);
+      await pg.waitForSelector('.qp-item.selected');
+      await pg.keyboard.press('Enter');
+      await pg.waitForSelector(`.workspace:not(.hidden) .tab.active >> text=${text}`);
+    };
+    const activeTitle = () => pg.evaluate(() => document.querySelector('.workspace:not(.hidden) .tab.active .tab-title').textContent);
+    const activeKind = () => pg.evaluate(() => window.skiffcode.active.activeTab.kind);
+    try {
+      await pg.goto(`http://localhost:${PORT}/?tkn=${token}`);
+      await pg.waitForSelector('.wt-row.active', { timeout: 15000 });
+      await pg.waitForFunction(() => window.skiffcode && window.skiffcode.openWorktree);
+      await pg.evaluate(p => window.skiffcode.openWorktree(p), repo);
+      const steps = [
+        ['Control+P is not quick open', async () => {
+          await pg.keyboard.press('Control+p');
+          await sleep(300);
+          assert.equal(await pg.locator('.qp-input').count(), 0);
+        }],
+        ['Meta+P is quick open', async () => {
+          await pick('Meta+p', 'README');
+          await pick('Meta+p', 'app.py');
+        }],
+        ['labels show ⌘', async () => {
+          assert.match(await pg.getAttribute('.sidebar-actions button[title^="Jump to"]', 'title'), /⌘⌥J/);
+        }],
+        ['Cmd+Shift+] switches to the next tab, found by its key position', async () => {
+          const before = await activeTitle();
+          await pg.evaluate(() => document.dispatchEvent(new KeyboardEvent('keydown', { key: '’', code: 'BracketRight', metaKey: true, shiftKey: true, bubbles: true, cancelable: true })));
+          assert.notEqual(await activeTitle(), before);
+        }],
+        ['Control+Backquote opens a new shell', async () => {
+          await pg.keyboard.press('Control+Backquote');
+          await pg.waitForFunction(() => window.skiffcode.active.activeTab.kind === 'session');
+          assert.equal(await activeKind(), 'session');
+        }],
+        ['in a terminal Ctrl+C is not copy, Cmd+C is', async () => {
+          await pg.waitForFunction(() => window.skiffcode.active.activeTab.term && window.skiffcode.active.activeTab.term.pre);
+          await pg.evaluate(() => navigator.clipboard.writeText('untouched'));
+          await pg.evaluate(() => { const t = window.skiffcode.active.activeTab; t.term.select('mac-selection'); t.term.focus(); });
+          await pg.keyboard.press('Control+c');
+          assert.equal(await pg.evaluate(() => navigator.clipboard.readText()), 'untouched', 'Ctrl+C does not copy');
+          assert.equal(await pg.evaluate(() => window.skiffcode.active.activeTab.term.hasSelection()), true, 'the selection stays');
+          await pg.keyboard.press('Meta+c');
+          await pg.waitForFunction(() => navigator.clipboard.readText().then(t => t === 'mac-selection'));
+        }],
+      ];
+      for (const [name, fn] of steps) {
+        try { await fn(); } catch (e) { e.message = `${name}: ${e.message}`; throw e; }
+      }
+      const id = await pg.evaluate(() => window.skiffcode.active.activeTab.sessionId);
+      await pg.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.forget', { id: i })), id);
     } finally {
       await ctx.close();
     }
