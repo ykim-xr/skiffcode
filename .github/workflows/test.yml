@@ -98,10 +98,11 @@ jobs:
           # The app's launcher finds skiffcode through the login shell, and through a shell without sh syntax.
           if [ "$RUNNER_OS" = macOS ]; then
             app="$SKIFFCODE_MAC_APP_DIR/SkiffCode.app/Contents/MacOS/SkiffCode"
-            out=$("$app" url 2>/dev/null)
-            check "app launcher runs skiffcode" grep -q '^http://127.0.0.1:3419/' <<<"$out"
-            out=$(SHELL=/bin/tcsh "$app" -psn_0_1 url 2>/dev/null)
-            check "app launcher with tcsh" grep -q '^http://127.0.0.1:3419/' <<<"$out"
+            shown() { printf '%s\n' "$1" | sed 's/tkn=[^&]*/tkn=<hidden>/' | tail -n 3; }
+            out=$("$app" url 2>&1); shown "$out"
+            check "app launcher runs skiffcode" grep -q '^http://localhost:3419/' <<<"$out"
+            out=$(SHELL=/bin/tcsh "$app" -psn_0_1 url 2>&1); shown "$out"
+            check "app launcher with tcsh" grep -q '^http://localhost:3419/' <<<"$out"
           fi
 
           out=$(/bin/bash "$sk" status 2>&1); echo "$out"

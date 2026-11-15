@@ -308,6 +308,8 @@ const G = {};
     await openExt('base\n');
     const saveAfterChange = async (mine, theirs) => {
       await editExt(mine);
+      // Two writes a few ms apart can get file times under 1 ms apart, which the server's save check takes for no change.
+      await sleep(50);
       fs.writeFileSync(extPath, theirs);
       await page.waitForSelector(`${W} .editor-banner:not(.hidden)`); // the editor knows; its saved time is still the old one
       await page.evaluate(`void ${extTab}.save()`);
