@@ -44,7 +44,7 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 |---|---|
 | **Windows** | in **WSL** (where Claude Code runs); opens as an Edge app window, with Windows notifications and a Start menu entry |
 | **Linux** | natively; opens in Chrome / Chromium / Edge as an app window (or any browser), notifications via `notify-send`, sounds via PipeWire / PulseAudio |
-| **macOS** | natively, experimental (not yet tried on a real Mac); same install command (needs Node.js 18+, git and the Xcode Command Line Tools); opens as a Chrome / Edge / Brave app window, and `SkiffCode` is added to `~/Applications`; no account switching yet; started from the app, macOS may ask for access to Documents, Desktop and Downloads the first time |
+| **macOS** | natively; tested in CI on GitHub's macOS runners, not yet tried by hand on a Mac; same install command (needs Node.js 18+, git and the Xcode Command Line Tools); opens as a Chrome / Edge / Brave app window, and `SkiffCode` is added to `~/Applications`; no account switching yet; started from the app, macOS may ask for access to Documents, Desktop and Downloads the first time |
 
 ## Install
 
