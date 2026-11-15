@@ -1198,8 +1198,8 @@ const G = {};
   });
 
   await step('idle worktrees unload (sessions keep running) and come back from their layout; memory readout', async () => {
-    await page.waitForSelector('.sb-item:has(.icon-chip)', { timeout: 35000 });
-    assert.match(await page.getAttribute('.sb-item:has(.icon-chip)', 'title'), /Claude sessions \(1\)/);
+    // The readout is sampled every 30 s: one taken while the session restarted counts no Claude session until the next.
+    await page.waitForFunction(() => /Claude sessions \(1\)/.test((document.querySelector('.sb-item:has(.icon-chip)') || {}).title || ''), null, { timeout: 65000 });
     assert.equal(await page.locator('.workspace').count(), 2);
     await page.click('.sb-item:has(.icon-chip)');
     await page.waitForSelector('.toast >> text=Unloaded 1 worktree');

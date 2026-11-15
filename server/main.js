@@ -288,20 +288,27 @@ function gitChanged(root) {
 }
 
 /** Watch each opened worktree's git dir (HEAD, index) so commits/stages refresh the views. */
-const gitWatchers = new Map();
+const gitWatchers = new Map(); // root -> FSWatcher, or the pending start attempt (a Promise)
 async function watchGit(root) {
-  if (gitWatchers.has(root)) return;
-  gitWatchers.set(root, null);
-  try {
-    const dir = await git.gitDir(root);
-    const w = fs.watch(dir, { persistent: false }, (_e, f) => {
-      if (f && /^(index|HEAD|ORIG_HEAD|FETCH_HEAD|MERGE_HEAD)$/.test(String(f))) gitChanged(root);
-    });
-    w.on('error', () => {});
-    gitWatchers.set(root, w);
-  } catch {
-    gitWatchers.delete(root); // not a repo yet: a later `git init` must be able to start the watch
+  // A call during a pending attempt waits for it: if that attempt ran before `git init` and fails, this call must retry.
+  for (let cur = gitWatchers.get(root); cur; cur = gitWatchers.get(root)) {
+    if (!(cur instanceof Promise)) return;
+    await cur;
   }
+  const attempt = (async () => {
+    try {
+      const dir = await git.gitDir(root);
+      const w = fs.watch(dir, { persistent: false }, (_e, f) => {
+        if (f && /^(index|HEAD|ORIG_HEAD|FETCH_HEAD|MERGE_HEAD)$/.test(String(f))) gitChanged(root);
+      });
+      w.on('error', () => {});
+      gitWatchers.set(root, w);
+    } catch {
+      gitWatchers.delete(root); // not a repo yet: a later `git init` must be able to start the watch
+    }
+  })();
+  gitWatchers.set(root, attempt);
+  await attempt;
 }
 
 function worktreeTarget(repo, branch) {
