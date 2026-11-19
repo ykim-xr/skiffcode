@@ -7,7 +7,7 @@ import { modal, toast, confirmDialog } from './dialogs.js';
 
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
-function when(ts) {
+export function when(ts) {
   const d = new Date(ts);
   const days = (Date.now() - ts) / 86400e3;
   if (days < 1) return `${relTime(ts)} ago`.replace('now ago', 'just now');

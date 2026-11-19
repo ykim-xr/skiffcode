@@ -10,6 +10,7 @@ import * as models from './models.js';
 import { newWorktreeDialog } from './worktree-dialog.js';
 import { usageItem, accountsDialog } from './accounts.js';
 import { resumeDialog, offerPastConversations } from './resume-dialog.js';
+import { sessionManager } from './session-manager.js';
 import { applyColors, colorsDialog, defineEditorTheme } from './colors.js';
 import { addRepoDialog } from './add-repo-dialog.js';
 import { soundsDialog } from './sounds-dialog.js';
@@ -36,6 +37,22 @@ async function loadMonaco() {
     d.setDiagnosticsOptions({ noSemanticValidation: true, noSyntaxValidation: false });
     d.setCompilerOptions({ allowJs: true, jsx: monaco.languages.typescript.JsxEmit.Preserve, allowNonTsExtensions: true, target: monaco.languages.typescript.ScriptTarget.ESNext });
   }
+  // Monaco has no language for these; they only need a comment character and some colors.
+  const ensureLanguage = (id, aliases, rules) => {
+    if (monaco.languages.getLanguages().some(l => l.id === id)) return;
+    monaco.languages.register({ id, aliases });
+    monaco.languages.setLanguageConfiguration(id, { comments: { lineComment: '#' } });
+    monaco.languages.setMonarchTokensProvider(id, { tokenizer: { root: [[/^\s*#.*$/, 'comment'], ...rules] } });
+  };
+  ensureLanguage('dotenv', ['Dotenv', 'dotenv'], [
+    [/^(\s*export\s+)?([\w.-]+)(\s*=)/, ['keyword', 'variable', 'delimiter']],
+    [/"(?:[^"\\]|\\.)*"|'[^']*'/, 'string'],
+  ]);
+  ensureLanguage('ignore', ['Ignore file', 'ignore'], []);
+  // Monaco's dockerfile has no comment character. It sets its own configuration when the language first loads,
+  // so ask for the same module after it (the loader answers requests for one module in order) and add the comment.
+  monaco.languages.onLanguage('dockerfile', () => window.require(['vs/basic-languages/dockerfile/dockerfile'],
+    m => monaco.languages.setLanguageConfiguration('dockerfile', { ...m.conf, comments: { lineComment: '#' } })));
   // F12 / Ctrl+click for every language: search the worktree for where the word is defined.
   monaco.languages.registerDefinitionProvider('*', {
     async provideDefinition(model, position) {
@@ -273,6 +290,8 @@ function hideSessionTabs(id) {
   }
 }
 
+const MERGED_HOW = { rebase: ' (rebased)', squash: ' (squashed)' };
+
 const actions = {
   openWorktree,
   isSessionFocused: id => !!(app.active && app.active.activeTab && app.active.activeTab.kind === 'session' && app.active.activeTab.sessionId === id),
@@ -294,6 +313,10 @@ const actions = {
     const p = worktreePath || store.active;
     if (!p) return toast('Open a worktree first.', { kind: 'warn' });
     return resumeDialog(app, p, { value });
+  },
+
+  sessionManager(scope) {
+    return sessionManager(app, scope);
   },
 
   async gitInit(p) {
@@ -396,7 +419,8 @@ const actions = {
       h('p', h('code', tildify(w.path, store.home)), ' will be deleted.'),
       info.sessions ? h('p', `${info.sessions} session(s) and shell(s) in it will be stopped.`) : null,
       info.dirty ? h('p.warn', `⚠ ${info.dirty} uncommitted or untracked file(s) will be discarded.`) : null,
-      info.unpushed && w.branch ? h('p', `${info.unpushed} commit(s) on ${w.branch} aren’t on a remote — kept unless you also delete the branch.`) : null,
+      info.merged ? h('p', `Merged into ${info.merged.base}${MERGED_HOW[info.merged.how] || ''}.`)
+        : info.unpushed && w.branch ? h('p', `${info.unpushed} commit(s) on ${w.branch} aren’t on a remote — kept unless you also delete the branch.`) : null,
       info.locked ? h('p', 'The worktree is locked; it will be force-removed.') : null,
       purge && purge.el);
     const buttons = [{ label: 'Remove worktree', value: 'keep', danger: !!info.dirty, primary: !info.dirty }];
@@ -415,10 +439,19 @@ const actions = {
         const main = (store.worktrees.get(r.path) || {}).list?.[0];
         if (main) await openWorktree(main.path);
       }
+      // A deleted branch has no reflog, so the toast keeps the way back
+      const deleted = () => res.sha && toast(`Deleted branch ${res.branchName} (was ${res.sha.slice(0, 7)}).`, {
+        icon: 'branch', timeout: 0, // stays until dismissed: the sha is the only way back
+        actions: [{ label: 'Copy restore command', action: () => navigator.clipboard.writeText(`git branch '${res.branchName.replace(/'/g, `'\\''`)}' ${res.sha}`) }],
+      });
       if (res.branch === 'unmerged') {
         const f = await confirmDialog({ title: `Branch ${res.branchName} isn’t merged`, detail: 'Delete it anyway? Its unmerged commits will be lost.', buttons: [{ label: 'Delete branch', value: 'yes', danger: true }] });
-        if (f === 'yes') await call('branches.delete', { repo: r.path, branch: res.branchName, force: true });
-      } else if (res.branch === 'error') toast(`Couldn’t delete branch ${res.branchName}: ${res.branchError}`, { kind: 'error' });
+        if (f === 'yes') {
+          await call('branches.delete', { repo: r.path, branch: res.branchName, force: true });
+          deleted();
+        }
+      } else if (res.branch === 'deleted') deleted();
+      else if (res.branch === 'error') toast(`Couldn’t delete branch ${res.branchName}: ${res.branchError}`, { kind: 'error' });
     } catch (e) {
       toast(e.message, { kind: 'error' });
     } finally {
@@ -584,9 +617,12 @@ const actions = {
       [shortcutsOn() ? 'Turn shortcuts off' : 'Turn shortcuts on', '', () => setShortcutsOn(!shortcutsOn())],
       ['Claude accounts & usage…', '', () => accountsDialog()],
       ['Resume a Claude conversation…', '', () => actions.resumeConversation()],
+      ['Manage Claude sessions', keyHint('sessions'), () => actions.sessionManager()],
       ['Open web page or file…', '', () => actions.openWebPage()],
       ['Panel colors…', '', () => colorsDialog()],
       ['Toggle sidebar', keyHint('toggleSidebar'), () => KEY_RUN.toggleSidebar()],
+      ['Toggle line comment', keyHint('toggleLineComment'), () => runEditorAction('editor.action.commentLine', true)],
+      ['Toggle block comment', keyHint('toggleBlockComment'), () => runEditorAction('editor.action.blockComment', true)],
     ];
     const v = await quickPick(cmds.map(([label, key, fn], i) => ({ label, description: key, value: i })), { placeholder: 'Run a command', matchDescription: false });
     if (v !== undefined) cmds[v][2]();
@@ -792,6 +828,7 @@ const KEY_RUN = {
   quickOpen: () => actions.quickOpen(),
   commands: () => actions.commands(),
   jump: () => actions.jump(),
+  sessions: () => actions.sessionManager(),
   nextNeedsYou: () => actions.nextNeedsYou(),
   newClaude: () => actions.newSession(null, 'claude'),
   newShell: () => actions.newSession(null, 'shell'),
@@ -804,6 +841,8 @@ const KEY_RUN = {
   toggleSidebar: () => document.body.classList.toggle('no-sidebar'),
   closeTab: () => closeActiveTab(),
   closeTabOutsideTerminals: () => closeActiveTab(),
+  toggleLineComment: () => runEditorAction('editor.action.commentLine'),
+  toggleBlockComment: () => runEditorAction('editor.action.blockComment'),
   nextWorktree: () => stepWorktree(1),
   prevWorktree: () => stepWorktree(-1),
   nextTab: () => stepTab(1),
@@ -812,6 +851,19 @@ const KEY_RUN = {
   prevTabAlt: () => stepTab(-1),
 };
 
+/**
+ * Runs a Monaco action on the editor with text focus (the editable side of a diff counts).
+ * `orActive`: from the palette no editor has focus, so use the active tab's editor.
+ */
+function runEditorAction(id, orActive = false) {
+  let ed = window.monaco.editor.getEditors().find(e => e.hasTextFocus());
+  if (!ed && orActive) {
+    const t = app.active && app.active.activeTab;
+    const e = t && (t.editor || (t.view && t.view.editor));
+    ed = e && (e.getModifiedEditor ? e.getModifiedEditor() : e);
+  }
+  if (ed) ed.trigger('keyboard', id, null);
+}
 function closeActiveTab() {
   const ws = app.active;
   if (ws && ws.activeTab) ws.closeTab(ws.activeTab);

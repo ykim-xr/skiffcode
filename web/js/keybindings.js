@@ -23,8 +23,11 @@ export const KEY_ACTIONS = [
   ['scm', 'Show source control', 'ctrl+shift+g'],
   ['settings', 'Settings', 'ctrl+,'],
   ['toggleSidebar', 'Toggle sidebar', ''],
+  ['sessions', 'Manage Claude sessions', ''],
   ['closeTab', 'Close tab', 'alt+w', ''],
   ['closeTabOutsideTerminals', isMac ? 'Close tab (also in terminals)' : 'Close tab (not in terminals)', 'ctrl+w'],
+  ['toggleLineComment', 'Toggle line comment', 'ctrl+/'],
+  ['toggleBlockComment', 'Toggle block comment', 'alt+shift+a'],
   ['nextWorktree', 'Next worktree', 'alt+arrowdown'],
   ['prevWorktree', 'Previous worktree', 'alt+arrowup'],
   ['nextTab', 'Next tab', 'alt+]', 'ctrl+shift+]'],
@@ -32,9 +35,9 @@ export const KEY_ACTIONS = [
   ['nextTabAlt', 'Next tab (second key)', 'ctrl+tab', 'control+tab'],
   ['prevTabAlt', 'Previous tab (second key)', 'ctrl+shift+tab', 'control+shift+tab'],
 ];
-/** Actions that leave the key to a focused terminal (Ctrl+W deletes a word in shells). */
-// On a Mac this key is Cmd+W, which would close the app window, so it works in terminals too.
-export const NOT_IN_TERMINALS = new Set(isMac ? [] : ['closeTabOutsideTerminals']);
+/** Actions that leave the key to a focused terminal (Ctrl+W deletes a word in shells, Ctrl+/ is undo). */
+// On a Mac the close key is Cmd+W, which would close the app window, so it works in terminals too.
+export const NOT_IN_TERMINALS = new Set([...(isMac ? [] : ['closeTabOutsideTerminals']), 'toggleLineComment', 'toggleBlockComment']);
 
 /** Punctuation by physical key: Option and Shift change e.key. */
 export const PUNCT = { '`': 'Backquote', '[': 'BracketLeft', ']': 'BracketRight', ',': 'Comma', '.': 'Period', '/': 'Slash',

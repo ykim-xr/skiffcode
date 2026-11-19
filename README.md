@@ -14,6 +14,7 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 - **Subagents** counted on their session; click to list them with their type
 - **Resume past conversations**, including ones started elsewhere (a terminal, Orca): pick from the worktree's list or paste `claude --resume <id>`
 - **Delete a session for good**: its Claude conversation goes too, so it's gone from `/resume`; removing a worktree or folder can do the same for all of its conversations
+- **Claude sessions manager**: every saved conversation by repo, worktree and folder, with search, filters, suggested cleanups (missing folders, empty, idle) and bulk delete
 - **Claude usage** (5-hour / weekly, time to reset) in the status bar
 - **Saved Claude logins**: switch every session to another login or org in one click, like `/login`; refresh each account's usage
 
@@ -23,10 +24,11 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 - New worktree from any base branch with your branch name, or one command: `skiffcode new`
 - Stage, discard, commit, push / pull (Ctrl/Shift+click selects several changed files), editable diffs, review vs base; commits expand to their files; a History pane below lists the whole branch log
 - **Stash** all, tracked or staged changes, or just the files you pick, with an optional message; a Stashes section lists every stash with its files and diffs, and applies, pops or drops it
+- **Remove a worktree** with “Remove + delete branch”: it knows squash, rebase and origin-only merges, and a deleted branch can be restored from its toast
 - Plain folders work too (no git); `git init` there and git features turn on
 
 **Editor and app**
-- Monaco editor with syntax colors for ~80 languages and F12 go-to-definition; quick open and search
+- Monaco editor with syntax colors for ~80 languages and F12 go-to-definition; Ctrl+/ and Alt+Shift+A comment lines, also in `.env`, ignore files and Dockerfiles; quick open and search
 - **Split panes** like VS Code: split right or down, nested, up to 8 panes; drop a tab on a pane's edge to split that way; pin tabs to keep them left; the bottom panel takes up to 5 side by side
 - **Drag and drop** like VS Code: files from Explorer into a folder (copied in) or onto a Claude session (attached); from the Files panel onto a folder (moved), an editor pane (opened) or a session (`@path`)
 - **Viewers**: images and PDFs open in a tab; HTML pages (and SVG) get a live preview to the side that reloads as files change
@@ -82,6 +84,7 @@ Defaults; change or switch them off in Settings → Keyboard shortcuts. F12 · S
 | Ctrl+Shift+F · E · G | search · files · source control |
 | Ctrl+Alt+D | review changes vs base |
 | F12 · Shift+F12 | go to definition · references |
+| Ctrl+/ · Alt+Shift+A | toggle line comment · block comment |
 
 On macOS, ⌘ takes the place of Ctrl, and the Control key belongs to the terminal (⌃C always interrupts). Different there: new shell ⌃\`, bottom panel ⌃⇧\`, review ⌘⌥R, next / previous tab ⌘⇧] · ⌘⇧[, worktrees ⌘1–9.
 

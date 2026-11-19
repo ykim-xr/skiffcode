@@ -71,14 +71,22 @@ function readTranscript(file) {
 
 /** Project folders that may hold this folder's transcripts (normally exactly one). */
 function projectDirs(configDir, folder) {
-  const root = path.join(configDir, 'projects');
-  const exact = path.join(root, encode(folder));
-  if (fs.existsSync(exact)) return [exact];
+  const exact = path.join(configDir, 'projects', encode(folder));
+  if (isRealDir(exact)) return [exact];
   // Claude's encoding has varied across versions; fall back to a loose name match.
-  let names = [];
-  try { names = fs.readdirSync(root); } catch { return []; }
   const want = squash(folder);
-  return names.filter(n => squash(n) === want).map(n => path.join(root, n));
+  return projectFolders(configDir).filter(d => squash(path.basename(d)) === want);
+}
+
+const isRealDir = p => { try { return fs.lstatSync(p).isDirectory(); } catch { return false; } };
+
+/**
+ * Claude's project folders: real directories only. A symlinked one is skipped everywhere (listing, footprint, delete),
+ * so a delete never reaches what the listing and the "recently active" check didn't see.
+ */
+function projectFolders(configDir) {
+  const root = path.join(configDir, 'projects');
+  try { return fs.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => path.join(root, d.name)); } catch { return []; }
 }
 
 /**
@@ -115,32 +123,193 @@ function listConversations(folder, configDirs, tracked, limit = 40) {
  * and its lines in the prompt history. Returns what was deleted.
  */
 function deleteConversation(configDirs, folder, id) {
-  if (!UUID.test(id) || id.length !== 36) throw new Error('Not a conversation ID');
-  const gone = [];
-  const rm = p => { if (fs.existsSync(p)) { fs.rmSync(p, { recursive: true, force: true }); gone.push(p); } };
+  const [r] = deleteConversations(configDirs, [id], [folder]);
+  if (r.error) throw new Error(r.error);
+  return r.gone;
+}
+
+function checkId(id) {
+  if (typeof id !== 'string' || !UUID.test(id) || id.length !== 36) throw new Error('Not a conversation ID');
+}
+
+/**
+ * deleteConversation for several ids at once: each folder is listed and the prompt history rewritten once per call.
+ * All ids are checked before anything is deleted. `folders` (optional) adds those folders' project dirs.
+ * Returns [{ id, gone, error? }]: a failure for one id doesn't stop the others.
+ */
+function deleteConversations(configDirs, ids, folders = []) {
+  ids.forEach(checkId);
+  const res = new Map(ids.map(id => [id, { id, gone: [] }]));
+  const rm = (r, p) => { if (fs.existsSync(p)) { fs.rmSync(p, { recursive: true, force: true }); r.gone.push(p); } };
   for (const cfg of configDirs) {
-    const dirs = new Set(projectDirs(cfg, folder));
-    // a conversation resumed elsewhere may sit in another project folder
-    try { for (const n of fs.readdirSync(path.join(cfg, 'projects'))) if (fs.existsSync(path.join(cfg, 'projects', n, `${id}.jsonl`))) dirs.add(path.join(cfg, 'projects', n)); } catch { /* none */ }
-    for (const d of dirs) { rm(path.join(d, `${id}.jsonl`)); rm(path.join(d, id)); }
-    rm(path.join(cfg, 'file-history', id));
-    rm(path.join(cfg, 'session-env', id));
-    rm(path.join(cfg, 'debug', `${id}.txt`));
-    try { for (const f of fs.readdirSync(path.join(cfg, 'todos'))) if (f.startsWith(id)) rm(path.join(cfg, 'todos', f)); } catch { /* none */ }
-    // prompt history (up-arrow): drop this conversation's lines, keep everything else
+    const projs = projectFolders(cfg);
+    let todos = [];
+    try { todos = fs.readdirSync(path.join(cfg, 'todos')); } catch { /* none */ }
+    const own = folders.flatMap(f => projectDirs(cfg, f));
+    for (const r of res.values()) {
+      const id = r.id;
+      try {
+        const dirs = new Set(own);
+        // a conversation resumed elsewhere may sit in another project folder
+        for (const d of projs) if (fs.existsSync(path.join(d, `${id}.jsonl`))) dirs.add(d);
+        for (const d of dirs) { rm(r, path.join(d, `${id}.jsonl`)); rm(r, path.join(d, id)); }
+        rm(r, path.join(cfg, 'file-history', id));
+        rm(r, path.join(cfg, 'session-env', id));
+        rm(r, path.join(cfg, 'debug', `${id}.txt`));
+        for (const f of todos) if (f.startsWith(id)) rm(r, path.join(cfg, 'todos', f));
+      } catch (e) {
+        r.error = e.message;
+      }
+    }
+    // prompt history (up-arrow): drop these conversations' lines, keep everything else
     const hist = path.join(cfg, 'history.jsonl');
     try {
       const lines = fs.readFileSync(hist, 'utf8').split('\n');
-      const keep = lines.filter(l => !l.includes(id) || (() => { try { return JSON.parse(l).sessionId !== id; } catch { return true; } })());
+      const dropped = new Map();
+      const keep = lines.filter(l => {
+        if (!ids.some(id => l.includes(id))) return true;
+        let sid;
+        try { sid = JSON.parse(l).sessionId; } catch { return true; }
+        // an id whose files couldn't all be deleted keeps its prompt history: it is still on disk
+        if (!res.has(sid) || res.get(sid).error) return true;
+        dropped.set(sid, (dropped.get(sid) || 0) + 1);
+        return false;
+      });
       if (keep.length !== lines.length) {
         fs.writeFileSync(`${hist}.skiffcode-tmp`, keep.join('\n'));
         fs.chmodSync(`${hist}.skiffcode-tmp`, fs.statSync(hist).mode & 0o7777);
         fs.renameSync(`${hist}.skiffcode-tmp`, hist);
-        gone.push(`${hist} (${lines.length - keep.length} lines)`);
+        for (const [sid, n] of dropped) res.get(sid).gone.push(`${hist} (${n} lines)`);
       }
     } catch { /* no history */ }
   }
-  return gone;
+  return [...res.values()];
+}
+
+const TRANSCRIPT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/;
+
+/** Every transcript in Claude's project folders: { proj, id, file }. Other entries (memory/, plans/, …) are never touched. */
+function* transcripts(configDirs) {
+  for (const cfg of configDirs) {
+    for (const proj of projectFolders(cfg)) {
+      let files = [];
+      try { files = fs.readdirSync(proj, { withFileTypes: true }); } catch { continue; }
+      for (const f of files) if (f.isFile() && TRANSCRIPT.test(f.name)) yield { proj, id: f.name.slice(0, -6), file: path.join(proj, f.name) };
+    }
+  }
+}
+
+/** Bytes and newest mtime of the files under a folder (a conversation's subagents, tool output). Never follows symlinks. */
+function folderStats(dir) {
+  let bytes = 0;
+  let newest = 0;
+  const walk = d => {
+    let ents;
+    try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile()) {
+        try {
+          const st = fs.lstatSync(p);
+          bytes += st.size;
+          if (st.mtimeMs > newest) newest = st.mtimeMs;
+        } catch { /* gone meanwhile */ }
+      }
+    }
+  };
+  walk(dir);
+  return { bytes, newest };
+}
+
+// transcript path -> { mtimeMs, size, t }: a full scan reads only what changed since the last one
+const summaries = new Map();
+
+/** Every conversation Claude has on disk, from any folder, newest first. One item per id: copies in several project folders add up. */
+async function listAllConversations(configDirs) {
+  const byId = new Map();
+  const seen = new Set();
+  let read = 0;
+  let scanned = 0;
+  for (const { proj, id, file } of transcripts(configDirs)) {
+    // the folder walks below run even for cached transcripts: let terminals and other calls in now and then
+    if (++scanned % 50 === 0) await new Promise(setImmediate);
+    let st;
+    try { st = fs.statSync(file); } catch { continue; }
+    seen.add(file);
+    let c = summaries.get(file);
+    if (!c || c.mtimeMs !== st.mtimeMs || c.size !== st.size) {
+      // a first scan may read thousands of transcripts: let terminals and other calls in now and then
+      if (++read % 20 === 0) await new Promise(setImmediate);
+      try { c = { mtimeMs: st.mtimeMs, size: st.size, t: readTranscript(file) }; } catch { continue; }
+      summaries.set(file, c);
+    }
+    const t = c.t;
+    const sub = folderStats(path.join(proj, id));
+    const item = {
+      id, title: t.title, summary: t.summary, first: t.first, prompts: t.prompts, started: t.started, updated: t.updated,
+      activeAt: Math.max(t.updated, sub.newest), size: t.size + sub.bytes,
+      empty: t.size <= HEAD && !t.prompts && !t.title, // only when the whole file was read
+      cwd: t.cwd || null,
+    };
+    const prev = byId.get(id);
+    if (prev) {
+      const keep = item.updated > prev.updated ? item : prev;
+      keep.size = prev.size + item.size;
+      keep.activeAt = Math.max(prev.activeAt, item.activeAt);
+      byId.set(id, keep);
+    } else byId.set(id, item);
+  }
+  for (const f of summaries.keys()) if (!seen.has(f)) summaries.delete(f);
+  return [...byId.values()].sort((x, y) => y.updated - x.updated);
+}
+
+/** What one conversation takes on disk now, over all its copies: { exists, bytes, activeAt }. */
+function conversationFootprint(configDirs, id) {
+  checkId(id);
+  const out = { exists: false, bytes: 0, activeAt: 0 };
+  for (const cfg of configDirs) {
+    for (const proj of projectFolders(cfg)) {
+      let st;
+      try { st = fs.lstatSync(path.join(proj, `${id}.jsonl`)); } catch { continue; }
+      if (!st.isFile()) continue;
+      const sub = folderStats(path.join(proj, id));
+      out.exists = true;
+      out.bytes += st.size + sub.bytes;
+      out.activeAt = Math.max(out.activeAt, st.mtimeMs, sub.newest);
+    }
+  }
+  return out;
+}
+
+const REGISTRY_FRESH_MS = 30 * 60e3;
+const alive = pid => {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+};
+
+/**
+ * Conversations a Claude process is running now, from Claude's registry (<config>/sessions/<pid>.json).
+ * Its format isn't documented: anything unexpected is skipped. Fails closed: an entry counts as live when its pid
+ * is alive here, or when it was updated recently (a Claude in another pid namespace, e.g. a container sharing the
+ * config folder). A reused pid also counts as live, which only refuses a delete.
+ */
+function liveConversationIds(configDirs) {
+  const out = new Set();
+  for (const cfg of configDirs) {
+    const dir = path.join(cfg, 'sessions');
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names) {
+      if (!n.endsWith('.json')) continue;
+      let j;
+      try { j = JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8')); } catch { continue; }
+      if (!j || typeof j.sessionId !== 'string') continue;
+      // epoch ms; pid 0 or below would signal a whole process group
+      const seen = Math.max(...[j.updatedAt, j.statusUpdatedAt].filter(Number.isFinite), 0);
+      if ((Number.isInteger(j.pid) && j.pid > 0 && alive(j.pid)) || Date.now() - seen < REGISTRY_FRESH_MS) out.add(j.sessionId.toLowerCase());
+    }
+  }
+  return out;
 }
 
 /** Pull a conversation ID out of anything pasted: an ID, `claude --resume <id>`, `claude -r "<id>"`, a transcript path. */
@@ -149,4 +318,4 @@ function parseConversationId(text) {
   return m ? m[0].toLowerCase() : null;
 }
 
-module.exports = { listConversations, parseConversationId, encode, readTranscript, deleteConversation, UUID };
+module.exports = { listConversations, parseConversationId, encode, readTranscript, deleteConversation, deleteConversations, listAllConversations, conversationFootprint, liveConversationIds, UUID };

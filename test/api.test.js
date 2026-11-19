@@ -1648,6 +1648,137 @@ function startServer() {
     await assert.rejects(c.call('claude.deleteConversation', { worktreePath: wt, id: '../../x' }), /Not a conversation ID/);
   });
 
+  await step('all conversations: listed with folder, sessions and live state; bulk delete refuses running, live and active ones', async () => {
+    const { encode } = require('../server/history');
+    const projOf = cwd => { const p = path.join(CLAUDE_HOME, 'projects', encode(cwd)); fs.mkdirSync(p, { recursive: true }); return p; };
+    const hourAgo = new Date(Date.now() - 3600e3);
+    const back = f => fs.utimesSync(f, hourAgo, hourAgo);
+    const sub = path.join(wt, 'sub', 'deep');
+    fs.mkdirSync(sub, { recursive: true });
+    const other = path.join(tmp, 'not-added');
+    fs.mkdirSync(other, { recursive: true });
+    const missing = path.join(tmp, 'gone-folder');
+    plan('SessionStart,hang');
+    const sR = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, name: 'holds R', cols: 80, rows: 24 });
+    plan('SessionStart,hang');
+    const sT = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, name: 'holds T', cols: 80, rows: 24 });
+    const held = async id => (await c.call('hello')).sessions.find(x => x.id === id).claudeId;
+    const R = await held(sR.id), T = await held(sT.id);
+    await c.call('sessions.stop', { id: sT.id });
+    const K = 'a1a1a1a1-0000-4000-8000-000000000001', S = 'a1a1a1a1-0000-4000-8000-000000000002', O = 'a1a1a1a1-0000-4000-8000-000000000003';
+    const M = 'a1a1a1a1-0000-4000-8000-000000000004', E = 'a1a1a1a1-0000-4000-8000-000000000005', N = 'a1a1a1a1-0000-4000-8000-000000000006';
+    const L = 'a1a1a1a1-0000-4000-8000-000000000007', F = 'a1a1a1a1-0000-4000-8000-000000000008';
+    const D = 'a1a1a1a1-0000-4000-8000-000000000009', P = 'a1a1a1a1-0000-4000-8000-00000000000a', Y = 'a1a1a1a1-0000-4000-8000-00000000000b';
+    const say = (cwd, text) => JSON.stringify({ type: 'user', ...(cwd ? { cwd } : {}), timestamp: '2026-10-01T12:00:00.000Z', message: { role: 'user', content: text } });
+    const write = (id, cwd, rows, fresh) => {
+      const f = path.join(projOf(cwd || wt), `${id}.jsonl`);
+      fs.writeFileSync(f, rows.join('\n') + '\n');
+      if (!fresh) back(f);
+      return f;
+    };
+    const subfile = (id, cwd) => {
+      const d = path.join(projOf(cwd), id, 'subagents');
+      fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(d, 'x'), 'y'.repeat(5000));
+      back(path.join(d, 'x'));
+      return path.join(projOf(cwd), id);
+    };
+    const files = {
+      K: write(K, wt, [say(wt, 'known')]), S: write(S, sub, [say(sub, 'in a subfolder')]), O: write(O, other, [say(other, 'elsewhere')]),
+      M: write(M, missing, [say(missing, 'folder gone')]), E: write(E, wt, [JSON.stringify({ type: 'user', isMeta: true, cwd: wt, message: { role: 'user', content: 'meta' } })]),
+      N: write(N, null, [say(null, 'no folder')]), R: write(R, wt, [say(wt, 'running')]), T: write(T, wt, [say(wt, 'stopped')]),
+      L: write(L, wt, [say(wt, 'live elsewhere')]), F: write(F, wt, [say(wt, 'fresh')], true),
+      D: write(D, wt, [say(wt, 'live in another pid namespace')]), P: write(P, wt, [say(wt, 'undeletable')]),
+    };
+    const kDir = subfile(K, wt), tDir = subfile(T, wt), mDir = subfile(M, missing), pDir = subfile(P, wt);
+    // a project folder that is a symlink: neither listed nor followed by a delete
+    const linkedReal = path.join(tmp, 'linked-proj');
+    fs.mkdirSync(linkedReal, { recursive: true });
+    const yFile = path.join(linkedReal, `${Y}.jsonl`);
+    fs.writeFileSync(yFile, say(wt, 'behind a symlink') + '\n');
+    const link = path.join(CLAUDE_HOME, 'projects', 'zz-linked');
+    fs.symlinkSync(linkedReal, link);
+    const reg = path.join(CLAUDE_HOME, 'sessions');
+    fs.mkdirSync(reg, { recursive: true });
+    fs.writeFileSync(path.join(reg, `${process.pid}.json`), JSON.stringify({ pid: process.pid, sessionId: L }));
+    fs.writeFileSync(path.join(reg, 'junk.json'), '{ not json');
+    // a Claude whose pid isn't visible here (another pid namespace) but that updated its entry just now
+    const deadPid = spawnSync('true').pid;
+    fs.writeFileSync(path.join(reg, `${deadPid}.json`), JSON.stringify({ pid: deadPid, sessionId: D, updatedAt: Date.now() }));
+    const hist = path.join(CLAUDE_HOME, 'history.jsonl');
+    fs.writeFileSync(hist, [T, M, R, P, D, 'other'].map(id => JSON.stringify({ display: `p ${id}`, sessionId: id })).join('\n') + '\n');
+
+    const list = async () => {
+      const r = await c.call('claude.allConversations');
+      assert.equal(typeof r.now, 'number');
+      return Object.fromEntries(r.conversations.map(x => [x.id, x]));
+    };
+    let all = await list();
+    for (const id of [K, S, O, M, E, N, R, T, L, F]) assert.ok(all[id], `listed ${id}`);
+    assert.equal(all[K].worktreePath, wt);
+    assert.equal(all[K].repoPath, repo);
+    assert.equal(all[K].atRoot, true);
+    assert.equal(all[S].worktreePath, wt, 'a subfolder belongs to its worktree');
+    assert.equal(all[S].repoPath, repo);
+    assert.equal(all[S].atRoot, false);
+    for (const id of [O, M, N]) assert.ok(!all[id].worktreePath && !all[id].repoPath, `no worktree for ${id}`);
+    assert.equal(all[O].folderExists, true);
+    assert.equal(all[M].folderExists, false);
+    assert.equal(all[N].cwd, null);
+    assert.equal(all[N].folderExists, false);
+    for (const id of [K, S, O, M, E, N, R, T, L, F]) assert.equal(all[id].empty, id === E, `empty ${id}`);
+    assert.ok(all[K].size >= fs.statSync(files.K).size + 5000, 'size counts the subagent files');
+    assert.deepEqual(all[R].sessions, [sR.id]);
+    assert.deepEqual(all[T].sessions, [sT.id]);
+    assert.deepEqual(all[K].sessions, []);
+    for (const id of [K, S, O, M, E, N, R, T, L, F, D]) assert.equal(all[id].live, id === R || id === L || id === D, `live ${id}`);
+    assert.deepEqual([R, L, F, T, D].map(id => all[id].block), ['running', 'live', 'active', null, 'live'], 'why each can or can\'t be deleted');
+    assert.ok(!all[Y], 'not listed from a symlinked project folder');
+    assert.ok(!JSON.stringify(all).includes(path.join(CLAUDE_HOME, 'projects')), 'no Claude config paths');
+
+    fs.appendFileSync(files.O, JSON.stringify({ type: 'custom-title', customTitle: 'renamed O' }) + '\n');
+    fs.utimesSync(files.O, hourAgo, new Date(hourAgo.getTime() + 1000));
+    all = await list();
+    assert.equal(all[O].title, 'renamed O', 'a changed transcript is read again');
+
+    const intact = () => {
+      for (const f of Object.values(files)) assert.ok(fs.existsSync(f), `kept ${f}`);
+      for (const d of [kDir, tDir, mDir, pDir]) assert.ok(fs.existsSync(d), `kept ${d}`);
+      assert.equal(fs.readFileSync(hist, 'utf8').trim().split('\n').length, 6);
+    };
+    for (const ids of [['../etc'], Array(101).fill(M), M, [M, 42], []]) {
+      await assert.rejects(c.call('claude.deleteConversations', { ids }), Error, JSON.stringify(ids).slice(0, 40));
+    }
+    intact();
+
+    // P's files can't all be deleted: its subagents folder is read-only
+    let results;
+    fs.chmodSync(path.join(pDir, 'subagents'), 0o555);
+    try {
+      ({ results } = await c.call('claude.deleteConversations', { ids: [R, T, M.toUpperCase(), L, F, D, P] }));
+    } finally {
+      fs.chmodSync(path.join(pDir, 'subagents'), 0o755);
+    }
+    const by = Object.fromEntries(results.map(x => [x.id, x]));
+    assert.deepEqual([R, T, M, L, F, D].map(id => by[id].ok ? 'ok' : by[id].reason), ['running', 'ok', 'ok', 'live', 'active', 'live']);
+    assert.equal(by[P].ok, false);
+    assert.match(by[P].reason, /EACCES|permission/i);
+    assert.ok(by[T].freed > 5000 && by[M].freed > 5000, 'freed counts transcript and subfolder');
+    assert.ok(!(await c.call('hello')).sessions.some(x => x.id === sT.id), 'the stopped session is gone');
+    assert.ok((await c.call('hello')).sessions.some(x => x.id === sR.id), 'the running one stays');
+    for (const p of [files.T, files.M, tDir, mDir]) assert.ok(!fs.existsSync(p), `deleted ${p}`);
+    for (const p of [files.R, files.L, files.F, files.K, kDir]) assert.ok(fs.existsSync(p), `kept ${p}`);
+    assert.deepEqual(fs.readFileSync(hist, 'utf8').trim().split('\n').map(l => JSON.parse(l).sessionId), [R, P, D, 'other'], 'a failed delete keeps its prompt history');
+    await c.call('claude.deleteConversations', { ids: [Y] });
+    assert.ok(fs.existsSync(yFile), 'a delete never follows a symlinked project folder');
+    fs.unlinkSync(link);
+    all = await list();
+    assert.ok(!all[T] && !all[M] && all[R]);
+
+    await c.call('sessions.forget', { id: sR.id });
+    for (const f of fs.readdirSync(reg)) fs.unlinkSync(path.join(reg, f));
+  });
+
   await step('Claude switches conversation (/tui, /clear): SkiffCode resumes the new one', async () => {
     const { encode } = require('../server/history');
     const proj = path.join(CLAUDE_HOME, 'projects', encode(wt));
@@ -2024,6 +2155,59 @@ function startServer() {
     sh('git commit -q --allow-empty -m unmerged', wip.path);
     const r2 = await c.call('worktrees.remove', { repo: base, path: wip.path, deleteBranch: true });
     assert.equal(r2.branch, 'unmerged');
+    await c.call('repos.remove', { path: base });
+  });
+
+  await step('removing a worktree: squashed, rebased and origin-only merges count as merged; merge edits and whitespace do not', async () => {
+    const base = path.join(tmp, 'code', 'mergedchk');
+    fs.mkdirSync(base);
+    const G = 'git -c user.email=t@t -c user.name=t';
+    sh(`git init -q -b main && echo a > a && echo foo > w && git add a w && ${G} commit -qm a`, base);
+    // a remote branch to make a tracking worktree from (git needs a remote for --track)
+    sh('git remote add origin ../nowhere && git update-ref refs/remotes/origin/rem main', base);
+    await c.call('repos.add', { path: base });
+    const wts = {};
+    wts.rem = await c.call('worktrees.create', { repo: base, newBranch: 'rem', base: 'origin/rem', track: true, startClaude: false });
+    sh(`echo rem1 > rem1 && git add rem1 && ${G} commit -qm rem1 && echo rem2 >> rem1 && ${G} commit -qam rem2`, wts.rem.path);
+    wts.ws = await c.call('worktrees.create', { repo: base, newBranch: 'ws', base: 'main', startClaude: false });
+    sh(`printf '  foo\\n' > w && ${G} commit -qam indent`, wts.ws.path);
+    wts.mg = await c.call('worktrees.create', { repo: base, newBranch: 'mg', base: 'main', startClaude: false });
+    sh(`echo mg1 > mg1 && git add mg1 && ${G} commit -qm mg1`, wts.mg.path);
+    const mg1 = sh('git rev-parse HEAD', wts.mg.path).trim();
+    for (const b of ['sq', 'rb', 'om', 'wip', 'part']) {
+      wts[b] = await c.call('worktrees.create', { repo: base, newBranch: b, base: 'main', startClaude: false });
+      sh(`echo ${b}1 > ${b}1 && git add ${b}1 && ${G} commit -qm ${b}1`, wts[b].path);
+      if (b !== 'wip') sh(`echo ${b}2 >> ${b}1 && ${G} commit -qam ${b}2`, wts[b].path);
+    }
+    sh(`${G} merge -q --squash sq && ${G} commit -qm 'squash sq'`, base);
+    sh(`${G} merge -q --squash rem && ${G} commit -qm 'squash rem'`, base);
+    sh(`printf '\\tfoo\\n' > w && ${G} commit -qam tab`, base);
+    // the merge commit carries an edit of its own, which main never got
+    sh(`${G} merge -q --no-ff --no-commit main && echo own > mgown && git add mgown && ${G} commit -qm 'merge main'`, wts.mg.path);
+    sh(`${G} cherry-pick ${mg1}`, base);
+    sh(`${G} cherry-pick rb~1 rb`, base);
+    sh(`${G} merge -q --squash part~1 && ${G} commit -qm 'squash part 1'`, base);
+    sh(`git checkout -q --detach main && ${G} merge -q --no-ff om -m 'merge om' && git update-ref refs/remotes/origin/main HEAD && git checkout -q main`, base);
+    const info = async b => (await c.call('worktrees.removeInfo', { repo: base, path: wts[b].path })).merged;
+    assert.equal((await info('sq')).how, 'squash');
+    assert.equal((await info('rb')).how, 'rebase');
+    assert.deepEqual(await info('om'), { base: 'origin/main', how: 'ancestor' });
+    assert.equal(await info('wip'), null);
+    assert.equal(await info('part'), null);
+    assert.equal(await info('mg'), null, 'a merge commit with its own edit');
+    assert.equal(await info('ws'), null, 'whitespace differs');
+    assert.deepEqual(await info('rem'), { base: 'main', how: 'squash' }, 'made from a remote branch');
+    const tip = sh('git rev-parse sq', base).trim();
+    const r = await c.call('worktrees.remove', { repo: base, path: wts.sq.path, deleteBranch: true });
+    assert.equal(r.branch, 'deleted');
+    assert.equal(r.merged.how, 'squash');
+    assert.equal(r.sha, tip);
+    assert.equal(sh('git branch --list sq', base).trim(), '');
+    for (const b of ['wip', 'part', 'mg']) {
+      const r2 = await c.call('worktrees.remove', { repo: base, path: wts[b].path, deleteBranch: true });
+      assert.equal(r2.branch, 'unmerged', b);
+      assert.equal(r2.sha, sh(`git rev-parse ${b}`, base).trim(), b);
+    }
     await c.call('repos.remove', { path: base });
   });
 

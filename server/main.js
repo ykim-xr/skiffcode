@@ -277,6 +277,31 @@ async function worktreeStatus(p, maxAge = 5000) {
   }
 }
 
+/** Refs a worktree's branch may have landed in: the base its status compares to, and that base's local/origin twin. */
+async function mergeCandidates(repo, p, branch) {
+  if (!baseCache.has(repo)) baseCache.set(repo, git.defaultBase(repo));
+  const upstream = (await git.git(repo, ['for-each-ref', '--format=%(upstream)', `refs/heads/${branch}`]).catch(() => '')).trim();
+  // A branch's own upstream says nothing about whether it was merged
+  const pick = async base => {
+    const out = [];
+    for (const b of [base, base.startsWith('origin/') ? base.slice(7) : `origin/${base}`]) {
+      if (b === 'HEAD' || b.startsWith('-') || (await git.isSameBranch(repo, b, branch))) continue;
+      if (upstream && (await git.git(repo, ['rev-parse', '--symbolic-full-name', b]).catch(() => '')).trim() === upstream) continue;
+      out.push(b);
+    }
+    return out;
+  };
+  const stored = state.worktreeMeta(p).base;
+  const out = stored ? await pick(stored) : [];
+  // A worktree made from a remote branch has that branch as its base: look at the repo's default base too
+  return out.length ? out : pick(await baseCache.get(repo));
+}
+
+// A deleted branch has no reflog: server.log keeps the way back after the page's toast is gone
+function logBranchDeleted(repo, branch, sha, how) {
+  console.log(`skiffcode: deleted branch ${branch} in ${repo} (was ${sha || 'unknown'}, ${how})`);
+}
+
 const gitTimers = new Map();
 function gitChanged(root) {
   statusCache.delete(root);
@@ -328,6 +353,27 @@ function copyIntoWorktree(repoPath, target) {
       fs.cpSync(src, dst, { recursive: true });
     } catch { /* skip */ }
   }
+}
+
+/** Claude conversation id -> SkiffCode sessions holding it. Usually one, but nothing stops two from following the same id. */
+function claudeHolders() {
+  const out = new Map();
+  for (const s of state.sessions) {
+    if (s.kind !== 'claude' || typeof s.claudeId !== 'string') continue;
+    const id = s.claudeId.toLowerCase();
+    out.set(id, [...(out.get(id) || []), s]);
+  }
+  return out;
+}
+// A conversation written to this recently may be in use by a Claude we can't see: don't delete it.
+const ACTIVE_MS = 120e3;
+
+/** Why a conversation can't be deleted now ('running' here, 'live' elsewhere, recently 'active'), or null. */
+function conversationBlock(id, { live, holders, activeAt }) {
+  if ((holders.get(id) || []).some(s => sessions.stateOf(s.id) !== 'ended')) return 'running';
+  if (live.has(id)) return 'live'; // Claude runs it outside SkiffCode
+  if (Date.now() - activeAt < ACTIVE_MS) return 'active';
+  return null;
 }
 
 /** Only folders SkiffCode knows (repos, their worktrees): never arbitrary paths. */
@@ -557,6 +603,7 @@ const api = {
       branch: w.branch, isMain: w.isMain, locked: w.locked, prunable: w.prunable,
       dirty: st ? st.dirty : 0,
       unpushed: w.branch ? await git.unpushedCount(repo, w.branch) : 0,
+      merged: w.branch ? await git.mergedInto(repo, w.branch, await mergeCandidates(repo, p, w.branch)).catch(() => null) : null,
       sessions: state.sessionsIn(p).length,
     };
   },
@@ -565,6 +612,8 @@ const api = {
     const w = wts.find(x => x.path === p);
     if (!w) throw new Error('Unknown worktree');
     if (w.isMain) throw new Error('That’s the main checkout — remove or delete the repository instead');
+    // Read before removing: the worktree's recorded base goes with it
+    const candidates = deleteBranch && w.branch ? await mergeCandidates(repo, p, w.branch) : [];
     await sessions.stopAllIn(p);
     if (w.prunable || !fs.existsSync(p)) {
       await git.pruneWorktrees(repo);
@@ -582,19 +631,38 @@ const api = {
     state.update(d => { delete d.worktrees[p]; if (d.layouts) delete d.layouts[p]; });
     let branchResult = 'kept';
     let branchError;
+    let merged;
+    let sha;
     if (deleteBranch && w.branch) {
+      // A deleted branch has no reflog: the page offers this sha to restore it
+      sha = (await git.git(repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${w.branch}`]).catch(() => '')).trim() || undefined;
       try {
         await git.deleteBranch(repo, w.branch, !!forceBranch);
         branchResult = 'deleted';
+        logBranchDeleted(repo, w.branch, sha, forceBranch ? 'forced' : 'merged');
       } catch (e) {
-        if (/not fully merged/i.test(e.message)) branchResult = 'unmerged';
-        else { branchResult = 'error'; branchError = e.message; }
+        if (/not fully merged/i.test(e.message)) {
+          // git -d misses squash, rebase and remote-only merges; checked here, never taken from the page
+          merged = await git.mergedInto(repo, w.branch, candidates).catch(() => null);
+          if (merged) {
+            try {
+              await git.deleteBranch(repo, w.branch, true);
+              branchResult = 'deleted';
+              logBranchDeleted(repo, w.branch, sha, `${merged.how} into ${merged.base}`);
+            } catch (e2) { branchResult = 'error'; branchError = e2.message; }
+          } else branchResult = 'unmerged';
+        } else { branchResult = 'error'; branchError = e.message; }
       }
     }
     broadcast('worktrees.changed', { repo });
-    return { branch: branchResult, branchName: w.branch, branchError };
+    return { branch: branchResult, branchName: w.branch, branchError, merged: merged || undefined, sha };
   },
-  async 'branches.delete'({ repo, branch, force }) { await git.deleteBranch(repo, branch, !!force); broadcast('worktrees.changed', { repo }); },
+  async 'branches.delete'({ repo, branch, force }) {
+    const sha = (await git.git(repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]).catch(() => '')).trim();
+    await git.deleteBranch(repo, branch, !!force);
+    logBranchDeleted(repo, branch, sha, force ? 'forced' : 'merged');
+    broadcast('worktrees.changed', { repo });
+  },
 
   // sessions & terminals
   async 'sessions.create'({ kind, worktreePath, name, cols, rows, resumeClaudeId }) {
@@ -658,15 +726,61 @@ const api = {
   /** Delete every saved Claude conversation of these folders (a worktree or repo you're removing). */
   async 'claude.purgeFolders'({ folders }) {
     const dirs = claudeDirs();
-    let n = 0;
-    for (const f of knownFolders(folders)) {
+    const known = knownFolders(folders);
+    const ids = new Set();
+    for (const f of known) {
       for (const s of state.sessions.filter(x => x.worktreePath === f && x.kind === 'claude')) await sessions.forget(s.id);
-      for (const c of history.listConversations(f, dirs, new Map(), Infinity)) {
-        history.deleteConversation(dirs, f, c.id);
-        n++;
+      for (const c of history.listConversations(f, dirs, new Map(), Infinity)) ids.add(c.id);
+    }
+    if (!ids.size) return { deleted: 0 };
+    const failed = history.deleteConversations(dirs, [...ids], known).find(r => r.error);
+    if (failed) throw new Error(failed.error);
+    return { deleted: ids.size };
+  },
+  /** Every Claude conversation on disk, from any folder: where it belongs here, its SkiffCode sessions, whether it runs. */
+  async 'claude.allConversations'() {
+    const live = history.liveConversationIds(claudeDirs());
+    const holders = claudeHolders();
+    const roots = [...knownRoots];
+    const conversations = (await history.listAllConversations(claudeDirs())).map(c => {
+      const abs = !!c.cwd && path.isAbsolute(c.cwd);
+      const real = abs ? realpath(c.cwd) : null;
+      // a subfolder belongs to its worktree; the deepest one wins when worktrees nest
+      const wt = real ? roots.filter(r => within(r, real)).sort((x, y) => y.length - x.length)[0] || null : null;
+      const repo = wt && repoForWorktree(wt);
+      const held = (holders.get(c.id) || []).map(s => s.id);
+      const block = conversationBlock(c.id, { live, holders, activeAt: c.activeAt });
+      return { ...c, folderExists: abs && fs.existsSync(c.cwd), worktreePath: wt, atRoot: !!wt && wt === real, repoPath: repo ? repo.path : null, sessions: held, live: live.has(c.id) || held.some(id => sessions.stateOf(id) !== 'ended'), block };
+    });
+    return { conversations, now: Date.now() };
+  },
+  /** Delete several conversations. Refused, per id, while Claude runs it (here or elsewhere) or wrote to it in the last two minutes. */
+  async 'claude.deleteConversations'({ ids } = {}) {
+    if (!Array.isArray(ids) || ids.length < 1 || ids.length > 100 || !ids.every(id => typeof id === 'string' && id.length === 36 && history.UUID.test(id))) throw new Error('Pick 1 to 100 conversations');
+    const dirs = claudeDirs();
+    const want = [...new Set(ids.map(id => id.toLowerCase()))];
+    const results = new Map();
+    // check and delete with no await in between, so nothing (a resume, an adopt) can start one of them meanwhile
+    const live = history.liveConversationIds(dirs);
+    const holders = claudeHolders();
+    const queued = [];
+    for (const id of want) {
+      try {
+        const fp = history.conversationFootprint(dirs, id);
+        const reason = conversationBlock(id, { live, holders, activeAt: fp.activeAt });
+        if (reason) results.set(id, { id, ok: false, reason });
+        else { results.set(id, { id, ok: true, freed: fp.bytes }); queued.push(id); }
+      } catch (e) {
+        results.set(id, { id, ok: false, reason: e.message });
       }
     }
-    return { deleted: n };
+    if (queued.length) for (const r of history.deleteConversations(dirs, queued)) if (r.error) results.set(r.id, { id: r.id, ok: false, reason: r.error });
+    // only now drop their (ended) sessions: a refused or failed delete keeps its session
+    for (const id of queued) {
+      if (!results.get(id).ok) continue;
+      for (const s of holders.get(id) || []) await sessions.forget(s.id).catch(() => {});
+    }
+    return { results: want.map(id => results.get(id)) };
   },
   /** Pick up an existing Claude conversation (pasted ID or `claude --resume …` line) as a SkiffCode session. */
   async 'sessions.adopt'({ worktreePath, conversation, name, cols, rows }) {

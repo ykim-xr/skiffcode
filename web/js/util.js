@@ -113,6 +113,7 @@ const P = {
   image: 'M2 2.5h12v11H2zM2 11l3.5-3.5 3 3 2-2 3.5 3.5M10.5 6.2a1.2 1.2 0 1 0 0-.01',
   eye: 'M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8zM8 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4z',
   external: 'M9.5 2.5h4v4M13.5 2.5 8 8M12 9.5v4H2.5V4h4',
+  list: 'M5.5 4h8M5.5 8h8M5.5 12h8M2.5 4h.01M2.5 8h.01M2.5 12h.01',
   back: 'M10 3 5 8l5 5',
   forward: 'M6 3l5 5-5 5',
 };
@@ -207,12 +208,21 @@ const EXT_LANG = {
   sql: 'sql', java: 'java', kt: 'kotlin', c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp', hpp: 'cpp', cs: 'csharp', rb: 'ruby', php: 'php', swift: 'swift',
   xml: 'xml', svg: 'xml', dockerfile: 'dockerfile', graphql: 'graphql', gql: 'graphql', lua: 'lua', r: 'r', dart: 'dart', ps1: 'powershell', bat: 'bat',
 };
+// Files known by name, so Ctrl+/ has a comment syntax. 'dotenv' and 'ignore' are registered in app.js.
+const NAME_LANG = {
+  makefile: 'shell', gnumakefile: 'shell', dockerfile: 'dockerfile', gemfile: 'ruby', rakefile: 'ruby', codeowners: 'ignore',
+  '.bashrc': 'shell', '.zshrc': 'shell', '.profile': 'shell', '.bash_profile': 'shell', '.envrc': 'shell',
+  '.gitignore': 'ignore', '.dockerignore': 'ignore', '.npmignore': 'ignore', '.prettierignore': 'ignore', '.eslintignore': 'ignore', '.gitattributes': 'ignore',
+  '.editorconfig': 'ini', '.npmrc': 'ini', '.gitconfig': 'ini',
+};
+const MORE_EXT_LANG = { env: 'dotenv', mk: 'shell', cfg: 'ini', conf: 'ini', properties: 'ini', tf: 'hcl', tfvars: 'hcl', hcl: 'hcl' };
 export function languageOf(p) {
   const name = basename(p).toLowerCase();
-  if (name === 'dockerfile') return 'dockerfile';
-  if (name === 'makefile') return 'shell';
+  if (NAME_LANG[name]) return NAME_LANG[name];
+  if (name.startsWith('.env.')) return 'dotenv';
+  if (name.startsWith('dockerfile.')) return 'dockerfile';
   const ext = name.includes('.') ? name.split('.').pop() : '';
-  return EXT_LANG[ext] || 'plaintext';
+  return MORE_EXT_LANG[ext] || EXT_LANG[ext] || 'plaintext';
 }
 
 export const STATUS_LABEL = { A: 'Added', M: 'Modified', D: 'Deleted', R: 'Renamed', C: 'Copied', T: 'Type changed', U: 'Conflict', '?': 'Untracked' };

@@ -1,6 +1,7 @@
 // Test stand-in for Monaco's AMD loader: defines a tiny fake `monaco` API.
 (function () {
   const models = new Map();
+  const editors = new Set();
   class Emitter { constructor() { this.l = []; } on(fn) { this.l.push(fn); return { dispose: () => {} }; } fire(v) { this.l.forEach(f => f(v)); } }
   class Uri {
     constructor(scheme, path, query) { this.scheme = scheme; this.path = path; this.query = query || ''; }
@@ -33,13 +34,16 @@
     const ed = {
       _ta: ta,
       _opts: { ...(opts || {}) }, // every option it was created or updated with, for tests
+      _triggered: [], // trigger() calls, for tests
+      hasTextFocus: () => document.activeElement === ta, trigger(...a) { ed._triggered.push(a.slice(0, 2)); },
       addCommand() {}, createContextKey() { return { set() {}, get() {}, reset() {} }; },
       onDidChangeCursorPosition() { return { dispose() {} }; }, getPosition: () => ({ lineNumber: 1, column: 1 }),
-      setSelection() {}, revealRangeInCenterIfOutsideViewport() {}, revealLineInCenter() {}, focus() { ta.focus(); }, layout() {}, dispose() { ta.remove(); },
+      setSelection() {}, revealRangeInCenterIfOutsideViewport() {}, revealLineInCenter() {}, focus() { ta.focus(); }, layout() {}, dispose() { editors.delete(ed); ta.remove(); },
       updateOptions(o) { Object.assign(ed._opts, o); if ('readOnly' in o) ta.readOnly = !!o.readOnly; }, getModel: () => model,
       setModel(m) { model = m; sync(); if (m) m.onDidChangeContent(() => { if (model === m && document.activeElement !== ta) sync(); }); },
     };
     if (model) model.onDidChangeContent(() => { if (document.activeElement !== ta) sync(); });
+    editors.add(ed);
     return ed;
   }
   window.require = function (deps, cb) {
@@ -48,6 +52,7 @@
       KeyMod: { CtrlCmd: 2048 }, KeyCode: { KeyS: 49 },
       editor: {
         create: editorStub,
+        getEditors: () => [...editors],
         createDiffEditor(el) {
           el.classList.add('stub-diff');
           const left = document.createElement('div'); left.className = 'stub-diff-left';
@@ -65,6 +70,7 @@
       },
       languages: {
         typescript: { typescriptDefaults: { setDiagnosticsOptions() {}, setCompilerOptions() {} }, javascriptDefaults: { setDiagnosticsOptions() {}, setCompilerOptions() {} }, JsxEmit: {}, ScriptTarget: {} },
+        getLanguages: () => [], onLanguage() {}, register() {}, setLanguageConfiguration() {}, setMonarchTokensProvider() {},
         registerDefinitionProvider(_l, p) { window.__defProvider = p; }, registerReferenceProvider() {},
       },
     };

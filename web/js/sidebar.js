@@ -77,7 +77,8 @@ function render() {
       h('div.sidebar-actions',
         h('button.icon-btn', { title: 'Add repository or folder', onclick: () => A.addRepo() }, icon('plus')),
         h('button.icon-btn', { title: 'New group', onclick: () => A.newGroup() }, icon('group')),
-        h('button.icon-btn', { title: withKey('Jump to…', 'jump'), onclick: () => A.jump() }, icon('search')))),
+        h('button.icon-btn', { title: withKey('Jump to…', 'jump'), onclick: () => A.jump() }, icon('search')),
+        h('button.icon-btn', { title: withKey('Claude sessions', 'sessions'), onclick: () => A.sessionManager() }, icon('list')))),
     activePanel(),
     list);
   list.scrollTop = treeTop;
@@ -169,6 +170,7 @@ function folderRows(r, depth) {
       { label: 'New Claude session', icon: 'claude', hint: keyHint('newClaude'), action: () => A.newSession(r.path, 'claude') },
       { label: 'New shell', icon: 'terminal', hint: keyHint('newShell'), action: () => A.newSession(r.path, 'shell') },
       { label: 'Resume Claude conversation…', icon: 'play', action: () => A.resumeConversation(r.path) },
+      { label: 'Manage Claude sessions…', icon: 'list', action: () => A.sessionManager({ repo: r.path }) },
       { separator: true },
       { label: 'Initialize git here', icon: 'git', action: () => A.gitInit(r.path) },
       { label: 'Customize…', icon: 'palette', action: () => customizeDialog('repo', r) },
@@ -211,6 +213,7 @@ function repoRows(r, depth) {
     oncontextmenu: e => contextMenu(e, [
       { label: 'New worktree…', icon: 'branch', action: () => A.newWorktree(r) },
       { label: 'Refresh', icon: 'refresh', action: () => A.refreshRepo(r) },
+      { label: 'Manage Claude sessions…', icon: 'list', action: () => A.sessionManager({ repo: r.path }) },
       { label: 'Customize…', icon: 'palette', action: () => customizeDialog('repo', r) },
       { separator: true },
       { label: 'Move up', icon: 'up', action: () => call('repos.nudge', { path: r.path, dir: -1 }) },
@@ -252,6 +255,7 @@ function worktreeRows(r, w, depth) {
       { label: 'New Claude session', icon: 'claude', hint: keyHint('newClaude'), action: () => A.newSession(w.path, 'claude') },
       { label: 'New shell', icon: 'terminal', hint: keyHint('newShell'), action: () => A.newSession(w.path, 'shell') },
       { label: 'Resume Claude conversation…', icon: 'play', action: () => A.resumeConversation(w.path) },
+      { label: 'Manage Claude sessions…', icon: 'list', action: () => A.sessionManager({ worktree: w.path }) },
       { label: 'Review changes vs base', icon: 'diff', action: () => A.reviewChanges(w.path) },
       { separator: true },
       { label: 'New worktree…', icon: 'branch', action: () => A.newWorktree(r) },

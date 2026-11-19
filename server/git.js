@@ -432,6 +432,49 @@ async function pruneWorktrees(repo) {
 async function deleteBranch(repo, branch, force) {
   await git(repo, ['branch', force ? '-D' : '-d', safeRef(branch)]);
 }
+// Same options on both sides, so user config (prefixes, renames, color, textconv, signatures) can't change a patch-id.
+const PATCH_OPTS = ['--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', '--binary', '--submodule=short', '--no-show-signature', '--src-prefix=a/', '--dst-prefix=b/'];
+const SQUASH_SCAN = 2000;
+let verbatimOk;
+/** Patch-ids that keep whitespace: a whitespace-only change must never match. Fails (closed) if git lacks --verbatim. */
+async function patchIds(repo, patch) {
+  if (verbatimOk === undefined) verbatimOk = await git(repo, ['patch-id', '--verbatim'], { input: '' }).then(() => true, () => false);
+  if (!verbatimOk) throw new Error('git patch-id --verbatim is not supported');
+  if (!patch.trim()) return [];
+  const out = await git(repo, ['patch-id', '--verbatim'], { input: patch });
+  return out.split('\n').map(l => l.split(' ')[0]).filter(Boolean);
+}
+const commitPatches = (repo, range) => git(repo, ['log', '-p', '--no-merges', ...PATCH_OPTS, '--format=commit %H', '-n', String(SQUASH_SCAN), range]);
+/**
+ * Where `branch` already landed, which `git branch -d` misses: an ancestor of a base, every commit
+ * rebased into it, or its whole diff squashed into one commit there. Reads only; writes no objects.
+ * Returns { base, how: 'ancestor' | 'rebase' | 'squash' } for the first base that matches, else null.
+ */
+async function mergedInto(repo, name, bases) {
+  const branch = `refs/heads/${safeRef(name)}`; // never a tag of the same name
+  if (!(await refExists(repo, branch))) return null;
+  const seen = new Set();
+  for (const base of bases) {
+    const sha = (await git(repo, ['rev-parse', '--verify', '--quiet', `${safeRef(base)}^{commit}`]).catch(() => '')).trim();
+    if (!sha || seen.has(sha)) continue;
+    seen.add(sha);
+    if (await git(repo, ['merge-base', '--is-ancestor', branch, sha]).then(() => true, () => false)) return { base, how: 'ancestor' };
+    try {
+      const mb = (await git(repo, ['merge-base', sha, branch])).trim();
+      const baseIds = new Set(await patchIds(repo, await commitPatches(repo, `${mb}..${sha}`)));
+      // Patch-ids skip merge commits, and a merge can carry edits of its own (a conflict fix)
+      const merges = (await git(repo, ['rev-list', '--merges', `${sha}..${branch}`])).trim();
+      const count = Number((await git(repo, ['rev-list', '--count', `${mb}..${branch}`])).trim());
+      if (!merges && count <= SQUASH_SCAN) { // past the cap, part of the branch would go unchecked
+        const mineEach = await patchIds(repo, await commitPatches(repo, `${mb}..${branch}`));
+        if (mineEach.length && mineEach.every(id => baseIds.has(id))) return { base, how: 'rebase' };
+      }
+      const [mine] = await patchIds(repo, await git(repo, ['diff', ...PATCH_OPTS, mb, branch]));
+      if (mine && baseIds.has(mine)) return { base, how: 'squash' };
+    } catch { /* no merge base, too much to scan, or no --verbatim: not proven merged */ }
+  }
+  return null;
+}
 async function unpushedCount(repo, branch) {
   safeRef(branch);
   const o = await git(repo, ['rev-list', '--count', branch, '--not', '--remotes']).catch(() => '0');
@@ -447,7 +490,7 @@ function sanitizeForPath(branch) {
 
 module.exports = {
   git, resolveRepoRoot, parseWorktreeList, listWorktrees, localBranches, remoteNames, baseRefs, defaultBase, refExists, isValidBranchName,
-  compareBase, parseStatusV2, status, branchStatus, parseNameStatus, changesSince, commitsSince, history, commitFiles, parentOf, showFile,
+  isSameBranch, compareBase, parseStatusV2, status, branchStatus, parseNameStatus, changesSince, commitsSince, history, commitFiles, parentOf, showFile,
   stage, stageAll, unstage, unstageAll, discard, commit, push, pull, addWorktree, removeWorktree, pruneWorktrees, deleteBranch,
-  unpushedCount, gitDir, sanitizeForPath, stashList, stashFiles, stashPush, stashApply, stashDrop, stashClear,
+  mergedInto, unpushedCount, gitDir, sanitizeForPath, stashList, stashFiles, stashPush, stashApply, stashDrop, stashClear,
 };

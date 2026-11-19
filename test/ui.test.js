@@ -943,6 +943,59 @@ const G = {};
     await page.waitForFunction(i => !window.skiffcode.active.allTabs().some(t => t.sessionId === i), id);
   });
 
+  await step('comment keys: Ctrl+/ and Shift+Alt+A run the focused editor’s action once; a terminal keeps Ctrl+/; the palette and keys dialog list both', async () => {
+    const triggered = () => page.evaluate(() => window.__cmt.editor._triggered.map(a => a.join(' ')));
+    // files with a comment syntax get a language that has one
+    const names = ['.env', '.env.local', 'prod.env', '.envrc', '.gitignore', 'CODEOWNERS', '.bashrc', 'GNUmakefile', 'rules.mk', '.editorconfig', 'app.conf', 'main.tf', 'prod.tfvars', 'Dockerfile.dev', 'Gemfile', 'notes.txt', 'src/app.py'];
+    assert.deepEqual(await page.evaluate(async n => { const { languageOf } = await import('/js/util.js'); return n.map(languageOf); }, names),
+      ['dotenv', 'dotenv', 'dotenv', 'shell', 'ignore', 'ignore', 'shell', 'shell', 'shell', 'ini', 'ini', 'hcl', 'hcl', 'dockerfile', 'ruby', 'plaintext', 'python']);
+    await page.evaluate(async () => {
+      const t = window.__cmt = await window.skiffcode.active.openFile('README.md');
+      t.editor._triggered = [];
+      t.editor.focus();
+    });
+    await page.keyboard.press('Control+Slash');
+    assert.deepEqual(await triggered(), ['keyboard editor.action.commentLine'], 'one line comment, run by SkiffCode (Monaco’s own binding is stopped)');
+    await page.keyboard.press('Shift+Alt+KeyA');
+    assert.deepEqual(await triggered(), ['keyboard editor.action.commentLine', 'keyboard editor.action.blockComment']);
+    // no editor with text focus: nothing runs
+    await page.evaluate(() => document.activeElement.blur());
+    await page.keyboard.press('Control+Slash');
+    assert.equal((await triggered()).length, 2, 'nothing runs without a focused editor');
+    // a focused terminal keeps Ctrl+/ (^_ is undo in shells and Claude Code)
+    assert.equal(await termKey({ key: '/', code: 'Slash', ctrlKey: true }), true, 'terminalKey passes Ctrl+/');
+    await page.click('.workspace:not(.hidden) .tabbar-actions button[title^="New shell"]');
+    await page.waitForFunction(() => { const t = window.skiffcode.active.activeTab; return t && t.session && t.session.kind === 'shell' && t.attached; });
+    const id = await page.evaluate(() => { const t = window.skiffcode.active.activeTab; t.term.focus(); return t.sessionId; });
+    // SkiffCode stops a key it handles before it reaches the page; seeing it here means it was left alone
+    await page.evaluate(() => { window.__keyed = 0; window.addEventListener('keydown', () => window.__keyed++, { once: true }); });
+    await page.keyboard.press('Control+Slash');
+    await page.waitForFunction(() => window.__keyed === 1, null, { timeout: 3000 });
+    await page.keyboard.press('Alt+w');
+    await page.waitForFunction(i => !window.skiffcode.active.allTabs().some(t => t.sessionId === i), id);
+    // the palette runs the action on the active editor
+    await page.evaluate(() => window.skiffcode.active.reveal(window.__cmt));
+    await page.keyboard.press('Control+Shift+p');
+    await page.fill('.qp-input', 'Toggle line comment');
+    await page.waitForSelector('.qp-item.selected .qp-desc >> text=Ctrl+/');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => window.__cmt.editor._triggered.length === 3);
+    assert.equal((await triggered())[2], 'keyboard editor.action.commentLine');
+    await page.keyboard.press('Control+Shift+p');
+    await page.fill('.qp-input', 'Toggle block comment');
+    await page.waitForSelector('.qp-item.selected .qp-desc >> text=Alt+Shift+A');
+    await page.keyboard.press('Escape');
+    await page.keyboard.press('Control+Shift+p');
+    await page.fill('.qp-input', 'Keyboard shortcuts');
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('.keys-modal');
+    assert.equal(await keyText('toggleLineComment'), 'Ctrl+/');
+    assert.equal(await keyText('toggleBlockComment'), 'Alt+Shift+A');
+    await page.click('.keys-modal .btn >> text=Cancel');
+    await page.waitForSelector('.keys-modal', { state: 'detached' });
+    await page.evaluate(() => { const ws = window.skiffcode.active; ws.closeTab(window.__cmt); });
+  });
+
   await step('bottom panel: move to panel, split right, hide/show, and the layout survives a reload', async () => {
     await page.keyboard.press('Control+p');
     await page.waitForSelector('.qp-input');
@@ -1662,6 +1715,89 @@ const G = {};
     if (await page.locator('.modal-title >> text=isn’t merged').count()) await page.click('.modal .btn >> text=Delete branch');
     await page.waitForSelector('.wt-row.active >> text=main');
     await shot('06-after-remove');
+  });
+
+  await step('Claude sessions: every conversation by repo, worktree and folder; filter, select a suggestion, delete', async () => {
+    const hourAgo = new Date(Date.now() - 3600e3);
+    const elsewhere = path.join(tmp, 'elsewhere');
+    const gone = path.join(tmp, 'gone-folder');
+    fs.mkdirSync(elsewhere, { recursive: true });
+    const seeds = [
+      { id: 'a1111111-0000-4000-8000-000000000001', cwd: repo, text: 'smx alpha in the worktree' },
+      { id: 'a1111111-0000-4000-8000-000000000002', cwd: elsewhere, text: 'smx beta outside skiffcode' },
+      { id: 'a1111111-0000-4000-8000-000000000003', cwd: gone, text: 'smx gamma in a missing folder' },
+      { id: 'a1111111-0000-4000-8000-000000000004', cwd: gone, text: 'smx delta in a missing folder' },
+    ];
+    const file = s => path.join(tmp, 'claude-home', 'projects', s.cwd.replace(/[^a-zA-Z0-9]/g, '-'), `${s.id}.jsonl`);
+    for (const s of seeds) {
+      fs.mkdirSync(path.dirname(file(s)), { recursive: true });
+      fs.writeFileSync(file(s), JSON.stringify({ type: 'user', cwd: s.cwd, timestamp: hourAgo.toISOString(), message: { role: 'user', content: s.text } }) + '\n');
+      fs.utimesSync(file(s), hourAgo, hourAgo); // newer than 2 minutes counts as active and can't be deleted
+    }
+    const fresh = { id: 'a1111111-0000-4000-8000-000000000005', cwd: elsewhere, text: 'smx fresh just written' };
+    fs.writeFileSync(file(fresh), JSON.stringify({ type: 'user', cwd: fresh.cwd, message: { role: 'user', content: fresh.text } }) + '\n');
+    const row = s => `.sm-row[data-id="${s.id}"]`;
+    await page.click('.sidebar-actions button[title="Claude sessions"]');
+    await page.waitForSelector('.sm-modal .sm-row');
+    for (const s of seeds) await page.waitForSelector(row(s));
+    await page.waitForFunction(() => document.activeElement === document.querySelector('.sm-modal .sm-search'), null, { timeout: 3000 }); // typing goes to the search box, not the terminal behind
+    // written a moment ago: Claude may still be using it, so it can't be selected
+    assert.equal(await page.isDisabled(`${row(fresh)} input[type=checkbox]`), true);
+    assert.equal(await page.getAttribute(`${row(fresh)} input[type=checkbox]`, 'title'), 'Active in the last 2 minutes');
+    // a store change that alters nothing shown leaves the rows alone (no redraw: clicks and focus aren't lost)
+    await page.evaluate(sel => { document.querySelector(sel).dataset.kept = '1'; return import('/js/store.js').then(m => m.notify()); }, row(seeds[1]));
+    await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+    assert.equal(await page.getAttribute(row(seeds[1]), 'data-kept'), '1', 'the row was not rebuilt');
+    // repo → worktree → conversation, then the folder groups
+    const order = await page.evaluate(ids => [...document.querySelectorAll('.sm-modal .sm-group, .sm-modal .sm-row')]
+      .map(e => (e.dataset.id && ids.includes(e.dataset.id) ? e.dataset.id : e.dataset.kind ? `${e.dataset.kind}:${e.dataset.name}` : null)).filter(Boolean), seeds.map(s => s.id));
+    const at = k => order.indexOf(k);
+    assert.ok(at('repo:myapp') >= 0 && at('repo:myapp') < at('worktree:myapp') && at('worktree:myapp') < at(seeds[0].id), `repo, worktree, conversation: ${order}`);
+    assert.ok(at('other:Other folders') > at(seeds[0].id) && at('other:Other folders') < at(seeds[1].id), 'Other folders holds the conversation outside SkiffCode');
+    assert.ok(at('missing:Missing folders') > at(seeds[1].id) && at('missing:Missing folders') < at(seeds[2].id) && at(seeds[2].id) < at(seeds[3].id), 'Missing folders holds the other two');
+    assert.match(await page.textContent(`${row(seeds[0])} .sm-meta`), /1 prompt/);
+    assert.match(await page.textContent('.sm-modal .sm-summary'), /\d+ conversations? · [\d.]+ (B|KB|MB|GB)/);
+    await page.evaluate(() => document.querySelectorAll('.toast').forEach(t => t.remove())); // earlier toasts cover the bottom bar
+    await shot('sm-tree');
+    // search
+    await page.fill('.sm-modal .sm-search', 'smx beta');
+    await page.waitForSelector(row(seeds[2]), { state: 'detached' });
+    assert.equal(await page.locator(`${row(seeds[1])}:visible`).count(), 1);
+    assert.equal(await page.locator('.sm-modal .sm-row').count(), 1, 'only the match is left');
+    await page.fill('.sm-modal .sm-search', '');
+    await page.waitForSelector(row(seeds[2]));
+    // "Where: Missing folders"
+    await page.click('.sm-modal .sm-chip >> text=Missing folders');
+    await page.waitForSelector(row(seeds[0]), { state: 'detached' });
+    assert.equal(await page.locator(row(seeds[1])).count(), 0);
+    assert.equal(await page.locator(`${row(seeds[2])}, ${row(seeds[3])}`).count(), 2);
+    await page.click('.sm-modal .sm-chip:text-is("All")');
+    await page.waitForSelector(row(seeds[0]));
+    // a suggestion selects its set; the others stay unselected
+    const set = await page.evaluate(() => import('/js/rpc.js').then(r => r.call('claude.allConversations')).then(r => r.conversations.filter(c => c.cwd && !c.folderExists && !c.block).length));
+    await page.click('.sm-modal .sm-suggest button:has-text("In missing folders")');
+    await page.waitForSelector(`.sm-modal .sm-bar >> text=${set} selected`);
+    for (const s of seeds) assert.equal(await page.isChecked(`${row(s)} input[type=checkbox]`), s.cwd === gone, s.id);
+    await shot('sm-suggestion');
+    // a search that hides a selected row drops it from the selection, so it can't be deleted unseen
+    await page.fill('.sm-modal .sm-search', 'gamma');
+    await page.waitForSelector(`.sm-modal .sm-bar >> text=${set - 1} selected`);
+    await page.click('.sm-modal .sm-suggest button:has-text("In missing folders")');
+    await page.waitForSelector(`.sm-modal .sm-bar >> text=${set} selected`);
+    assert.equal(await page.inputValue('.sm-modal .sm-search'), '', 'the suggestion clears the search');
+    await page.click('.sm-modal .sm-bar .btn.danger');
+    await page.waitForSelector(`.modal-title >> text=Delete ${set} conversation`);
+    assert.match(await page.textContent('.modal-detail'), /gone-folder/);
+    assert.match(await page.textContent('.modal-detail'), /can.t be undone/);
+    await page.click('.modal:not(.sm-modal) .btn.danger');
+    await page.waitForSelector(row(seeds[2]), { state: 'detached' });
+    await page.waitForSelector(`.toast >> text=Deleted ${set} conversation`);
+    assert.equal(await page.locator(row(seeds[3])).count(), 0);
+    assert.ok(!fs.existsSync(file(seeds[2])) && !fs.existsSync(file(seeds[3])), 'files deleted');
+    assert.ok(fs.existsSync(file(seeds[0])) && fs.existsSync(file(seeds[1])), 'the others stay');
+    assert.equal(await page.locator(`${row(seeds[0])}, ${row(seeds[1])}`).count(), 2);
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('.sm-modal', { state: 'detached' });
   });
 
   await step('a plain folder: added from the browser, opens with files; Changes says it isn’t git', async () => {
