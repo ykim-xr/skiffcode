@@ -1703,7 +1703,14 @@ function startServer() {
     fs.writeFileSync(path.join(reg, `${process.pid}.json`), JSON.stringify({ pid: process.pid, sessionId: L }));
     fs.writeFileSync(path.join(reg, 'junk.json'), '{ not json');
     // a Claude whose pid isn't visible here (another pid namespace) but that updated its entry just now
-    const deadPid = spawnSync('true').pid;
+    // a pid that surely names no process: spawnSync has reaped it, and kill(0) confirms it's gone
+    const deadPidNow = () => {
+      for (;;) {
+        const pid = spawnSync('true').pid;
+        try { process.kill(pid, 0); } catch (e) { if (e.code === 'ESRCH') return pid; }
+      }
+    };
+    const deadPid = deadPidNow();
     fs.writeFileSync(path.join(reg, `${deadPid}.json`), JSON.stringify({ pid: deadPid, sessionId: D, updatedAt: Date.now() }));
     const hist = path.join(CLAUDE_HOME, 'history.jsonl');
     fs.writeFileSync(hist, [T, M, R, P, D, 'other'].map(id => JSON.stringify({ display: `p ${id}`, sessionId: id })).join('\n') + '\n');
@@ -1775,7 +1782,41 @@ function startServer() {
     all = await list();
     assert.ok(!all[T] && !all[M] && all[R]);
 
-    await c.call('sessions.forget', { id: sR.id });
+    // stop and force list ids from ids; anything else is refused before anything is stopped or deleted
+    const running = async id => (await c.call('hello')).sessions.find(x => x.id === id).state !== 'ended';
+    await assert.rejects(c.call('claude.deleteConversations', { ids: [R], stop: true }), /stop/);
+    await assert.rejects(c.call('claude.deleteConversations', { ids: [F], force: [K] }), /force/);
+    assert.ok(await running(sR.id), 'not stopped by a refused call');
+    for (const p of [files.R, files.F, files.K]) assert.ok(fs.existsSync(p), `kept ${p}`);
+    // force skips the live and active checks only for the ids it lists, and never a running SkiffCode session
+    ({ results } = await c.call('claude.deleteConversations', { ids: [L, F], force: [L] }));
+    assert.deepEqual(results.map(x => x.ok ? 'ok' : x.reason), ['ok', 'active']);
+    ({ results } = await c.call('claude.deleteConversations', { ids: [R, F, D], force: [R, F, D] }));
+    assert.deepEqual(results.map(x => x.ok ? 'ok' : x.reason), ['running', 'ok', 'ok']);
+    for (const p of [files.L, files.F, files.D]) assert.ok(!fs.existsSync(p), `force deleted ${p}`);
+    assert.ok(fs.existsSync(files.R));
+    // stop ends the listed ids' SkiffCode sessions first; their fresh transcript and registry entry then don't count, a pid still alive does
+    fs.utimesSync(files.R, new Date(), new Date());
+    const deadPid2 = deadPidNow();
+    fs.writeFileSync(path.join(reg, `${deadPid2}.json`), JSON.stringify({ pid: deadPid2, sessionId: R, updatedAt: Date.now() }));
+    plan('SessionStart,hang');
+    const sA = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, name: 'holds A', cols: 80, rows: 24 });
+    const A = await held(sA.id);
+    const aFile = write(A, wt, [say(wt, 'also alive elsewhere')]);
+    fs.writeFileSync(path.join(reg, `${process.pid}.json`), JSON.stringify({ pid: process.pid, sessionId: A }));
+    ({ results } = await c.call('claude.deleteConversations', { ids: [R, A] }));
+    assert.deepEqual(results.map(x => x.ok ? 'ok' : x.reason), ['running', 'running'], 'not stopped without stop');
+    ({ results } = await c.call('claude.deleteConversations', { ids: [R, A], stop: [R] }));
+    assert.deepEqual(results.map(x => x.ok ? 'ok' : x.reason), ['ok', 'running'], 'only the listed one is stopped');
+    assert.ok(!fs.existsSync(files.R));
+    assert.ok(!(await c.call('hello')).sessions.some(x => x.id === sR.id), 'the stopped and deleted session is gone');
+    assert.ok(await running(sA.id), 'the unlisted one keeps running');
+    ({ results } = await c.call('claude.deleteConversations', { ids: [A], stop: [A] }));
+    assert.deepEqual(results.map(x => x.ok ? 'ok' : x.reason), ['live'], 'stopped, but a Claude still runs it');
+    assert.ok(fs.existsSync(aFile));
+    assert.equal(((await c.call('hello')).sessions.find(x => x.id === sA.id) || {}).state, 'ended', 'a refused one stays, stopped');
+
+    await c.call('sessions.forget', { id: sA.id });
     for (const f of fs.readdirSync(reg)) fs.unlinkSync(path.join(reg, f));
   });
 

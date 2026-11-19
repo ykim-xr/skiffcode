@@ -294,7 +294,12 @@ const alive = pid => {
  * config folder). A reused pid also counts as live, which only refuses a delete.
  */
 function liveConversationIds(configDirs) {
-  const out = new Set();
+  return new Set(liveConversations(configDirs).keys());
+}
+
+/** liveConversationIds as a Map: id -> true when a pid running it is alive here, false when only its entry is fresh. */
+function liveConversations(configDirs) {
+  const out = new Map();
   for (const cfg of configDirs) {
     const dir = path.join(cfg, 'sessions');
     let names = [];
@@ -306,7 +311,9 @@ function liveConversationIds(configDirs) {
       if (!j || typeof j.sessionId !== 'string') continue;
       // epoch ms; pid 0 or below would signal a whole process group
       const seen = Math.max(...[j.updatedAt, j.statusUpdatedAt].filter(Number.isFinite), 0);
-      if ((Number.isInteger(j.pid) && j.pid > 0 && alive(j.pid)) || Date.now() - seen < REGISTRY_FRESH_MS) out.add(j.sessionId.toLowerCase());
+      const id = j.sessionId.toLowerCase();
+      if (Number.isInteger(j.pid) && j.pid > 0 && alive(j.pid)) out.set(id, true);
+      else if (Date.now() - seen < REGISTRY_FRESH_MS && !out.has(id)) out.set(id, false);
     }
   }
   return out;
@@ -318,4 +325,4 @@ function parseConversationId(text) {
   return m ? m[0].toLowerCase() : null;
 }
 
-module.exports = { listConversations, parseConversationId, encode, readTranscript, deleteConversation, deleteConversations, listAllConversations, conversationFootprint, liveConversationIds, UUID };
+module.exports = { listConversations, parseConversationId, encode, readTranscript, deleteConversation, deleteConversations, listAllConversations, conversationFootprint, liveConversationIds, liveConversations, UUID };

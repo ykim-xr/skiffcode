@@ -13,7 +13,7 @@ const STATE = [['Any', 'any'], ['Running', 'running'], ['Stopped', 'stopped'], [
 const SORT = [['Last active', 'active'], ['Size', 'size'], ['Prompts', 'prompts']];
 const VIEW = [['Tree', 'tree'], ['List', 'list']];
 const CHUNK = 50;
-const BLOCK = { running: 'Running in SkiffCode', live: 'Running in another terminal', active: 'Active in the last 2 minutes' };
+const BLOCK = { running: 'Running in SkiffCode: stopped first', live: 'Running in another terminal', active: 'Active in the last 2 minutes' };
 const REASON = { running: 'running', live: 'running in another terminal', active: 'active in the last 2 minutes' };
 
 export function fmtSize(n) {
@@ -101,6 +101,7 @@ export async function sessionManager(app, scope = {}) {
     return { held, running, stopped: !running && held.length > 0, where, block, branch: branchOf(c) };
   }
   let infos = new Map();
+  // for group checkboxes and suggestions: a blocked row is only ever picked by hand
   const selectable = c => !infos.get(c.id).block;
   const inScope = c => (!sc.worktree || c.worktreePath === sc.worktree) && (!sc.repo || c.repoPath === sc.repo);
 
@@ -202,7 +203,6 @@ export async function sessionManager(app, scope = {}) {
     const i = infos.get(c.id);
     const cb = h('input', {
       type: 'checkbox',
-      disabled: !!i.block,
       title: BLOCK[i.block] || 'Select',
       onchange: () => { cb.checked ? selected.add(c.id) : selected.delete(c.id); render(); },
     });
@@ -227,7 +227,7 @@ export async function sessionManager(app, scope = {}) {
       canResume ? btn('Resume', 'play', () => void resume(c)) : null,
       btn('Copy ID', 'files', () => copy(c.id)),
       c.cwd ? btn('Copy resume command', 'terminal', () => copy(`cd '${c.cwd.replace(/'/g, `'\\''`)}' && claude --resume ${c.id}`)) : null,
-      btn('Delete', 'trash', () => void removeIds([c.id], !!i.block))));
+      btn('Delete', 'trash', () => void removeIds([c.id]))));
   }
 
   function treeRows(g, depth, out) {
@@ -304,20 +304,27 @@ export async function sessionManager(app, scope = {}) {
   }
 
   let busy = false;
-  async function removeIds(ids, blocked) {
+  async function removeIds(ids) {
     if (busy || !ids.length) return;
-    if (blocked) { err.textContent = 'This conversation is in use now. Try again when it has stopped.'; return; }
     const picked = all.filter(c => ids.includes(c.id));
     const names = [...new Set(picked.map(c => (c.cwd ? basename(c.cwd) : 'Unknown folder')))];
     const held = picked.some(c => c.sessions.length);
+    const blocked = b => picked.filter(c => infos.get(c.id).block === b).map(c => c.id);
+    const running = blocked('running');
+    const live = blocked('live');
+    const active = blocked('active');
+    const used = [...live, ...active];
     const v = await confirmDialog({
       title: `Delete ${plural(picked.length, 'conversation')}?`,
       detail: [
         `This frees ${fmtSize(sum(picked, c => c.size))}. Folders: ${names.slice(0, 5).join(', ')}${names.length > 5 ? ` and ${names.length - 5} more` : ''}.`,
-        held ? 'Their stopped sessions in SkiffCode are removed too.' : '',
+        running.length ? `${running.length} running in SkiffCode will be stopped first.` : '',
+        live.length ? `${live.length} are running in another terminal; Claude there can write them again.` : '',
+        active.length ? `${active.length} were written in the last 2 minutes.` : '',
+        held ? 'Their sessions in SkiffCode are removed too.' : '',
         'They won’t appear in /resume any more. This can’t be undone.',
       ].filter(Boolean).join('\n'),
-      buttons: [{ label: picked.length === 1 ? 'Delete conversation' : 'Delete conversations', value: 'yes', danger: true }],
+      buttons: [{ label: running.length ? 'Stop and delete' : used.length ? 'Delete anyway' : picked.length === 1 ? 'Delete conversation' : 'Delete conversations', value: 'yes', danger: true }],
     });
     if (v !== 'yes') return;
     busy = true;
@@ -327,7 +334,11 @@ export async function sessionManager(app, scope = {}) {
     const refused = [];
     try {
       for (let i = 0; i < ids.length; i += CHUNK) {
-        const { results } = await call('claude.deleteConversations', { ids: ids.slice(i, i + CHUNK) });
+        const chunk = ids.slice(i, i + CHUNK);
+        // per id, only what the dialog said: a row that became busy since is still refused
+        const stop = running.filter(id => chunk.includes(id));
+        const force = used.filter(id => chunk.includes(id));
+        const { results } = await call('claude.deleteConversations', { ids: chunk, ...(stop.length && { stop }), ...(force.length && { force }) });
         for (const r of results) {
           if (r.ok) { done++; freed += r.freed || 0; } else refused.push(r);
           selected.delete(r.id);

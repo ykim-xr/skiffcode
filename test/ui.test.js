@@ -1737,12 +1737,18 @@ const G = {};
     const fresh = { id: 'a1111111-0000-4000-8000-000000000005', cwd: elsewhere, text: 'smx fresh just written' };
     fs.writeFileSync(file(fresh), JSON.stringify({ type: 'user', cwd: fresh.cwd, message: { role: 'user', content: fresh.text } }) + '\n');
     const row = s => `.sm-row[data-id="${s.id}"]`;
+    plan('SessionStart,hang');
+    const runId = await page.evaluate(p => import('/js/rpc.js').then(r => r.call('sessions.create', { kind: 'claude', worktreePath: p, name: 'smx runner', cols: 80, rows: 24 })).then(x => x.id), repo);
+    await page.waitForSelector('.session-row:has-text("smx runner")');
+    const runner = { id: await page.evaluate(i => import('/js/store.js').then(m => m.store.sessions.find(s => s.id === i).claudeId), runId), cwd: repo };
+    fs.writeFileSync(file(runner), JSON.stringify({ type: 'user', cwd: repo, timestamp: hourAgo.toISOString(), message: { role: 'user', content: 'smx running here' } }) + '\n');
+    fs.utimesSync(file(runner), hourAgo, hourAgo);
     await page.click('.sidebar-actions button[title="Claude sessions"]');
     await page.waitForSelector('.sm-modal .sm-row');
     for (const s of seeds) await page.waitForSelector(row(s));
     await page.waitForFunction(() => document.activeElement === document.querySelector('.sm-modal .sm-search'), null, { timeout: 3000 }); // typing goes to the search box, not the terminal behind
-    // written a moment ago: Claude may still be using it, so it can't be selected
-    assert.equal(await page.isDisabled(`${row(fresh)} input[type=checkbox]`), true);
+    // written a moment ago: Claude may still be using it, so it is picked only by hand, never by a suggestion
+    assert.equal(await page.isDisabled(`${row(fresh)} input[type=checkbox]`), false);
     assert.equal(await page.getAttribute(`${row(fresh)} input[type=checkbox]`, 'title'), 'Active in the last 2 minutes');
     // a store change that alters nothing shown leaves the rows alone (no redraw: clicks and focus aren't lost)
     await page.evaluate(sel => { document.querySelector(sel).dataset.kept = '1'; return import('/js/store.js').then(m => m.notify()); }, row(seeds[1]));
@@ -1796,6 +1802,18 @@ const G = {};
     assert.ok(!fs.existsSync(file(seeds[2])) && !fs.existsSync(file(seeds[3])), 'files deleted');
     assert.ok(fs.existsSync(file(seeds[0])) && fs.existsSync(file(seeds[1])), 'the others stay');
     assert.equal(await page.locator(`${row(seeds[0])}, ${row(seeds[1])}`).count(), 2);
+    // a session running in SkiffCode can be picked by hand: it is stopped, then deleted
+    const runCb = `${row(runner)} input[type=checkbox]`;
+    assert.equal(await page.isDisabled(runCb), false);
+    assert.equal(await page.getAttribute(runCb, 'title'), 'Running in SkiffCode: stopped first');
+    await page.check(runCb);
+    await page.waitForSelector('.sm-modal .sm-bar >> text=1 selected');
+    await page.click('.sm-modal .sm-bar .btn.danger');
+    await page.waitForSelector('.modal-detail >> text=1 running in SkiffCode will be stopped first.');
+    await page.click('.modal:not(.sm-modal) .btn.danger >> text=Stop and delete');
+    await page.waitForSelector(row(runner), { state: 'detached' });
+    await page.waitForSelector('.session-row:has-text("smx runner")', { state: 'detached' });
+    assert.ok(!fs.existsSync(file(runner)), 'its conversation deleted');
     await page.keyboard.press('Escape');
     await page.waitForSelector('.sm-modal', { state: 'detached' });
   });

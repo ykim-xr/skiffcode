@@ -137,12 +137,15 @@ class Sessions extends EventEmitter {
     }
   }
 
-  async stop(id) {
-    const s = this.state.session(id);
-    if (!s) return;
-    this.state.update(d => { const x = d.sessions.find(y => y.id === id); if (x) { x.stoppedByUser = true; x.interrupted = undefined; } });
-    await this.killHost(id);
-    this.setState(id, 'ended', true);
+  /** Waits for a launch or resume under way: before its host exists there is nothing to kill. Never call it from inside oneAtATime. */
+  stop(id) {
+    return this.oneAtATime(id, async () => {
+      const s = this.state.session(id);
+      if (!s) return;
+      this.state.update(d => { const x = d.sessions.find(y => y.id === id); if (x) { x.stoppedByUser = true; x.interrupted = undefined; } });
+      await this.killHost(id);
+      this.setState(id, 'ended', true);
+    });
   }
 
   async forget(id) {

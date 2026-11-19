@@ -368,11 +368,17 @@ function claudeHolders() {
 // A conversation written to this recently may be in use by a Claude we can't see: don't delete it.
 const ACTIVE_MS = 120e3;
 
-/** Why a conversation can't be deleted now ('running' here, 'live' elsewhere, recently 'active'), or null. */
-function conversationBlock(id, { live, holders, activeAt }) {
+/**
+ * Why a conversation can't be deleted now ('running' here, 'live' elsewhere, recently 'active'), or null.
+ * stopped: ids whose SkiffCode sessions were just stopped (live is then a liveConversations Map). force skips 'live' and 'active'.
+ */
+function conversationBlock(id, { live, holders, activeAt, stopped, force }) {
   if ((holders.get(id) || []).some(s => sessions.stateOf(s.id) !== 'ended')) return 'running';
-  if (live.has(id)) return 'live'; // Claude runs it outside SkiffCode
-  if (Date.now() - activeAt < ACTIVE_MS) return 'active';
+  if (force) return null;
+  // we just ended its writer: a fresh write or registry entry was ours, but an alive pid means a Claude still runs it
+  const ours = !!stopped && stopped.has(id);
+  if (live.has(id) && !(ours && live.get(id) === false)) return 'live'; // Claude runs it outside SkiffCode
+  if (!ours && Date.now() - activeAt < ACTIVE_MS) return 'active';
   return null;
 }
 
@@ -754,33 +760,73 @@ const api = {
     });
     return { conversations, now: Date.now() };
   },
-  /** Delete several conversations. Refused, per id, while Claude runs it (here or elsewhere) or wrote to it in the last two minutes. */
-  async 'claude.deleteConversations'({ ids } = {}) {
-    if (!Array.isArray(ids) || ids.length < 1 || ids.length > 100 || !ids.every(id => typeof id === 'string' && id.length === 36 && history.UUID.test(id))) throw new Error('Pick 1 to 100 conversations');
-    const dirs = claudeDirs();
+  /**
+   * Delete several conversations. Refused, per id, while Claude runs it (here or elsewhere) or wrote to it in the last two minutes.
+   * stop: ids (from ids) whose SkiffCode sessions are stopped first. force: ids (from ids) deleted even when Claude may run them
+   * outside SkiffCode. Per id, so a row that became busy after the user confirmed is still refused.
+   */
+  async 'claude.deleteConversations'({ ids, stop, force } = {}) {
+    const isIds = v => Array.isArray(v) && v.every(id => typeof id === 'string' && id.length === 36 && history.UUID.test(id));
+    if (!isIds(ids) || ids.length < 1 || ids.length > 100) throw new Error('Pick 1 to 100 conversations');
     const want = [...new Set(ids.map(id => id.toLowerCase()))];
+    const subset = (v, name) => {
+      if (v === undefined) return new Set();
+      if (!isIds(v)) throw new Error(`${name} must list conversation IDs`);
+      const out = new Set(v.map(id => id.toLowerCase()));
+      if (![...out].every(id => want.includes(id))) throw new Error(`${name} may only list conversations being deleted`);
+      return out;
+    };
+    const stopIds = subset(stop, 'stop');
+    const forceIds = subset(force, 'force');
+    const dirs = claudeDirs();
     const results = new Map();
-    // check and delete with no await in between, so nothing (a resume, an adopt) can start one of them meanwhile
-    const live = history.liveConversationIds(dirs);
-    const holders = claudeHolders();
-    const queued = [];
-    for (const id of want) {
-      try {
-        const fp = history.conversationFootprint(dirs, id);
-        const reason = conversationBlock(id, { live, holders, activeAt: fp.activeAt });
-        if (reason) results.set(id, { id, ok: false, reason });
-        else { results.set(id, { id, ok: true, freed: fp.bytes }); queued.push(id); }
-      } catch (e) {
-        results.set(id, { id, ok: false, reason: e.message });
+    const stopped = new Set();
+    const forced = [];
+    let stoppedSessions = 0;
+    let deleted = 0;
+    try {
+      const running = claudeHolders();
+      for (const id of want) {
+        if (!stopIds.has(id)) continue;
+        for (const s of running.get(id) || []) {
+          if (sessions.stateOf(s.id) === 'ended') continue;
+          stopped.add(id);
+          await sessions.stop(s.id);
+          stoppedSessions++;
+        }
       }
+      // check and delete with no await in between, so nothing (a resume, an adopt) can start one of them meanwhile
+      const live = history.liveConversations(dirs);
+      const holders = claudeHolders();
+      const queued = [];
+      for (const id of want) {
+        try {
+          const fp = history.conversationFootprint(dirs, id);
+          const check = { live, holders, activeAt: fp.activeAt, stopped };
+          const reason = conversationBlock(id, { ...check, force: forceIds.has(id) });
+          if (reason) results.set(id, { id, ok: false, reason });
+          else {
+            results.set(id, { id, ok: true, freed: fp.bytes });
+            queued.push(id);
+            if (conversationBlock(id, check)) forced.push(id);
+          }
+        } catch (e) {
+          results.set(id, { id, ok: false, reason: e.message });
+        }
+      }
+      if (queued.length) for (const r of history.deleteConversations(dirs, queued)) if (r.error) results.set(r.id, { id: r.id, ok: false, reason: r.error });
+      deleted = queued.filter(id => results.get(id).ok).length;
+      // only now drop their (ended) sessions: a refused or failed delete keeps its session
+      for (const id of queued) {
+        if (!results.get(id).ok) continue;
+        for (const s of holders.get(id) || []) await sessions.forget(s.id).catch(() => {});
+      }
+      return { results: want.map(id => results.get(id)) };
+    } finally {
+      // deleted transcripts can't be recovered: server.log keeps what was stopped or forced, also when a stop failed
+      const okForced = forced.filter(id => (results.get(id) || {}).ok);
+      if (stopIds.size || forceIds.size) console.log(`skiffcode: delete conversations: ${want.length} asked, ${deleted} deleted, ${stoppedSessions} sessions stopped (${[...stopped].join(', ') || 'none'}), ${okForced.length} forced (${okForced.join(', ') || 'none'})`);
     }
-    if (queued.length) for (const r of history.deleteConversations(dirs, queued)) if (r.error) results.set(r.id, { id: r.id, ok: false, reason: r.error });
-    // only now drop their (ended) sessions: a refused or failed delete keeps its session
-    for (const id of queued) {
-      if (!results.get(id).ok) continue;
-      for (const s of holders.get(id) || []) await sessions.forget(s.id).catch(() => {});
-    }
-    return { results: want.map(id => results.get(id)) };
   },
   /** Pick up an existing Claude conversation (pasted ID or `claude --resume …` line) as a SkiffCode session. */
   async 'sessions.adopt'({ worktreePath, conversation, name, cols, rows }) {
