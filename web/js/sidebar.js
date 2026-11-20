@@ -54,8 +54,8 @@ function render() {
   renderAfterDrag = !!drag;
   if (drag) return;
   const list = h('div.tree', {
-    ondragover: e => { if (!drag) return; markDrop(null); if (drag.kind !== 'session') e.preventDefault(); },
-    ondrop: e => { if (drag && drag.kind !== 'session' && e.target === list) { e.preventDefault(); drop(null); } },
+    ondragover: e => { if (!drag) return; markDrop(null); if (drag.kind !== 'session' && drag.kind !== 'worktree') e.preventDefault(); },
+    ondrop: e => { if (drag && drag.kind !== 'session' && drag.kind !== 'worktree' && e.target === list) { e.preventDefault(); drop(null); } },
   });
   // Each group / repo / folder is one block, so a hairline can separate them.
   for (const g of store.groups) list.append(groupRow(g));
@@ -247,8 +247,15 @@ function worktreeRows(r, w, depth) {
   const sess = sessionsIn(w.path).filter(isClaude); // shells live in the tabs only
   const st = store.status.get(w.path);
   const active = store.active === w.path;
+  const me = { kind: 'worktree', repo: r.path, path: w.path };
   const row = h(`div.row.wt-row${active ? '.active' : ''}${w.prunable ? '.missing' : ''}`, {
     style: { paddingLeft: `${6 + depth * 12}px` },
+    ...(w.isMain ? {} : {
+      draggable: 'true',
+      ondragstart: e => startDrag(e, me),
+      ondragover: e => { if (drag && drag.kind === 'worktree') overRow(e, row, me); },
+      ondrop: e => { if (drag && drag.kind === 'worktree') { e.preventDefault(); e.stopPropagation(); drop({ ...me, after: row.dataset.drop === 'after' }); } },
+    }),
     title: `${w.path}${st && st.base ? `\nCompared with ${st.base}` : ''}`,
     onclick: () => A.openWorktree(w.path),
     oncontextmenu: e => contextMenu(e, [
@@ -337,7 +344,7 @@ function sessionRow(s, depth, agentsKey) {
   return row;
 }
 
-// ---- drag and drop (repos, groups, and sessions within a worktree)
+// ---- drag and drop (repos, groups, worktrees within a repo, and sessions within a worktree)
 
 function startDrag(e, item) {
   drag = item;
@@ -351,6 +358,7 @@ function overRow(e, row, target) {
   e.stopPropagation();
   if (drag.kind === 'group' && target.kind !== 'group') return; // no drop here
   if (drag.kind === 'session' && (target.kind !== 'session' || target.worktreePath !== drag.worktreePath || target.id === drag.id)) { markDrop(null); return; }
+  if (drag.kind === 'worktree' && (target.kind !== 'worktree' || target.repo !== drag.repo || target.path === drag.path)) { markDrop(null); return; }
   e.preventDefault();
   const r = row.getBoundingClientRect();
   const y = e.clientY - r.top;
@@ -370,6 +378,10 @@ function drop(target) {
   if (!item) return;
   if (item.kind === 'session') {
     if (target && target.kind === 'session' && target.worktreePath === item.worktreePath && target.id !== item.id) call('sessions.move', { id: item.id, target: target.id, after: !!target.after });
+    return;
+  }
+  if (item.kind === 'worktree') {
+    if (target && target.kind === 'worktree' && target.repo === item.repo && target.path !== item.path) call('worktrees.move', { repo: item.repo, path: item.path, target: target.path, after: !!target.after });
     return;
   }
   if (target && item.kind === target.kind && (item.path || item.id) === (target.path || target.id)) return;

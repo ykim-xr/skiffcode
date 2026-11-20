@@ -1662,11 +1662,13 @@ const G = {};
     }
     const order = () => page.evaluate(() => [...document.querySelectorAll('.tree .session-row .row-label')].map(e => e.textContent).filter(t => t.startsWith('order-')));
     assert.deepEqual(await order(), ['order-a', 'order-b']);
+    // The Active panel lists 'starting' sessions: when they start it shrinks and the tree shifts under the mouse.
+    await page.waitForFunction(ids => import('/js/store.js').then(m => ids.every(i => m.store.sessions.find(s => s.id === i).state !== 'starting')), ids);
     const from = await page.locator('.tree .session-row:has-text("order-b")').boundingBox();
     const to = await page.locator('.tree .session-row:has-text("order-a")').boundingBox();
     await page.mouse.move(from.x + 40, from.y + from.height / 2);
     await page.mouse.down();
-    await page.mouse.move(to.x + 40, to.y + 3, { steps: 6 });
+    await page.mouse.move(to.x + 40, to.y + to.height * 0.25, { steps: 6 });
     await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.setUnread', { id: i, unread: true })), ids[0]); // a state change in mid-drag
     await sleep(200);
     await page.mouse.up();
@@ -1678,6 +1680,55 @@ const G = {};
     assert.deepEqual(await order(), ['order-b', 'order-a'], 'the order is saved');
     for (const id of ids) await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.forget', { id: i })), id);
     await page.waitForSelector('.session-row:has-text("order-")', { state: 'detached' });
+  });
+
+  await step('drag worktrees to reorder them under their repo; the main checkout stays first', async () => {
+    const rpc = (m, a) => page.evaluate(([m, a]) => import('/js/rpc.js').then(r => r.call(m, a)), [m, a]);
+    const repoPath = path.join(tmp, 'code', 'myapp');
+    const extra = await rpc('worktrees.create', { repo: repoPath, newBranch: 'drag-wt', base: 'main', startClaude: false });
+    await page.waitForSelector('.wt-row >> text=drag-wt');
+    const orderIn = () => {
+      const block = [...document.querySelectorAll('.tree .tree-item')].find(b => b.textContent.includes('drag-wt'));
+      return block ? [...block.querySelectorAll('.wt-row .row-label')].map(e => e.textContent) : [];
+    };
+    const order = () => page.evaluate(orderIn);
+    await page.waitForFunction(`(${orderIn})().length === 3`);
+    // The Active panel lists 'starting' sessions and shifts the tree when they start: wait for it to settle.
+    await page.waitForFunction(() => import('/js/store.js').then(m => !m.store.sessions.some(s => s.state === 'starting')));
+    const [main, ...linked] = await order(); // git's own order of linked worktrees is not fixed
+    assert.equal(main, 'main');
+    assert.deepEqual([...linked].sort(), ['drag-wt', 'feat/login']);
+    const drag = async (from, to, y) => {
+      // Read in the page: a locator can lose its row to a sidebar rebuild between finding it and measuring it.
+      const rowBox = text => page.evaluate(t => {
+        const block = [...document.querySelectorAll('.tree .tree-item')].find(x => x.textContent.includes('drag-wt'));
+        const row = [...block.querySelectorAll('.wt-row')].find(r => r.querySelector('.row-label').textContent === t);
+        const { x, y, width, height } = row.getBoundingClientRect();
+        return { x, y, width, height };
+      }, text);
+      const a = await rowBox(from);
+      const b = await rowBox(to);
+      await page.mouse.move(a.x + 40, a.y + a.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(b.x + 40, b.y + b.height * y, { steps: 6 });
+      await page.mouse.up();
+    };
+    await drag(linked[1], linked[0], 0.25);
+    await page.waitForFunction(`(${orderIn})()[1] === ${JSON.stringify(linked[1])}`);
+    const want = ['main', ...[...linked].reverse()];
+    assert.deepEqual(await order(), want);
+    await drag(want[1], 'main', 0.25); // the main checkout is no drop target
+    await sleep(300);
+    assert.deepEqual(await order(), want);
+    await drag('main', want[2], 0.75); // nor can it be dragged
+    await sleep(300);
+    assert.deepEqual(await order(), want);
+    await page.reload();
+    await page.waitForSelector('.wt-row.active >> text=feat/login', { timeout: 15000 });
+    await page.waitForSelector('.wt-row >> text=drag-wt');
+    assert.deepEqual(await order(), want, 'the order is saved');
+    await rpc('worktrees.remove', { repo: repoPath, path: extra.path, deleteBranch: true, forceBranch: true });
+    await page.waitForSelector('.wt-row:has-text("drag-wt")', { state: 'detached' });
   });
 
   await step('delete a session and its conversation from the sidebar', async () => {

@@ -7,7 +7,7 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 **Claude sessions**
 - Several Claude sessions and shells per worktree; they keep running when you close the window, restart SkiffCode or reboot (they resume where they left off)
 - Name sessions when you start them; names stay in sync with Claude both ways (rename here, or `/rename` in Claude)
-- Drag sessions in the sidebar to reorder them within a worktree
+- Drag sessions in the sidebar to reorder them within a worktree, and worktrees to reorder them under their repo
 - **Active panel**: every session waiting for you or working; one click opens it
 - At a glance: orange Claude icon while working, a zigzag while a command it started runs, ❓ / 🛡 when it needs you
 - **Alerts** for questions, permission prompts and finished work: a sound per alert (built-in or your own file, with volume) and desktop notifications

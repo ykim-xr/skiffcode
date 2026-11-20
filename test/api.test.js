@@ -296,6 +296,39 @@ function startServer() {
     for (const x of [a, b, d, other]) await c.call('sessions.forget', { id: x.id });
   });
 
+  await step('worktrees.move: reorders linked worktrees, keeps main first, survives a restart; main and foreign paths are refused', async () => {
+    const extra = await c.call('worktrees.create', { repo, newBranch: 'wt-order', base: 'main', startClaude: false });
+    const order = async () => (await c.call('worktrees.list', { repo })).worktrees.map(w => w.branch);
+    await c.call('worktrees.move', { repo, path: extra.path, target: wt, after: false });
+    assert.deepEqual(await order(), ['main', 'wt-order', 'feat/login']);
+    await c.call('worktrees.move', { repo, path: extra.path, target: wt, after: true });
+    assert.deepEqual(await order(), ['main', 'feat/login', 'wt-order']);
+    await c.call('worktrees.move', { repo, path: wt, target: extra.path, after: true });
+    assert.deepEqual(await order(), ['main', 'wt-order', 'feat/login']);
+    server.kill('SIGTERM');
+    await sleep(300);
+    await startServer();
+    c = await new Client(PORT, token).connect();
+    await c.call('hello');
+    assert.deepEqual(await order(), ['main', 'wt-order', 'feat/login'], 'the order is saved');
+    await assert.rejects(c.call('worktrees.move', { repo, path: repo, target: wt }), /main checkout/);
+    await assert.rejects(c.call('worktrees.move', { repo, path: wt, target: repo }), /main checkout/);
+    const other = path.join(tmp, 'code', 'order-other');
+    fs.mkdirSync(other);
+    sh('git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m x', other);
+    await c.call('repos.add', { path: other });
+    const foreign = await c.call('worktrees.create', { repo: other, newBranch: 'side', base: 'main', startClaude: false });
+    await assert.rejects(c.call('worktrees.move', { repo, path: foreign.path, target: wt }), /Unknown worktree/);
+    await assert.rejects(c.call('worktrees.move', { repo, path: wt, target: foreign.path }), /Unknown worktree/);
+    assert.deepEqual(await order(), ['main', 'wt-order', 'feat/login'], 'refused moves change nothing');
+    await c.call('worktrees.remove', { repo: other, path: foreign.path, deleteBranch: true });
+    await c.call('repos.remove', { path: other });
+    await c.call('worktrees.remove', { repo, path: extra.path, deleteBranch: true });
+    const stored = JSON.parse(fs.readFileSync(path.join(HOME, 'state.json'), 'utf8')).repos.find(r => r.path === repo);
+    assert.ok(!(stored.worktreeOrder || []).includes(extra.path), 'a removed worktree leaves the order');
+    assert.deepEqual(await order(), ['main', 'feat/login']);
+  });
+
   await step('restart: model and context come back from the status line; no unread marks; a pending rename wins', async () => {
     plan('SessionStart,UserPromptSubmit,PreToolUse:AskUserQuestion,hang');
     const s = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, name: 'before', cols: 80, rows: 24 });

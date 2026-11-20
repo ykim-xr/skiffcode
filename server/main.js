@@ -193,6 +193,14 @@ async function worktreesOf(repo) {
   return wts;
 }
 
+// Main checkout first, then the linked worktrees in the user's order; new ones follow in git order.
+function inUserOrder(r, wts) {
+  const rank = new Map((r.worktreeOrder || []).map((p, i) => [p, i]));
+  const linked = wts.filter(w => !w.isMain);
+  const known = linked.filter(w => rank.has(w.path)).sort((a, b) => rank.get(a.path) - rank.get(b.path));
+  return [...wts.filter(w => w.isMain), ...known, ...linked.filter(w => !rank.has(w.path))];
+}
+
 function announceGit(p) {
   statusCache.delete(p);
   void watchGit(p);
@@ -548,8 +556,24 @@ const api = {
     const r = state.repo(repo);
     if (!r) throw new Error('Unknown repository');
     if (!fs.existsSync(r.path)) return { missing: true, worktrees: [] };
-    const wts = await worktreesOf(r);
+    const wts = inUserOrder(r, await worktreesOf(r));
     return { worktrees: wts.map(w => ({ ...w, base: state.worktreeMeta(w.path).base })) };
+  },
+  /** Reorder linked worktrees: put `path` before `target`, or after it when `after` is set. */
+  async 'worktrees.move'({ repo, path: p, target, after }) {
+    const r = state.repo(repo);
+    if (!r) throw new Error('Unknown repository');
+    const wts = await worktreesOf(r);
+    const find = x => wts.find(w => w.path === x);
+    for (const x of [p, target]) {
+      if (!find(x)) throw new Error('Unknown worktree');
+      if (find(x).isMain) throw new Error('The main checkout stays first');
+    }
+    if (p === target) return;
+    const order = inUserOrder(r, wts).filter(w => !w.isMain).map(w => w.path).filter(x => x !== p);
+    order.splice(order.indexOf(target) + (after ? 1 : 0), 0, p);
+    state.update(d => { d.repos.find(x => x.path === r.path).worktreeOrder = order; });
+    broadcast('worktrees.changed', { repo: r.path });
   },
   async 'worktrees.status'({ path: p, fresh }) { return worktreeStatus(rootOf(p), fresh ? 0 : 5000); },
   async 'worktrees.branches'({ repo }) {
@@ -634,7 +658,12 @@ const api = {
     }
     if (fs.existsSync(p) && safeToDelete(p)) fs.rmSync(p, { recursive: true, force: true });
     knownRoots.delete(p);
-    state.update(d => { delete d.worktrees[p]; if (d.layouts) delete d.layouts[p]; });
+    state.update(d => {
+      delete d.worktrees[p];
+      if (d.layouts) delete d.layouts[p];
+      const rec = d.repos.find(x => x.path === repo);
+      if (rec && rec.worktreeOrder) rec.worktreeOrder = rec.worktreeOrder.filter(x => x !== p);
+    });
     let branchResult = 'kept';
     let branchError;
     let merged;
