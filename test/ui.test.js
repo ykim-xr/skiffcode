@@ -81,6 +81,12 @@ const G = {};
   page.on('pageerror', e => errors.push(e.message));
   page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
   const shot = name => page.screenshot({ path: path.join(SHOTS, `${name}.png`) });
+  /** Shows or hides the Active panel. A session going idle empties it and moves the tree under the mouse, so drags hide it first. */
+  const activePanel = async open => {
+    if ((await page.locator('.active-panel .panel-body').count() > 0) === open) return;
+    await page.click('.active-panel .panel-head');
+    await page.waitForSelector('.active-panel .panel-body', { state: open ? 'attached' : 'detached' });
+  };
   /** Records RPC calls in window.__sent; window.__drop(msg) holds one back, window.__rewrite(msg) replaces one. Lasts until a reload. */
   const spySend = () => page.evaluate(() => {
     if (window.__spy) return;
@@ -1662,8 +1668,7 @@ const G = {};
     }
     const order = () => page.evaluate(() => [...document.querySelectorAll('.tree .session-row .row-label')].map(e => e.textContent).filter(t => t.startsWith('order-')));
     assert.deepEqual(await order(), ['order-a', 'order-b']);
-    // The Active panel lists 'starting' sessions: when they start it shrinks and the tree shifts under the mouse.
-    await page.waitForFunction(ids => import('/js/store.js').then(m => ids.every(i => m.store.sessions.find(s => s.id === i).state !== 'starting')), ids);
+    await activePanel(false);
     const from = await page.locator('.tree .session-row:has-text("order-b")').boundingBox();
     const to = await page.locator('.tree .session-row:has-text("order-a")').boundingBox();
     await page.mouse.move(from.x + 40, from.y + from.height / 2);
@@ -1678,6 +1683,7 @@ const G = {};
     await page.waitForSelector('.wt-row.active >> text=feat/login', { timeout: 15000 });
     await page.waitForSelector('.tree .session-row >> text=order-a');
     assert.deepEqual(await order(), ['order-b', 'order-a'], 'the order is saved');
+    await activePanel(true);
     for (const id of ids) await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.forget', { id: i })), id);
     await page.waitForSelector('.session-row:has-text("order-")', { state: 'detached' });
   });
@@ -1693,8 +1699,7 @@ const G = {};
     };
     const order = () => page.evaluate(orderIn);
     await page.waitForFunction(`(${orderIn})().length === 3`);
-    // The Active panel lists 'starting' sessions and shifts the tree when they start: wait for it to settle.
-    await page.waitForFunction(() => import('/js/store.js').then(m => !m.store.sessions.some(s => s.state === 'starting')));
+    await activePanel(false);
     const [main, ...linked] = await order(); // git's own order of linked worktrees is not fixed
     assert.equal(main, 'main');
     assert.deepEqual([...linked].sort(), ['drag-wt', 'feat/login']);
@@ -1727,6 +1732,7 @@ const G = {};
     await page.waitForSelector('.wt-row.active >> text=feat/login', { timeout: 15000 });
     await page.waitForSelector('.wt-row >> text=drag-wt');
     assert.deepEqual(await order(), want, 'the order is saved');
+    await activePanel(true);
     await rpc('worktrees.remove', { repo: repoPath, path: extra.path, deleteBranch: true, forceBranch: true });
     await page.waitForSelector('.wt-row:has-text("drag-wt")', { state: 'detached' });
   });
