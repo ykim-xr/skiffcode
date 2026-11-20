@@ -240,10 +240,11 @@ const G = {};
     const W = '.workspace:not(.hidden)';
     await spySend();
     await page.click(`${W} .tab:has-text("renamed.txt")`);
-    await page.evaluate(() => { window.__sent.length = 0; });
     await page.click(`${W} .tab.active:has-text("renamed.txt") .tab-close`);
     await page.waitForSelector('.modal-title >> text=Save changes to renamed.txt?');
-    await page.click('.modal-buttons .btn.danger');
+    // Clear and click in one script: a late watch event for the earlier writes reloads the file while its tab is
+    // still open (macOS reports them late), so only reads after the choice count.
+    await page.evaluate(() => { window.__sent.length = 0; document.querySelector('.modal-buttons .btn.danger').click(); });
     await page.waitForFunction(() => !window.skiffcode.active.allTabs().some(t => t.path === 'src/renamed.txt'));
     await sleep(300);
     assert.equal(await page.evaluate(() => window.__sent.filter(m => m.method === 'fs.read' && m.params.path === 'src/renamed.txt').length), 0);
