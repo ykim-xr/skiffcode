@@ -1808,10 +1808,21 @@ const G = {};
     // written a moment ago: Claude may still be using it, so it is picked only by hand, never by a suggestion
     assert.equal(await page.isDisabled(`${row(fresh)} input[type=checkbox]`), false);
     assert.equal(await page.getAttribute(`${row(fresh)} input[type=checkbox]`, 'title'), 'Active in the last 2 minutes');
-    // a store change that alters nothing shown leaves the rows alone (no redraw: clicks and focus aren't lost)
-    await page.evaluate(sel => { document.querySelector(sel).dataset.kept = '1'; return import('/js/store.js').then(m => m.notify()); }, row(seeds[1]));
-    await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
-    assert.equal(await page.getAttribute(row(seeds[1]), 'data-kept'), '1', 'the row was not rebuilt');
+    // a store change that alters nothing shown leaves the rows alone (no redraw: clicks and focus aren't lost).
+    // The runner's hook may still be on its way (starting → idle redraws its row for real), so let it settle first.
+    await page.waitForFunction(i => import('/js/store.js').then(m => m.store.sessions.find(s => s.id === i).state !== 'starting'), runId);
+    const kept = await page.evaluate(async sel => {
+      const { store, notify } = await import('/js/store.js');
+      // what the dialog draws from: if a real change lands inside this window, a redraw is right and nothing is asserted
+      const shown = () => JSON.stringify([store.repos.map(r => [r.path, r.name, r.kind, ((store.worktrees.get(r.path) || {}).list || []).map(w => [w.path, w.branch, w.detached])]), store.sessions.map(s => [s.id, s.state])]);
+      const before = shown();
+      const el = document.querySelector(sel);
+      el.dataset.kept = '1';
+      notify();
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+      return { changed: shown() !== before, alive: el.isConnected && document.querySelector(sel) === el };
+    }, row(seeds[1]));
+    assert.ok(kept.changed || kept.alive, 'the row was not rebuilt');
     // repo → worktree → conversation, then the folder groups
     const order = await page.evaluate(ids => [...document.querySelectorAll('.sm-modal .sm-group, .sm-modal .sm-row')]
       .map(e => (e.dataset.id && ids.includes(e.dataset.id) ? e.dataset.id : e.dataset.kind ? `${e.dataset.kind}:${e.dataset.name}` : null)).filter(Boolean), seeds.map(s => s.id));
