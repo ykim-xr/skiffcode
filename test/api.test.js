@@ -510,6 +510,11 @@ function startServer() {
     assert.deepEqual([await view('links/beta-file'), await view('links/app')], [200, 200]);
     await c.call('fs.write', { root: wt, path: 'links/beta-file', text: 'shared 2' });
     assert.equal(fs.readFileSync(path.join(beta, 'shared.txt'), 'utf8'), 'shared 2');
+    // a folder link is listed as a folder and marked as a link (deleting it removes only the link)
+    fs.mkdirSync(path.join(links, 'real'));
+    const listed = Object.fromEntries((await c.call('fs.list', { root: wt, dir: 'links' })).map(e => [e.name, e]));
+    assert.deepEqual([listed.out.type, listed.out.link], ['dir', true], 'a folder link');
+    assert.deepEqual([listed.real.type, 'link' in listed.real], ['dir', false], 'a plain folder');
     // deleting a link removes the link, not what it points to
     await c.call('fs.delete', { root: wt, path: 'links/out' });
     assert.ok(!fs.existsSync(path.join(links, 'out')) && fs.readFileSync(path.join(outside, 'secret.txt'), 'utf8') === 'secret');

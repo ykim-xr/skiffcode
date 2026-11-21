@@ -34,6 +34,7 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 - **Viewers**: images and PDFs open in a tab; HTML pages (and SVG) get a live preview to the side that reloads as files change
 - **Paths in terminals are links**, Claude’s output included: an HTML report opens in your browser on click, or as a preview inside SkiffCode on Ctrl+click; code opens in the editor at its line; right-click for more. Works with Linux, `C:\…` and `\\wsl.localhost\…` paths
 - **Reveal in file manager**: right-click a file or folder in the Files panel, or a path in a terminal, to see it in Explorer (WSL) or your desktop's file manager
+- **Select several files and folders** in the Files panel with Ctrl+click and Shift+click, then delete them together (right-click or the Delete key)
 - **Web pages in a tab**: Ctrl+click a link in a terminal or the editor to open it inside SkiffCode (a plain click in a terminal opens your browser), or the globe button for a new tab where you type a web address or paste a file path; sites that refuse to be embedded get an “Open in your browser” button
 - Terminals: select and right-click to copy, right-click to paste; Ctrl+C copies a selection, Ctrl+V pastes
 - Panel background colors, comfortable or compact sidebar, idle worktrees unload to save memory

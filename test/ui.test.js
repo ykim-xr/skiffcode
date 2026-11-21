@@ -268,6 +268,133 @@ const G = {};
     assert.equal(fs.existsSync(path.join(repo, 'src/notes.txt')), false, 'the old file is not recreated');
   });
 
+  const fileRow = p => `.workspace:not(.hidden) .file-row[data-path="${p}"]`;
+  const fileSelection = () => page.$$eval('.workspace:not(.hidden) .file-row.selected', rows => rows.map(r => r.dataset.path));
+  const del = (...p) => path.join(repo, 'del', ...p);
+
+  await step('files panel: Ctrl+click and Shift+click select files and folders; right-click deletes exactly the selection', async () => {
+    fs.mkdirSync(del('sub'), { recursive: true });
+    for (const f of ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'keep.txt', 'sub/x.txt', 'sub/y.txt']) fs.writeFileSync(del(f), f);
+    await page.click(fileRow('del'));
+    await page.click(fileRow('del/sub'));
+    await page.waitForSelector(fileRow('del/sub/y.txt'));
+    await page.waitForSelector(fileRow('del/keep.txt'));
+    await quiet();
+    const tabs = await page.locator('.workspace:not(.hidden) .tab').count();
+    await page.click(fileRow('del/a.txt'), { modifiers: ['ControlOrMeta'] });
+    await page.click(fileRow('del/b.txt'), { modifiers: ['Shift'] });
+    for (const p of ['del/sub', 'del/sub/x.txt', 'del/d.txt']) await page.click(fileRow(p), { modifiers: ['ControlOrMeta'] });
+    assert.deepEqual(await fileSelection(), ['del/sub', 'del/sub/x.txt', 'del/a.txt', 'del/b.txt', 'del/d.txt']);
+    assert.equal(await page.locator('.workspace:not(.hidden) .tab').count(), tabs, 'Ctrl/Shift+click open nothing');
+    assert.ok(await page.locator(fileRow('del/sub/x.txt')).count(), 'Ctrl+click on a folder does not collapse it');
+    await page.click(fileRow('del/b.txt'), { button: 'right' });
+    await page.waitForSelector('.menu-item >> text=Delete 4 items');
+    assert.equal(await page.locator('.menu-item:has-text("Rename")').count(), 0, 'no Rename for several items');
+    await page.click('.menu-item >> text=Delete 4 items');
+    await page.waitForSelector('.modal-title >> text=Delete 4 items?');
+    const detail = await page.textContent('.modal-detail');
+    for (const p of ['del/sub and everything in it', 'del/a.txt', 'del/b.txt', 'del/d.txt', 'This can’t be undone.']) assert.ok(detail.includes(p), `the confirm lists ${p}`);
+    assert.ok(!detail.includes('x.txt'), 'a file inside a selected folder is not listed on its own');
+    await page.click('.modal .btn.danger >> text=Delete');
+    await page.waitForSelector(fileRow('del/a.txt'), { state: 'detached' });
+    await page.waitForSelector(fileRow('del/sub'), { state: 'detached' });
+    for (const f of ['a.txt', 'b.txt', 'd.txt', 'sub']) assert.equal(fs.existsSync(del(f)), false, `${f} is deleted`);
+    for (const f of ['c.txt', 'keep.txt']) assert.equal(fs.existsSync(del(f)), true, `${f} stays`);
+    assert.equal(await page.locator('.toast.error').count(), 0);
+  });
+
+  await step('files panel: the Delete key deletes the selection after the same question', async () => {
+    for (const f of ['k1.txt', 'k2.txt']) fs.writeFileSync(del(f), f);
+    await page.waitForSelector(fileRow('del/k2.txt'));
+    await quiet();
+    await page.click(fileRow('del/k1.txt'), { modifiers: ['ControlOrMeta'] });
+    await page.click(fileRow('del/k2.txt'), { modifiers: ['ControlOrMeta'] });
+    await page.keyboard.press('Delete');
+    await page.waitForSelector('.modal-title >> text=Delete 2 items?');
+    await page.click('.modal .btn.danger >> text=Delete');
+    await page.waitForSelector(fileRow('del/k2.txt'), { state: 'detached' });
+    for (const f of ['k1.txt', 'k2.txt']) assert.equal(fs.existsSync(del(f)), false, `${f} is deleted`);
+    for (const f of ['c.txt', 'keep.txt']) assert.equal(fs.existsSync(del(f)), true, `${f} stays`);
+  });
+
+  await step('files panel: the confirm for more than 10 items lists the folders first', async () => {
+    const names = Array.from({ length: 11 }, (_, i) => `f${String(i + 1).padStart(2, '0')}.txt`);
+    fs.mkdirSync(del('many'));
+    fs.mkdirSync(del('zz'));
+    for (const f of names) fs.writeFileSync(del('many', f), f);
+    await page.waitForSelector(fileRow('del/zz'));
+    await page.click(fileRow('del/many'));
+    await page.waitForSelector(fileRow('del/many/f11.txt'));
+    await quiet();
+    await page.click(fileRow('del/many/f01.txt'), { modifiers: ['ControlOrMeta'] });
+    await page.click(fileRow('del/many/f11.txt'), { modifiers: ['Shift'] });
+    await page.click(fileRow('del/zz'), { modifiers: ['ControlOrMeta'] });
+    await page.keyboard.press('Delete');
+    await page.waitForSelector('.modal-title >> text=Delete 12 items?');
+    const detail = await page.textContent('.modal-detail');
+    assert.ok(detail.includes('del/zz and everything in it'), 'the folder, last in tree order, is listed');
+    assert.ok(detail.includes('and 2 more'));
+    await page.click('.modal .btn >> text=Cancel');
+    await page.waitForSelector('.modal', { state: 'detached' });
+    for (const f of ['many', 'zz']) fs.rmSync(del(f), { recursive: true });
+    await page.waitForSelector(fileRow('del/many'), { state: 'detached' });
+  });
+
+  await step('files panel: deleting a linked folder and a file inside it deletes both and keeps the link’s target', async () => {
+    fs.mkdirSync(del('target'));
+    fs.writeFileSync(del('target', 't.txt'), 't');
+    fs.symlinkSync('target', del('ln'));
+    await page.waitForSelector(fileRow('del/ln'));
+    await quiet();
+    await page.click(fileRow('del/ln')); // selects only the link and opens it
+    await page.waitForSelector(fileRow('del/ln/t.txt'));
+    await page.click(fileRow('del/ln/t.txt'), { modifiers: ['ControlOrMeta'] });
+    await page.click(fileRow('del/ln/t.txt'), { button: 'right' });
+    await page.click('.menu-item >> text=Delete 2 items');
+    await page.waitForSelector('.modal-title >> text=Delete 2 items?');
+    const detail = await page.textContent('.modal-detail');
+    assert.ok(detail.includes('del/ln (link only)') && !detail.includes('everything'), 'the link is not said to take its contents');
+    await page.click('.modal .btn.danger >> text=Delete');
+    await page.waitForSelector(fileRow('del/ln'), { state: 'detached' });
+    assert.throws(() => fs.lstatSync(del('ln')), /ENOENT/, 'the link is deleted');
+    assert.equal(fs.existsSync(del('target', 't.txt')), false, 'the file inside it is deleted');
+    assert.equal(fs.existsSync(del('target')), true, 'the target folder stays');
+    assert.equal(await page.locator('.toast.error').count(), 0);
+  });
+
+  await step('files panel: when one item of a selection can’t be deleted, the others still go and one toast names it', async () => {
+    fs.mkdirSync(del('locked'));
+    fs.writeFileSync(del('locked', 'f.txt'), 'f');
+    fs.writeFileSync(del('k3.txt'), 'k3');
+    await page.waitForSelector(fileRow('del/k3.txt'));
+    await page.waitForSelector(fileRow('del/locked'));
+    await quiet();
+    await page.click(fileRow('del/k3.txt'), { modifiers: ['ControlOrMeta'] });
+    await page.click(fileRow('del/locked')); // a plain click opens the folder and selects only it
+    await page.waitForSelector(fileRow('del/locked/f.txt'));
+    assert.deepEqual(await fileSelection(), ['del/locked']);
+    await page.click(fileRow('del/locked'), { modifiers: ['ControlOrMeta'] });
+    await page.click(fileRow('del/locked/f.txt'), { modifiers: ['ControlOrMeta'] });
+    await page.click(fileRow('del/k3.txt'), { modifiers: ['ControlOrMeta'] });
+    fs.chmodSync(del('locked'), 0o555);
+    try {
+      await page.click(fileRow('del/k3.txt'), { button: 'right' });
+      await page.click('.menu-item >> text=Delete 2 items');
+      await page.click('.modal .btn.danger >> text=Delete');
+      await page.waitForSelector('.toast.error >> text=del/locked/f.txt');
+      assert.equal(await page.locator('.toast.error').count(), 1, 'one toast for the failures');
+      assert.ok(!(await page.textContent('.toast.error')).includes('k3.txt'), 'the toast names only the failure');
+      await page.waitForSelector(fileRow('del/k3.txt'), { state: 'detached' });
+      assert.equal(fs.existsSync(del('k3.txt')), false, 'the other item is deleted');
+      assert.equal(fs.existsSync(del('locked', 'f.txt')), true);
+    } finally {
+      fs.chmodSync(del('locked'), 0o755);
+    }
+    await page.evaluate(() => document.querySelectorAll('.toast').forEach(t => t.remove()));
+    fs.rmSync(del(), { recursive: true });
+    await page.waitForSelector(fileRow('del'), { state: 'detached' });
+  });
+
   await step('typing while a save is on its way leaves the file unsaved', async () => {
     const dirty = await page.evaluate(async () => {
       const t = window.skiffcode.active.activeTab;

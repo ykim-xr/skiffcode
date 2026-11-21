@@ -66,15 +66,19 @@ async function list(root, rel = '') {
   const entries = dirents
     .filter(d => !HIDDEN.has(d.name))
     .map(d => {
-      let type = d.isDirectory() ? 'dir' : d.isSymbolicLink() ? 'link' : 'file';
-      if (type === 'link') {
+      const link = d.isSymbolicLink();
+      let type = d.isDirectory() ? 'dir' : 'file';
+      if (link) {
         try {
           type = fs.statSync(path.join(dir, d.name)).isDirectory() ? 'dir' : 'file';
         } catch {
           type = 'file';
         }
       }
-      return { name: d.name, path: path.posix.join(rel.split(path.sep).join('/'), d.name), type };
+      // Deleting a link removes only the link, so the UI must know a 'dir' here is one.
+      const entry = { name: d.name, path: path.posix.join(rel.split(path.sep).join('/'), d.name), type };
+      if (link) entry.link = true;
+      return entry;
     });
   if (entries.length && isGitDir(root)) {
     const out = await run('git', ['check-ignore', '--stdin', '-z'], {

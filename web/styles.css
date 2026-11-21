@@ -256,6 +256,7 @@ select.input { padding: 2px 6px; }
 .file-row { display: flex; align-items: center; gap: 4px; height: 22px; padding-right: 8px; cursor: pointer; white-space: nowrap; }
 .file-row:hover { background: var(--bg-hover); }
 .file-row.active { background: var(--bg-active); }
+.file-row.selected { background: var(--bg-active); }
 .file-row.ignored { opacity: .5; }
 .file-type { width: 14px; height: 14px; color: var(--fg-muted); }
 .file-row .twisty { width: 14px; height: 14px; color: var(--fg-muted); }

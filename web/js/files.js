@@ -1,5 +1,5 @@
 // Right panel: file tree of the worktree, colored by git status.
-import { h, icon, clear, basename, dirname, dirtyCount, STATUS_LETTER } from './util.js';
+import { h, icon, clear, isMac, basename, dirname, dirtyCount, STATUS_LETTER } from './util.js';
 import { call, on } from './rpc.js';
 import { contextMenu, promptDialog, confirmDialog, toast } from './dialogs.js';
 import { hasPreview, viewerFor, revealInFileManager } from './viewers.js';
@@ -15,6 +15,15 @@ export class FilesView {
     this.tree.addEventListener('dragover', e => this.dragOver(e));
     this.tree.addEventListener('dragleave', e => { if (!this.tree.contains(e.relatedTarget)) this.markDrop(null); });
     this.tree.addEventListener('drop', e => this.drop(e));
+    // Only while the tree itself has focus, so the key never deletes from an editor, terminal or input.
+    this.tree.addEventListener('keydown', e => {
+      if (e.target !== this.tree || e.altKey || e.shiftKey) return;
+      const plainDelete = e.key === 'Delete' && !e.ctrlKey && !e.metaKey;
+      const macDelete = isMac && e.key === 'Backspace' && e.metaKey && !e.ctrlKey;
+      if (!plainDelete && !macDelete) return;
+      e.preventDefault();
+      void this.removeMany(this.deleteSet());
+    });
     this.el.append(
       h('div.view-toolbar',
         h('span.view-title', basename(ws.root)),
@@ -28,6 +37,9 @@ export class FilesView {
     this.watched = new Set(); // folders the server watches for us: once each, however often they reload
     this.gitMarks = new Map(); // path -> status letter
     this.loaded = false;
+    this.sel = new Set(); // selected paths, files and folders
+    this.anchor = null; // last row clicked without Shift
+    this.visible = []; // entries in tree order, as last drawn
     this.off = [
       on('fs.changed', e => {
         if (e.root !== this.ws.root) return;
@@ -151,19 +163,70 @@ export class FilesView {
     for (const row of this.tree.querySelectorAll('.file-row')) row.classList.toggle('active', row.dataset.path === path);
   }
 
+  /** Selection changed: mark rows without drawing the tree again. */
+  markSelected() {
+    for (const row of this.tree.querySelectorAll('.file-row')) row.classList.toggle('selected', this.sel.has(row.dataset.path));
+  }
+
+  clearSelection() {
+    this.sel.clear();
+    this.anchor = null;
+    this.markSelected();
+  }
+
+  clickRow(ev, e) {
+    if (ev.shiftKey) {
+      const order = this.visible.map(v => v.path);
+      const a = order.indexOf(this.anchor);
+      const b = order.indexOf(e.path);
+      const [from, to] = a < 0 ? [b, b] : [Math.min(a, b), Math.max(a, b)];
+      this.sel = new Set(order.slice(from, to + 1));
+      if (a < 0) this.anchor = e.path;
+    } else if (ev.ctrlKey || ev.metaKey) {
+      if (!this.sel.delete(e.path)) this.sel.add(e.path);
+      this.anchor = e.path;
+    } else {
+      this.sel = new Set([e.path]);
+      this.anchor = e.path;
+      this.markSelected();
+      if (e.type === 'dir') this.toggle(e.path);
+      else this.ws.openFile(e.path, { preview: true });
+      return;
+    }
+    this.markSelected();
+  }
+
+  /** The selected entries to delete, in tree order: never the top folder, and nothing inside a selected folder (deleting the folder covers it). A linked folder covers nothing: deleting it removes only the link. */
+  deleteSet() {
+    const picked = this.visible.filter(v => v.path && this.sel.has(v.path));
+    const dirs = picked.filter(v => v.type === 'dir' && !v.link).map(v => `${v.path}/`);
+    return picked.filter(v => !dirs.some(d => v.path.startsWith(d)));
+  }
+
   render() {
     const rows = [];
+    const visible = [];
     const walk = (d, depth) => {
       for (const e of this.children.get(d) || []) {
+        visible.push(e);
         const st = this.gitMarks.get(e.path);
         const open = e.type === 'dir' && this.expanded.has(e.path);
         const active = this.activePath() === e.path;
-        rows.push(h(`div.file-row${e.ignored ? '.ignored' : ''}${active ? '.active' : ''}${st && st !== 'dir' ? `.g-${STATUS_LETTER(st)}` : st === 'dir' ? '.g-dir' : ''}`, {
+        rows.push(h(`div.file-row${e.ignored ? '.ignored' : ''}${active ? '.active' : ''}${this.sel.has(e.path) ? '.selected' : ''}${st && st !== 'dir' ? `.g-${STATUS_LETTER(st)}` : st === 'dir' ? '.g-dir' : ''}`, {
           style: { paddingLeft: `${8 + depth * 12}px` },
           title: e.path,
-          onclick: () => (e.type === 'dir' ? this.toggle(e.path) : this.ws.openFile(e.path, { preview: true })),
-          ondblclick: () => e.type !== 'dir' && this.ws.openFile(e.path),
-          oncontextmenu: ev => contextMenu(ev, this.menu(e)),
+          // Shift+click selects a range without selecting text; the tree keeps focus for the Delete key
+          onmousedown: ev => { if (ev.shiftKey) { ev.preventDefault(); this.tree.focus({ preventScroll: true }); } },
+          onclick: ev => this.clickRow(ev, e),
+          ondblclick: ev => e.type !== 'dir' && !ev.shiftKey && !ev.ctrlKey && !ev.metaKey && this.ws.openFile(e.path),
+          oncontextmenu: ev => {
+            if (!this.sel.has(e.path)) {
+              this.sel = new Set([e.path]);
+              this.anchor = e.path;
+              this.markSelected();
+            }
+            contextMenu(ev, this.sel.size > 1 ? this.manyMenu(this.deleteSet()) : this.menu(e));
+          },
           draggable: 'true',
           ondragstart: ev => startInternal(ev, this.ws.root, e),
           dataset: { path: e.path, type: e.type },
@@ -176,6 +239,11 @@ export class FilesView {
       }
     };
     walk('', 0);
+    // rows that went away (deleted, or hidden in a collapsed folder) leave the selection
+    this.visible = visible;
+    const shown = new Set(visible.map(e => e.path));
+    for (const p of this.sel) if (!shown.has(p)) this.sel.delete(p);
+    if (!shown.has(this.anchor)) this.anchor = null;
     clear(this.tree, rows.length ? rows : h('div.muted.pad', this.loaded ? 'Empty folder' : 'Loading…'));
   }
 
@@ -243,8 +311,13 @@ export class FilesView {
       { label: 'Copy relative path', action: () => navigator.clipboard.writeText(e.path) },
       { label: 'Reveal in file manager', icon: 'folder', action: () => revealInFileManager(this.ws.root, `${this.ws.root}/${e.path}`) },
       { separator: true },
-      { label: 'Delete', icon: 'trash', danger: true, action: () => this.remove(e) },
+      { label: 'Delete', icon: 'trash', danger: true, action: () => this.removeMany([e]) },
     ];
+  }
+
+  /** Several rows selected: only what acts on all of them (a folder with a file in it can come down to one item). */
+  manyMenu(items) {
+    return [{ label: `Delete ${items.length} item${items.length === 1 ? '' : 's'}`, icon: 'trash', danger: true, action: () => this.removeMany(items) }];
   }
 
   async newEntry(dir, type) {
@@ -274,14 +347,43 @@ export class FilesView {
     }
   }
 
-  async remove(e) {
-    const ok = await confirmDialog({ title: `Delete ${e.name}?`, detail: `${e.path}${e.type === 'dir' ? ' and everything in it' : ''} will be deleted from disk.`, buttons: [{ label: 'Delete', value: 'yes', danger: true }] });
+  /** Deletes these entries after one question. Each goes through the server's guarded fs.delete; a failure doesn't stop the rest. */
+  async removeMany(items) {
+    items = items.filter(e => e.path); // never the worktree itself
+    if (!items.length) return;
+    const folder = e => e.type === 'dir' && !e.link;
+    const what = e => `${e.path}${e.link ? ' (link only)' : folder(e) ? ' and everything in it' : ''}`;
+    const MAX_LISTED = 10;
+    const one = items.length === 1;
+    // Folders first, so a cut list never hides one.
+    const listed = [...items.filter(folder), ...items.filter(e => !folder(e))];
+    const hidden = listed.slice(MAX_LISTED);
+    const hiddenDirs = hidden.filter(folder).length;
+    const ok = await confirmDialog({
+      title: one ? `Delete ${items[0].name}?` : `Delete ${items.length} items?`,
+      detail: one ? `${what(items[0])} will be deleted from disk.` : [
+        h('ul', listed.slice(0, MAX_LISTED).map(e => h('li', what(e)))),
+        hidden.length ? h('p', `and ${hidden.length} more${hiddenDirs ? `, ${hiddenDirs} of them ${hiddenDirs === 1 ? 'a folder' : 'folders'}` : ''}`) : null,
+        h('p', 'This can’t be undone.'),
+      ],
+      buttons: [{ label: 'Delete', value: 'yes', danger: true }],
+    });
     if (ok !== 'yes') return;
-    try {
-      await call('fs.delete', { root: this.ws.root, path: e.path });
-      this.reloadDir(dirname(e.path));
-    } catch (err) {
-      toast(err.message, { kind: 'error' });
+    const failed = [];
+    // Children before their parent: a file reached through a linked folder must go before the link does.
+    for (const e of [...items].reverse()) {
+      try {
+        await call('fs.delete', { root: this.ws.root, path: e.path });
+      } catch (err) {
+        failed.push({ path: e.path, message: err.message });
+      }
+    }
+    for (const d of new Set(items.map(e => dirname(e.path)))) this.reloadDir(d);
+    if (one && failed.length) toast(failed[0].message, { kind: 'error' });
+    else if (failed.length) {
+      const MAX_FAILED = 5;
+      const more = failed.length > MAX_FAILED ? `, and ${failed.length - MAX_FAILED} more` : '';
+      toast(`Couldn’t delete ${failed.slice(0, MAX_FAILED).map(f => `${f.path} (${f.message})`).join(', ')}${more}`, { kind: 'error' });
     }
   }
 

@@ -934,6 +934,7 @@ export class Workspace {
   hide() {
     this.lastSeen = Date.now();
     this.el.classList.add('hidden');
+    this.files.clearSelection();
   }
 
   saveLayout() {
