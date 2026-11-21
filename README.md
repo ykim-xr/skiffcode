@@ -92,7 +92,7 @@ On macOS, ⌘ takes the place of Ctrl, and the Control key belongs to the termin
 
 A dependency-free Node server (127.0.0.1 only, token-protected) serves the UI and keeps each session in its own terminal host, so sessions outlive the window and the server. Claude runs as plain `claude` with a hooks and status-line file passed via `--settings`: your `~/.claude` settings are never edited, and your own status line still runs. Data lives in `~/.local/share/skiffcode`.
 
-Tests: `node test/api.test.js` and `node test/ui.test.js` (Playwright).
+Tests: `node test/api.test.js` and `node test/ui.test.js` (Playwright). `node test/stress.js` runs the UI tests in parallel on a slowed CPU, to catch timing races.
 
 ## License
 

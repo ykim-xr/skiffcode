@@ -12,13 +12,20 @@ const { chromium } = require(process.env.PLAYWRIGHT_PATH || 'playwright');
 const APP = path.resolve(__dirname, '..');
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/tmp' : os.tmpdir(), 'skiffcode-ui-')));
 const HOME = path.join(tmp, 'home');
-const PORT = 3950 + Math.floor(Math.random() * 40);
+// SKIFFCODE_TEST_PORT pins the port so parallel copies (test/stress.js) don't collide; the usage stand-in uses PORT + 100.
+const PORT = Number(process.env.SKIFFCODE_TEST_PORT) || 3950 + Math.floor(Math.random() * 40);
+// SKIFFCODE_TEST_CPU=4 slows every page's CPU 4x, so timing races that a slow CI runner shows appear locally.
+const CPU = Number(process.env.SKIFFCODE_TEST_CPU) || 1;
 const SHOTS = process.env.SHOTS || path.join(tmp, 'shots');
 fs.mkdirSync(SHOTS, { recursive: true });
 const sh = (cmd, cwd) => execFileSync('bash', ['-c', cmd], { cwd, encoding: 'utf8' });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let passed = 0;
-const step = async (name, fn) => { await fn(); passed++; console.log(`  ✓ ${name}`); };
+const step = async (name, fn) => {
+  try { await fn(); } catch (e) { console.error(`  ✗ ${name}`); throw e; }
+  passed++;
+  console.log(`  ✓ ${name}`);
+};
 const prefs = () => JSON.parse(fs.readFileSync(path.join(HOME, 'state.json'), 'utf8')).prefs.settings || {};
 /** Saved settings, once ok(settings) holds (or after 2 s). */
 const prefsWhen = async ok => { for (let i = 0; i < 40 && !ok(prefs()); i++) await sleep(50); return prefs(); };
@@ -65,6 +72,48 @@ function png(w, hgt) {
   return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
 }
 
+/** A page in ctx, slowed by SKIFFCODE_TEST_CPU. Every page the suite uses comes from here. */
+async function newPage(ctx) {
+  const pg = await ctx.newPage();
+  if (CPU > 1) await (await ctx.newCDPSession(pg)).send('Emulation.setCPUThrottlingRate', { rate: CPU });
+  return pg;
+}
+
+/** Runs in every page of the main context before the app: counts RPC calls still waiting for a reply and fingerprints the layout, for quiet(). */
+function idleProbe() {
+  const live = new Set(); // sockets with calls in flight
+  const waiting = new Map(); // socket -> ids of calls without a reply yet
+  const send = WebSocket.prototype.send;
+  WebSocket.prototype.send = function (d) {
+    if (typeof d === 'string') {
+      let m;
+      try { m = JSON.parse(d); } catch { m = null; }
+      if (m && m.id !== undefined && m.method) {
+        if (!waiting.has(this)) {
+          waiting.set(this, new Set());
+          live.add(this);
+          this.addEventListener('message', ev => {
+            if (typeof ev.data !== 'string' || !ev.data.startsWith('{"id":')) return;
+            try { waiting.get(this).delete(JSON.parse(ev.data).id); } catch { /* not a reply */ }
+          });
+          this.addEventListener('close', () => { waiting.delete(this); live.delete(this); });
+        }
+        waiting.get(this).add(m.id);
+      }
+    }
+    return send.call(this, d);
+  };
+  const box = el => { const r = el.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].map(Math.round).join(','); };
+  window.__pendingCalls = () => { let n = 0; for (const ids of waiting.values()) n += ids.size; return n; };
+  // Rects and counts, not text: clocks in the UI tick without anything moving.
+  window.__fingerprint = () => {
+    const side = document.getElementById('sidebar');
+    const rows = side ? [...side.querySelectorAll('.wt-row, .session-row')].map(box).join(';') : '';
+    const modals = [...document.querySelectorAll('.modal')].map(m => `${box(m)}#${m.querySelectorAll('*').length}`).join(';');
+    return `side ${side ? `${box(side)}#${side.querySelectorAll('*').length}` : '-'} rows ${rows} modals ${modals}`;
+  };
+}
+
 const G = {};
 (async () => {
   console.log(`SkiffCode UI e2e (tmp: ${tmp}, vendor: ${process.env.SKIFFCODE_VENDOR ? 'stubs' : 'real'})`);
@@ -76,7 +125,8 @@ const G = {};
   // Fixed platform: labels, Ctrl presses and shortcuts behave the same on a Mac runner.
   await context.addInitScript(() => Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64' }));
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `http://localhost:${PORT}` });
-  const page = (G.page = await context.newPage());
+  await context.addInitScript(idleProbe);
+  const page = (G.page = await newPage(context));
   const errors = (G.errors = []);
   page.on('pageerror', e => errors.push(e.message));
   page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
@@ -106,6 +156,22 @@ const G = {};
       return send.call(this, d);
     };
   });
+
+  /**
+   * Waits until the app is idle: no RPC call waits for its reply, no session is 'starting', and the sidebar and open
+   * dialogs look the same on two frames in a row. Call it before measuring or counting, so a late reply or redraw
+   * can't land in between. Bounded by the page's default timeout.
+   */
+  const quiet = async () => {
+    await page.evaluate(() => { window.__quietPrev = null; });
+    await page.waitForFunction(async () => {
+      const { store } = await import('/js/store.js');
+      const fp = window.__fingerprint();
+      const same = fp === window.__quietPrev;
+      window.__quietPrev = fp;
+      return same && window.__pendingCalls() === 0 && !store.sessions.some(s => s.state === 'starting');
+    }, null, { polling: 'raf' });
+  };
 
   await page.goto(`http://localhost:${PORT}/?tkn=${token}`);
   await page.waitForSelector('#sidebar .sidebar-title', { timeout: 15000 });
@@ -242,6 +308,7 @@ const G = {};
     await page.click(`${W} .tab:has-text("renamed.txt")`);
     await page.click(`${W} .tab.active:has-text("renamed.txt") .tab-close`);
     await page.waitForSelector('.modal-title >> text=Save changes to renamed.txt?');
+    await quiet();
     // Clear and click in one script: a late watch event for the earlier writes reloads the file while its tab is
     // still open (macOS reports them late), so only reads after the choice count.
     await page.evaluate(() => { window.__sent.length = 0; document.querySelector('.modal-buttons .btn.danger').click(); });
@@ -657,8 +724,12 @@ const G = {};
     await page.waitForSelector('.keys-modal');
     await page.uncheck('.keys-modal .keys-enabled input');
     await page.waitForSelector('.keys-modal .keys-rows.off');
+    // Saving sets the value here at once; the server's snapshot for the save follows ~40 ms later and replaces it.
+    // Turning shortcuts on before that snapshot lands would be overwritten by it (it still says off), so wait for it.
+    await page.evaluate(() => import('/js/rpc.js').then(rpc => { window.__offPushed = false; rpc.on('state', s => { if (s.settings.shortcutsEnabled === false) window.__offPushed = true; }); }));
     await page.click('.keys-modal .btn >> text=Save');
     await page.waitForSelector('.keys-modal', { state: 'detached' });
+    await page.waitForFunction(() => window.__offPushed);
     await page.keyboard.press('Control+Alt+b');
     assert.equal(await sidebarHidden(), false, 'shortcuts off: the sidebar key does nothing');
     assert.equal(await termKey({ key: 'p', code: 'KeyP', ctrlKey: true }), true, 'shortcuts off: terminals get Ctrl+P');
@@ -1670,6 +1741,7 @@ const G = {};
     const order = () => page.evaluate(() => [...document.querySelectorAll('.tree .session-row .row-label')].map(e => e.textContent).filter(t => t.startsWith('order-')));
     assert.deepEqual(await order(), ['order-a', 'order-b']);
     await activePanel(false);
+    await quiet();
     const from = await page.locator('.tree .session-row:has-text("order-b")').boundingBox();
     const to = await page.locator('.tree .session-row:has-text("order-a")').boundingBox();
     await page.mouse.move(from.x + 40, from.y + from.height / 2);
@@ -1705,6 +1777,7 @@ const G = {};
     assert.equal(main, 'main');
     assert.deepEqual([...linked].sort(), ['drag-wt', 'feat/login']);
     const drag = async (from, to, y) => {
+      await quiet();
       // Read in the page: a locator can lose its row to a sidebar rebuild between finding it and measuring it.
       const rowBox = text => page.evaluate(t => {
         const block = [...document.querySelectorAll('.tree .tree-item')].find(x => x.textContent.includes('drag-wt'));
@@ -1809,19 +1882,32 @@ const G = {};
     assert.equal(await page.isDisabled(`${row(fresh)} input[type=checkbox]`), false);
     assert.equal(await page.getAttribute(`${row(fresh)} input[type=checkbox]`, 'title'), 'Active in the last 2 minutes');
     // a store change that alters nothing shown leaves the rows alone (no redraw: clicks and focus aren't lost).
-    // The runner's hook may still be on its way (starting → idle redraws its row for real), so let it settle first.
-    await page.waitForFunction(i => import('/js/store.js').then(m => m.store.sessions.find(s => s.id === i).state !== 'starting'), runId);
+    // The runner's hook may still be on its way (starting → idle redraws its row for real), so let the app settle first.
+    await quiet();
     const kept = await page.evaluate(async sel => {
-      const { store, notify } = await import('/js/store.js');
+      const { store, notify, subscribe } = await import('/js/store.js');
       // what the dialog draws from: if a real change lands inside this window, a redraw is right and nothing is asserted
       const shown = () => JSON.stringify([store.repos.map(r => [r.path, r.name, r.kind, ((store.worktrees.get(r.path) || {}).list || []).map(w => [w.path, w.branch, w.detached])]), store.sessions.map(s => [s.id, s.state])]);
+      // Timeline for the failure message: a redraw by a notification that is not ours shows up here.
+      const t0 = performance.now();
+      const log = [];
+      const at = what => log.push(`+${(performance.now() - t0).toFixed(1)}ms ${what}`);
+      const body = document.querySelector('.sm-modal .sm-body');
+      const watch = new MutationObserver(list => at(`sm-body children changed (${list.reduce((n, r) => n + r.addedNodes.length + r.removedNodes.length, 0)} nodes)`));
+      watch.observe(body, { childList: true, subtree: true });
+      const off = subscribe(() => at('store notification'));
+      const fingerprint = window.__fingerprint();
       const before = shown();
       const el = document.querySelector(sel);
       el.dataset.kept = '1';
+      at('own notify()');
       notify();
       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-      return { changed: shown() !== before, alive: el.isConnected && document.querySelector(sel) === el };
+      watch.disconnect();
+      off();
+      return { changed: shown() !== before, alive: el.isConnected && document.querySelector(sel) === el, log, fingerprint };
     }, row(seeds[1]));
+    if (!kept.changed && !kept.alive) console.log(`  re-render guard failed.\n    fingerprint before: ${kept.fingerprint}\n${kept.log.map(l => `    ${l}`).join('\n')}`);
     assert.ok(kept.changed || kept.alive, 'the row was not rebuilt');
     // repo → worktree → conversation, then the folder groups
     const order = await page.evaluate(ids => [...document.querySelectorAll('.sm-modal .sm-group, .sm-modal .sm-row')]
@@ -2955,7 +3041,7 @@ const G = {};
     // Headless Chromium reports 'denied', which hides the banner: a fresh context that reports 'default' stands in for a real browser.
     const ctx = await browser.newContext({ viewport: { width: 1500, height: 900 } });
     await ctx.addInitScript(() => Object.defineProperty(Notification, 'permission', { get: () => 'default' }));
-    const pg = await ctx.newPage();
+    const pg = await newPage(ctx);
     const banner = '.toast >> text=Get a desktop notification when Claude needs you?';
     const asked = () => JSON.parse(fs.readFileSync(path.join(HOME, 'state.json'), 'utf8')).prefs.askedNotify;
     try {
@@ -2977,7 +3063,7 @@ const G = {};
     const ctx = await browser.newContext({ viewport: { width: 1500, height: 900 } });
     await ctx.addInitScript(() => Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' }));
     await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `http://localhost:${PORT}` });
-    const pg = await ctx.newPage();
+    const pg = await newPage(ctx);
     const pick = async (keys, text) => {
       await pg.keyboard.press(keys);
       await pg.waitForSelector('.qp-input');
