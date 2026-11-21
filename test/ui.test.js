@@ -2050,6 +2050,15 @@ const G = {};
       const { store, notify, subscribe } = await import('/js/store.js');
       // what the dialog draws from: if a real change lands inside this window, a redraw is right and nothing is asserted
       const shown = () => JSON.stringify([store.repos.map(r => [r.path, r.name, r.kind, ((store.worktrees.get(r.path) || {}).list || []).map(w => [w.path, w.branch, w.detached])]), store.sessions.map(s => [s.id, s.state])]);
+      const frames = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+      // Deliveries are batched per frame, so a store change that landed before we started may still be pending and our
+      // notify() would merge into it. Flush first; the dialog's baseline is the shown() at the last delivery, like ours.
+      const deliveries = [];
+      const off = subscribe(() => deliveries.push(shown()));
+      notify();
+      await frames();
+      const before = deliveries[deliveries.length - 1];
+      deliveries.length = 0;
       // Timeline for the failure message: a redraw by a notification that is not ours shows up here.
       const t0 = performance.now();
       const log = [];
@@ -2057,19 +2066,17 @@ const G = {};
       const body = document.querySelector('.sm-modal .sm-body');
       const watch = new MutationObserver(list => at(`sm-body children changed (${list.reduce((n, r) => n + r.addedNodes.length + r.removedNodes.length, 0)} nodes)`));
       watch.observe(body, { childList: true, subtree: true });
-      const off = subscribe(() => at('store notification'));
       const fingerprint = window.__fingerprint();
-      const before = shown();
       const el = document.querySelector(sel);
       el.dataset.kept = '1';
       at('own notify()');
       notify();
-      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+      await frames();
       watch.disconnect();
       off();
-      return { changed: shown() !== before, alive: el.isConnected && document.querySelector(sel) === el, log, fingerprint };
+      return { changed: deliveries.some(d => d !== before), alive: el.isConnected && document.querySelector(sel) === el, log, fingerprint, deliveries: deliveries.length };
     }, row(seeds[1]));
-    if (!kept.changed && !kept.alive) console.log(`  re-render guard failed.\n    fingerprint before: ${kept.fingerprint}\n${kept.log.map(l => `    ${l}`).join('\n')}`);
+    if (!kept.changed && !kept.alive) console.log(`  re-render guard failed.\n    fingerprint before: ${kept.fingerprint}\n    deliveries: ${kept.deliveries}\n${kept.log.map(l => `    ${l}`).join('\n')}`);
     assert.ok(kept.changed || kept.alive, 'the row was not rebuilt');
     // repo → worktree → conversation, then the folder groups
     const order = await page.evaluate(ids => [...document.querySelectorAll('.sm-modal .sm-group, .sm-modal .sm-row')]
