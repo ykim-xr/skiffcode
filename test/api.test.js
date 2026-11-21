@@ -2142,11 +2142,13 @@ function startServer() {
     await c.call('repos.add', { path: w });
     const changes = cl => cl.events.filter(e => e.event === 'fs.changed' && e.data.root === w && e.data.path.startsWith('sub'));
     const touch = n => fs.writeFileSync(path.join(w, 'sub', 'f.txt'), n);
+    // On macOS, node starts the FSEvents stream on another thread and rebuilds it for every new watch (the server
+    // starts one on .git too), so a write right after fs.watch can fall in a gap. Write until the first event shows it is live.
+    const reported = (cl, what) => { let n = 0; return until(() => { if (n++ % 5 === 0) touch(String(n)); return changes(cl).length; }, what); };
     await c.call('fs.watch', { root: w, path: 'sub' });
     await c.call('fs.watch', { root: w, path: 'sub' });
     c.events.length = 0;
-    touch('1');
-    await until(() => changes(c).length, 'a watched folder reports changes');
+    await reported(c, 'a watched folder reports changes');
     await c.call('fs.unwatch', { root: w, path: 'sub' });
     await sleep(200);
     c.events.length = 0;
@@ -2157,8 +2159,7 @@ function startServer() {
     await c2.call('fs.watch', { root: w, path: 'sub' });
     await c2.call('fs.watch', { root: w, path: 'sub' });
     c.events.length = 0;
-    touch('3');
-    await until(() => changes(c).length, 'the second client’s watch reports changes');
+    await reported(c, 'the second client’s watch reports changes');
     c2.close();
     await sleep(400);
     c.events.length = 0;
