@@ -292,6 +292,17 @@ function hideSessionTabs(id) {
 
 const MERGED_HOW = { rebase: ' (rebased)', squash: ' (squashed)' };
 
+/** A worktree is gone: close its workspace, refresh the list, and leave for the main checkout if it was the open one. */
+async function forgetWorktree(r, w, wasActive) {
+  const ws = app.workspaces.get(w.path);
+  if (ws) { ws.dispose(); app.workspaces.delete(w.path); }
+  await loadWorktrees(r.path);
+  if (wasActive) {
+    const main = (store.worktrees.get(r.path) || {}).list?.[0];
+    if (main) await openWorktree(main.path);
+  }
+}
+
 const actions = {
   openWorktree,
   isSessionFocused: id => !!(app.active && app.active.activeTab && app.active.activeTab.kind === 'session' && app.active.activeTab.sessionId === id),
@@ -413,7 +424,16 @@ const actions = {
   },
 
   async removeWorktree(r, w) {
-    const info = await call('worktrees.removeInfo', { repo: r.path, path: w.path });
+    const wasActive = store.active === w.path;
+    let info;
+    try {
+      info = await call('worktrees.removeInfo', { repo: r.path, path: w.path });
+    } catch (e) {
+      if (!/^Unknown worktree/.test(e.message)) return toast(e.message, { kind: 'error' });
+      // Removed outside SkiffCode (git lists it no more): the row was stale
+      await forgetWorktree(r, w, wasActive);
+      return toast('That worktree was already removed.');
+    }
     const purge = await purgeCheckbox([w.path]);
     const detail = h('div',
       h('p', h('code', tildify(w.path, store.home)), ' will be deleted.'),
@@ -430,15 +450,8 @@ const actions = {
     const t = toast('Removing worktree…', { timeout: 0 });
     try {
       if (purge && purge.input.checked) await call('claude.purgeFolders', { folders: [w.path] });
-      const wasActive = store.active === w.path;
       const res = await call('worktrees.remove', { repo: r.path, path: w.path, deleteBranch: v === 'branch' });
-      const ws = app.workspaces.get(w.path);
-      if (ws) { ws.dispose(); app.workspaces.delete(w.path); }
-      await loadWorktrees(r.path);
-      if (wasActive) {
-        const main = (store.worktrees.get(r.path) || {}).list?.[0];
-        if (main) await openWorktree(main.path);
-      }
+      await forgetWorktree(r, w, wasActive);
       // A deleted branch has no reflog, so the toast keeps the way back
       const deleted = () => res.sha && toast(`Deleted branch ${res.branchName} (was ${res.sha.slice(0, 7)}).`, {
         icon: 'branch', timeout: 0, // stays until dismissed: the sha is the only way back
@@ -793,6 +806,15 @@ subscribe(() => { applyColors(); document.body.classList.toggle('density-compact
 setInterval(updateStatusBar, 30_000); // keeps the usage reset countdown current
 
 let lastView = '';
+// Worktrees removed or added outside SkiffCode normally arrive as worktrees.changed. This covers what the server
+// can't see (a worktree folder deleted by hand) and a watch that missed an event.
+let lastRefresh = 0;
+function refreshWorktrees() {
+  if (document.hidden || !connected() || Date.now() - lastRefresh < 3000) return;
+  lastRefresh = Date.now();
+  void loadAll();
+}
+
 function reportView() {
   const ws = app.active;
   const t = ws && ws.activeTab;
@@ -803,9 +825,9 @@ function reportView() {
   if (connected()) void call('view', info).catch(() => {});
 }
 app.reportView = reportView;
-window.addEventListener('focus', () => { lastView = ''; reportView(); });
+window.addEventListener('focus', () => { lastView = ''; reportView(); refreshWorktrees(); });
 window.addEventListener('blur', () => { lastView = ''; reportView(); });
-document.addEventListener('visibilitychange', () => { lastView = ''; reportView(); });
+document.addEventListener('visibilitychange', () => { lastView = ''; reportView(); refreshWorktrees(); });
 
 // ------------------------------------------------------------------ keyboard
 

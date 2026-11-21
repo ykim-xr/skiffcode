@@ -1723,6 +1723,7 @@ const G = {};
   await step('jump palette and groups / drag-to-reorder repos', async () => {
     await page.evaluate(p => import('/js/rpc.js').then(r => r.call('repos.add', { path: p })), other);
     await page.waitForSelector('.repo-row >> text=other');
+    await quiet();
     await page.dragAndDrop('.repo-row:has-text("other")', '.repo-row:has-text("myapp")', { targetPosition: { x: 20, y: 3 } });
     await page.waitForFunction(() => document.querySelector('.repo-row .row-label').textContent === 'other');
     await page.keyboard.press('Control+Alt+j');
@@ -1742,8 +1743,12 @@ const G = {};
     assert.deepEqual(await order(), ['order-a', 'order-b']);
     await activePanel(false);
     await quiet();
-    const from = await page.locator('.tree .session-row:has-text("order-b")').boundingBox();
-    const to = await page.locator('.tree .session-row:has-text("order-a")').boundingBox();
+    // Read in the page: a locator can lose its row to a sidebar rebuild between finding it and measuring it.
+    const [from, to] = await page.evaluate(() => ['order-b', 'order-a'].map(t => {
+      const row = [...document.querySelectorAll('.tree .session-row')].find(r => r.textContent.includes(t));
+      const { x, y, width, height } = row.getBoundingClientRect();
+      return { x, y, width, height };
+    }));
     await page.mouse.move(from.x + 40, from.y + from.height / 2);
     await page.mouse.down();
     await page.mouse.move(to.x + 40, to.y + to.height * 0.25, { steps: 6 });
@@ -1846,6 +1851,36 @@ const G = {};
     if (await page.locator('.modal-title >> text=isn’t merged').count()) await page.click('.modal .btn >> text=Delete branch');
     await page.waitForSelector('.wt-row.active >> text=main');
     await shot('06-after-remove');
+  });
+
+  await step('a worktree removed outside SkiffCode: removing its stale row says so; a window focus refreshes the list', async () => {
+    const repoPath = path.join(tmp, 'code', 'myapp');
+    await spySend();
+    const stale = async name => {
+      sh(`git worktree add -q -b ${name} ../myapp.worktrees/${name}`, repoPath);
+      await page.waitForSelector(`.wt-row:has-text("${name}")`);
+      await quiet();
+      // Hold the page's list reload back, as if the server's worktrees.changed never arrived
+      await page.evaluate(() => { window.__held = []; window.__drop = m => m.method === 'worktrees.list' && !!window.__held.push(m); });
+      sh(`git worktree remove ../myapp.worktrees/${name}`, repoPath);
+      await page.waitForFunction(() => window.__held.length > 0);
+      assert.equal(await page.locator(`.wt-row:has-text("${name}")`).count(), 1, 'the row is stale');
+      await page.evaluate(() => { window.__drop = null; });
+    };
+    await stale('ext-menu');
+    await page.click('.wt-row:has-text("ext-menu")', { button: 'right' });
+    await page.click('.menu-item >> text=Remove worktree…');
+    await page.waitForSelector('.toast >> text=That worktree was already removed.');
+    await page.waitForSelector('.wt-row:has-text("ext-menu")', { state: 'detached' });
+    assert.equal(await page.locator('.modal').count(), 0, 'no dialog');
+
+    await stale('ext-focus');
+    // Reloads run at most every 3 s: an earlier focus may have used the slot, so repeat
+    for (let i = 0; i < 8 && await page.locator('.wt-row:has-text("ext-focus")').count(); i++) {
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+      await page.waitForSelector('.wt-row:has-text("ext-focus")', { state: 'detached', timeout: 1000 }).catch(() => {});
+    }
+    assert.equal(await page.locator('.wt-row:has-text("ext-focus")').count(), 0, 'focus reloaded the list');
   });
 
   await step('Claude sessions: every conversation by repo, worktree and folder; filter, select a suggestion, delete', async () => {

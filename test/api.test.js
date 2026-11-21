@@ -27,6 +27,15 @@ async function until(fn, what, ms = 8000) {
   }
   throw new Error(`timed out waiting for: ${what}${last instanceof Error ? ` (${last.message})` : ''}`);
 }
+/**
+ * Runs `write` (n = 1, 2, ...) every fifth poll until `seen` is true. On macOS, node starts the FSEvents stream on
+ * another thread and rebuilds it for every new directory watch, so one write made right after a watch starts can
+ * fall in a gap and be lost. The first event shows the watch is live.
+ */
+function writeUntil(write, seen, what, ms) {
+  let n = 0;
+  return until(() => { if (n++ % 5 === 0) write(n); return seen(); }, what, ms);
+}
 let passed = 0;
 const step = async (name, fn) => { await fn(); passed++; console.log(`  ✓ ${name}`); };
 const MAC = process.platform === 'darwin';
@@ -449,9 +458,10 @@ function startServer() {
     for (const n of [1, 2, 3]) {
       await sleep(200);
       c.events.length = 0;
-      fs.writeFileSync(`${f}.tmp`, String(n));
-      fs.renameSync(`${f}.tmp`, f); // how editors and git replace a file: a new inode
-      await until(changed, `change ${n} reported`, 3000);
+      await writeUntil(i => {
+        fs.writeFileSync(`${f}.tmp`, `${n}.${i}`);
+        fs.renameSync(`${f}.tmp`, f); // how editors and git replace a file: a new inode
+      }, changed, `change ${n} reported`, 3000);
     }
     await sleep(200);
     c.events.length = 0;
@@ -1994,6 +2004,27 @@ function startServer() {
     assert.deepEqual(mine, [], 'Claude process stopped');
   });
 
+  await step('worktrees added or removed outside SkiffCode are announced', async () => {
+    const outer = path.join(tmp, 'code', 'outer');
+    const linked = path.join(tmp, 'code', 'outer.worktrees');
+    fs.mkdirSync(outer);
+    sh('git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m x && git worktree add -q --detach ../outer.worktrees/a', outer);
+    await c.call('repos.add', { path: outer });
+    const seen = () => c.events.filter(e => e.event === 'worktrees.changed' && e.data.repo === outer).length;
+    let n = seen();
+    await writeUntil(i => sh(`git worktree add -q --detach ../outer.worktrees/p${i}`, outer), () => seen() > n, 'worktrees.changed after git worktree add');
+    n = seen();
+    sh('git worktree remove ../outer.worktrees/a', outer);
+    await until(() => seen() > n, 'worktrees.changed after git worktree remove');
+    assert.ok(!(await c.call('worktrees.list', { repo: outer })).worktrees.some(w => w.path === path.join(linked, 'a')));
+    // The last linked worktree takes git's worktrees folder with it: the watch must follow when it comes back
+    for (const d of fs.readdirSync(linked)) sh(`git worktree remove ../outer.worktrees/${d}`, outer);
+    await sleep(400);
+    n = seen();
+    await writeUntil(i => sh(`git worktree add -q --detach ../outer.worktrees/q${i}`, outer), () => seen() > n, 'worktrees.changed after the folder came back');
+    await c.call('repos.remove', { path: outer });
+  });
+
   await step('delete repo from disk: wrong name refused, worktree folders deleted', async () => {
     const doomed = path.join(tmp, 'code', 'doomed');
     fs.mkdirSync(doomed);
@@ -2141,10 +2172,8 @@ function startServer() {
     sh('git init -q -b main', w);
     await c.call('repos.add', { path: w });
     const changes = cl => cl.events.filter(e => e.event === 'fs.changed' && e.data.root === w && e.data.path.startsWith('sub'));
-    const touch = n => fs.writeFileSync(path.join(w, 'sub', 'f.txt'), n);
-    // On macOS, node starts the FSEvents stream on another thread and rebuilds it for every new watch (the server
-    // starts one on .git too), so a write right after fs.watch can fall in a gap. Write until the first event shows it is live.
-    const reported = (cl, what) => { let n = 0; return until(() => { if (n++ % 5 === 0) touch(String(n)); return changes(cl).length; }, what); };
+    const touch = n => fs.writeFileSync(path.join(w, 'sub', 'f.txt'), String(n));
+    const reported = (cl, what) => writeUntil(touch, () => changes(cl).length, what);
     await c.call('fs.watch', { root: w, path: 'sub' });
     await c.call('fs.watch', { root: w, path: 'sub' });
     c.events.length = 0;
@@ -2208,8 +2237,9 @@ function startServer() {
     await c.call('repos.add', { path: sub });
     await c.call('fs.watch', { root: sub, path: '' });
     c.events.length = 0;
-    fs.writeFileSync(path.join(sub, 'new.txt'), 'x');
-    const ev = await until(() => c.events.find(e => e.event === 'fs.changed' && e.data.path.endsWith('new.txt')), 'change reported');
+    const find = () => c.events.find(e => e.event === 'fs.changed' && e.data.path.endsWith('new.txt'));
+    await writeUntil(i => fs.writeFileSync(path.join(sub, 'new.txt'), `x${i}`), find, 'change reported');
+    const ev = find();
     assert.deepEqual([ev.data.root, ev.data.path], [sub, 'new.txt']);
     await c.call('fs.unwatch', { root: sub, path: '' });
     for (const p of [sub, sup]) await c.call('repos.remove', { path: p });

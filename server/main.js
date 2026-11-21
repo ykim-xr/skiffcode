@@ -204,6 +204,7 @@ function inUserOrder(r, wts) {
 function announceGit(p) {
   statusCache.delete(p);
   void watchGit(p);
+  void watchWorktrees(p);
   broadcast('state', snapshot());
   broadcast('worktrees.changed', { repo: p });
   gitChanged(p);
@@ -235,6 +236,7 @@ function forgetRoots(repoPath, wts) {
   const roots = new Set([repoPath, ...(rootsByRepo.get(repoPath) || []), ...wts.map(w => w.path)]);
   rootsByRepo.delete(repoPath);
   baseCache.delete(repoPath);
+  stopWorktreeWatch(repoPath);
   for (const w of roots) { knownRoots.delete(w); statusCache.delete(w); }
   return roots;
 }
@@ -344,6 +346,56 @@ async function watchGit(root) {
   await attempt;
 }
 
+/**
+ * Tell the pages when worktrees come or go outside SkiffCode (`git worktree add/remove` in a shell).
+ * Git keeps one folder per linked worktree in <common dir>/worktrees, and removes that folder with the last one:
+ * watch the common dir for it and re-arm the inner watch whenever it appears or disappears.
+ */
+const worktreeWatchers = new Map(); // repo path -> { outer, inner, timer }
+async function watchWorktrees(repoPath) {
+  if (worktreeWatchers.has(repoPath)) return;
+  const entry = { outer: null, inner: null, timer: null };
+  worktreeWatchers.set(repoPath, entry);
+  const fire = () => {
+    if (entry.timer) return;
+    entry.timer = setTimeout(() => {
+      entry.timer = null;
+      if (worktreeWatchers.get(repoPath) === entry) broadcast('worktrees.changed', { repo: repoPath });
+    }, 250);
+  };
+  try {
+    const common = (await git.git(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).trim();
+    if (worktreeWatchers.get(repoPath) !== entry) return; // the repo was removed meanwhile
+    const dir = path.join(common, 'worktrees');
+    const arm = () => {
+      if (entry.inner) entry.inner.close();
+      entry.inner = null;
+      try {
+        entry.inner = fs.watch(dir, { persistent: false }, fire);
+        entry.inner.on('error', () => {});
+      } catch { /* no linked worktrees: the outer watch sees the folder appear */ }
+    };
+    entry.outer = fs.watch(common, { persistent: false }, (_e, f) => {
+      if (f && String(f) !== 'worktrees') return;
+      arm();
+      fire();
+    });
+    entry.outer.on('error', () => {});
+    arm();
+  } catch {
+    if (worktreeWatchers.get(repoPath) === entry) worktreeWatchers.delete(repoPath); // not a repo (yet): a later `git init` retries
+  }
+}
+function stopWorktreeWatch(repoPath) {
+  const entry = worktreeWatchers.get(repoPath);
+  if (!entry) return;
+  worktreeWatchers.delete(repoPath);
+  if (entry.timer) clearTimeout(entry.timer);
+  if (entry.outer) entry.outer.close();
+  if (entry.inner) entry.inner.close();
+}
+for (const r of state.repos) if (r.kind !== 'folder') void watchWorktrees(r.path);
+
 function worktreeTarget(repo, branch) {
   const s = settings();
   const leaf = git.sanitizeForPath(branch);
@@ -413,6 +465,7 @@ async function addRepo(dir) {
   const root = gitRoot || real;
   if (!gitRoot && (root === '/' || root === os.homedir())) throw new Error(`Pick a project folder, not ${root}`);
   if (!state.repo(root)) state.update(d => void d.repos.push({ path: root, name: path.basename(root).replace(/\.git$/, ''), addedAt: Date.now(), ...(gitRoot ? {} : { kind: 'folder' }) }));
+  if (gitRoot) await watchWorktrees(root);
   await worktreesOf(state.repo(root)).catch(() => []);
   return state.repo(root);
 }
