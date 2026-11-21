@@ -23,6 +23,7 @@ window.Terminal = class {
     if (cb) cb();
   }
   reset() { this.text = ''; }
+  scrollToBottom() {}
   onData(fn) { this._d = fn; return { dispose() {} }; }
   attachCustomKeyEventHandler(fn) { this.kh = fn; }
   hasSelection() { return !!this._sel; } getSelection() { return this._sel || ''; } clearSelection() { this._sel = ''; } select(text) { this._sel = text; }

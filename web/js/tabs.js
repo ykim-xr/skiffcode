@@ -478,7 +478,11 @@ export class TerminalTab extends Tab {
         this.term.reset();
         // Saved output still holds old queries (cursor position…): xterm would answer them again, and the shell would get the answers as typed text.
         this.replaying = true;
-        this.term.write(bytes, () => { this.replaying = false; });
+        this.term.write(bytes, () => {
+          this.replaying = false;
+          // reset() shrinks the scroll area and queues a DOM scroll event to 0. If it lands after this write, xterm takes it as the user scrolling up. The next frame runs after it.
+          requestAnimationFrame(() => { if (!this.disposed) this.term.scrollToBottom(); });
+        });
         this.ended = false;
         this.updateBanner();
       } else if (type === 2) this.term.write(bytes);
