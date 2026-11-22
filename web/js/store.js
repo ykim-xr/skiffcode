@@ -8,6 +8,7 @@ export const store = {
   groups: [],
   repos: [],
   sessions: [],
+  links: [], // sessions that messaged each other: { a, b, n, at, from, first }
   prefs: { muted: false, collapsed: {} },
   settings: {},
   layouts: {},
@@ -40,6 +41,7 @@ export function applySnapshot(s) {
     groups: s.groups,
     repos: s.repos,
     sessions: s.sessions,
+    links: s.links || [],
     prefs: s.prefs,
     settings: s.settings,
   });

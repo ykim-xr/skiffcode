@@ -1018,6 +1018,76 @@ function startServer() {
     await c.call('sessions.forget', { id: s.id });
   });
 
+  await step('peer links: a message from another session links the two; no replay after a restart; dismiss and forget remove it', async () => {
+    const links = async () => (await c.call('hello')).links;
+    const mk = async (name, steps) => {
+      plan(`SessionStart,${steps}hang`);
+      const s = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, name, cols: 80, rows: 24 });
+      await until(async () => (await c.call('hello')).sessions.find(x => x.id === s.id).state !== 'ended', `${name} started`);
+      return s;
+    };
+    const idle = async s => { await until(async () => (await c.call('hello')).sessions.find(x => x.id === s.id).state === 'idle', 'idle'); return s; };
+    const pair = (x, y) => [x.id, y.id].sort();
+    const linkOf = (all, x, y) => all.find(l => [l.a, l.b].join() === pair(x, y).join());
+    const A = await idle(await mk('pl-a', ''));
+    const aPids = fs.readFileSync(path.join(HOME, 'pty', `${A.id}.sock.pid`), 'utf8').trim().split(/\s+/).map(Number);
+    // the pid wins over the name: the name here matches nobody
+    const B = await mk('pl-b', `Peer:${aPids[1]}:nobody-by-that-name,`);
+    const l1 = await until(async () => linkOf(await links(), A, B), 'link by pid');
+    assert.deepEqual([l1.n, l1.from, l1.first], [1, A.id, A.id]);
+    assert.ok(Math.abs(l1.at - Date.now()) < 30_000);
+    // an unknown pid falls back to the one live session with that name
+    const C = await mk('pl-c', 'Peer:1:pl-a,');
+    const l2 = await until(async () => linkOf(await links(), A, C), 'link by name');
+    assert.deepEqual([l2.n, l2.from], [1, A.id]);
+    // two messages in one prompt count twice
+    const D = await mk('pl-d', 'Peer2:1:pl-a,');
+    assert.equal((await until(async () => linkOf(await links(), A, D), 'two tags')).n, 2);
+    // a subagent hand-back, an unknown sender and a session's own name make no link
+    const E = await mk('pl-e', 'UserPromptSubmit,AgentMsg:pl-a,Peer:1:nobody-at-all,Peer:1:pl-e,');
+    const peersOf = s => { try { return fs.readFileSync(path.join(HOME, 'status', `${s.id}.peers`), 'utf8').split('\n').filter(Boolean); } catch { return []; } };
+    await until(() => peersOf(E).length === 2, 'E logged its two peer lines');
+    assert.ok(peersOf(E).every(l => l.includes('<cross-session-message ')), 'ordinary prompts and subagent hand-backs write nothing');
+    assert.equal(peersOf(B).length, 1);
+    await sleep(500);
+    assert.ok(!(await links()).some(l => l.a === E.id || l.b === E.id), 'no link for E');
+    assert.equal((await links()).length, 3);
+    // a tag quoted inside a message is not a sender
+    const dPid = Number(fs.readFileSync(path.join(HOME, 'pty', `${D.id}.sock.pid`), 'utf8').trim().split(/\s+/)[1]);
+    const F = await mk('pl-f', `PeerQuote:${aPids[1]}:pl-a:${dPid},`);
+    assert.equal((await until(async () => linkOf(await links(), A, F), 'link for F')).n, 1);
+    await sleep(300);
+    assert.equal(linkOf(await links(), D, F), undefined, 'the quoted tag made no link');
+    // dismiss, then restart the server: the dismissed link stays gone and the others are not replayed
+    await c.call('links.dismiss', { ids: [A.id, B.id] });
+    assert.equal(linkOf(await links(), A, B), undefined);
+    server.kill('SIGKILL');
+    await sleep(300);
+    fs.rmSync(path.join(HOME, 'server.pid'), { force: true });
+    await startServer();
+    c = await new Client(PORT, token).connect();
+    await sleep(500);
+    const after = await links();
+    assert.equal(linkOf(after, A, B), undefined, 'dismissed link not replayed');
+    assert.equal(linkOf(after, A, C).n, 1);
+    assert.equal(linkOf(after, A, D).n, 2);
+    // lines written while the server is down are read at startup
+    server.kill('SIGKILL');
+    await sleep(300);
+    fs.rmSync(path.join(HOME, 'server.pid'), { force: true });
+    const tag = '<cross-session-message from="uds:/x/1.sock" from-name="pl-d" from-mode="prompting">\nhi\n</cross-session-message>';
+    fs.appendFileSync(path.join(HOME, 'status', `${C.id}.peers`), `${Math.floor(Date.now() / 1000)}\t${JSON.stringify({ session_id: 'x', prompt: tag })}\n`);
+    await startServer();
+    c = await new Client(PORT, token).connect();
+    assert.equal((await until(async () => linkOf(await links(), C, D), 'link from the line written while down')).n, 1);
+    assert.equal(linkOf(await links(), A, C).n, 1, 'earlier lines not read again');
+    // forgetting a session removes its links
+    await c.call('sessions.forget', { id: A.id });
+    assert.ok(!(await links()).some(l => l.a === A.id || l.b === A.id));
+    for (const s of [B, C, D, E, F]) await c.call('sessions.forget', { id: s.id });
+    assert.deepEqual(await links(), []);
+  });
+
   await step('subagents: the agent a tool result names is the one that stops; Claude\'s list of running ones ends the rest', async () => {
     const { applyAgentEvent } = require(path.join(APP, 'server', 'sessions.js'));
     const run = events => { const list = []; events.forEach((ev, i) => applyAgentEvent(list, ev, i)); return Object.fromEntries(list.map(x => [x.toolUseId, x.state])); };

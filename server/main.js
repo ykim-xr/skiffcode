@@ -12,7 +12,7 @@ const git = require('./git');
 const fsops = require('./fsops');
 const search = require('./search');
 const { State } = require('./state');
-const { Sessions } = require('./sessions');
+const { Sessions, LINK_TTL_MS } = require('./sessions');
 const { PtyClient, hostPids, procfs, psProcess } = require('./pty');
 const notify = require('./notify');
 const { Accounts, claudeBin } = require('./accounts');
@@ -156,6 +156,7 @@ function snapshot() {
     groups: state.groups,
     repos: state.repos,
     sessions: sessions.list(),
+    links: (state.data.links || []).filter(l => Date.now() - l.at < LINK_TTL_MS),
     prefs: { muted: !!state.prefs.muted, askedNotify: !!state.prefs.askedNotify, collapsed: state.prefs.collapsed || {} },
     accounts: accounts.list(),
     currentLogin: accounts.currentLogin(),
@@ -928,6 +929,11 @@ const api = {
   async 'sessions.resume'({ id, cols, rows }) { return sessions.resume(sessionId(id), cols, rows); },
   async 'sessions.stop'({ id }) { await sessions.stop(sessionId(id)); },
   async 'sessions.forget'({ id }) { await sessions.forget(sessionId(id)); },
+  /** Dismiss the links among these sessions (the Working together panel's group). */
+  async 'links.dismiss'({ ids }) {
+    if (!Array.isArray(ids) || !ids.every(i => typeof i === 'string')) throw new Error('ids must be a list of session ids');
+    state.update(d => { d.links = (d.links || []).filter(l => !(ids.includes(l.a) && ids.includes(l.b))); });
+  },
   async 'sessions.rename'({ id, name }) { await sessions.rename(sessionId(id), name); },
   'sessions.setUnread'({ id, unread }) { sessions.setUnread(sessionId(id), unread); },
   /** Reorder sessions within one worktree: put `id` before `target`, or after it when `after` is set. */

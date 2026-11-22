@@ -219,4 +219,4 @@ class PtyClient extends EventEmitter {
   }
 }
 
-module.exports = { spawnHost, hostAlive, hostPids, isHost, psProcess, psSnapshot, procfs, hostCommandMatches, parseEtime, PtyClient };
+module.exports = { spawnHost, hostAlive, hostPids, isHost, psProcess, psSnapshot, procfs, hostCommandMatches, parseEtime, parentOf, PtyClient };

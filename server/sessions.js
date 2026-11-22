@@ -7,13 +7,16 @@ const { execFile } = require('child_process');
 const path = require('path');
 const crypto = require('crypto');
 const { EventEmitter } = require('events');
-const { spawnHost, hostAlive, hostPids, isHost, psSnapshot, procfs, PtyClient } = require('./pty');
+const { spawnHost, hostAlive, hostPids, isHost, psSnapshot, procfs, parentOf, PtyClient } = require('./pty');
 const { shq, userShell, TERM_SIZE } = require('./util');
 const { userStatusLine, quotedPath } = require('./accounts');
 const { UUID } = require('./history');
 
 const STALL_MS = Number(process.env.SKIFFCODE_STALL_MS) || 8000; // "working" but silent this long (and nothing running) = stopped
 // No 'ended': liveness decides that (a /clear also fires SessionEnd).
+const LINK_TTL_MS = 12 * 3600e3;
+// a start tag counts only at the start of the prompt or right after a closing tag: one quoted in a message does not
+const PEER_TAG_RE = /(?:"prompt":"|<\\?\/cross-session-message>(?:\\[nrt]|\s)*)(<cross-session-message\b[^>]*>)/g;
 const HOOK_STATES = new Set(['working', 'question', 'permission', 'idle']);
 const UUID_RE = new RegExp(`^${UUID.source}$`, 'i');
 const needsYou = s => s === 'question' || s === 'permission';
@@ -56,6 +59,9 @@ class Sessions extends EventEmitter {
     this.poll();
     for (const s of state.sessions) this.readStatus(s.id, true);
     this.starting = false;
+    // readPeers must run after readStatus: its name fallback skips ended sessions
+    this.pruneLinks();
+    for (const s of state.sessions) this.readPeers(s.id);
     this.watch();
     this.timer = setInterval(() => { this.poll(); void this.scanCommands(); }, 2000);
   }
@@ -273,10 +279,14 @@ class Sessions extends EventEmitter {
     this.removeStatus(id);
     this.info.delete(id);
     this.agents.delete(id);
-    for (const ext of ['.prompted', '.edited', '.statusline', '.agents', '.title']) fs.rmSync(path.join(this.statusDir, id + ext), { force: true });
+    for (const ext of ['.prompted', '.edited', '.statusline', '.agents', '.peers', '.title']) fs.rmSync(path.join(this.statusDir, id + ext), { force: true });
     for (const ext of ['.log', '.log.tmp', '.sock.exit']) fs.rmSync(path.join(this.ptyDir, id + ext), { force: true });
     this.live.delete(id);
-    this.state.update(d => { d.sessions = d.sessions.filter(s => s.id !== id); });
+    this.state.update(d => {
+      d.sessions = d.sessions.filter(s => s.id !== id);
+      d.links = (d.links || []).filter(l => l.a !== id && l.b !== id);
+      delete (d.peerOffsets || {})[id];
+    });
   }
 
   // ---------------------------------------------------------------- state
@@ -357,11 +367,14 @@ class Sessions extends EventEmitter {
     const edited = new Set();
     const lines = new Set();
     const agentLogs = new Set();
+    const peerLogs = new Set();
     let timer;
     const flush = () => {
       timer = undefined;
       for (const id of agentLogs) this.readAgents(id);
       agentLogs.clear();
+      for (const id of peerLogs) this.readPeers(id);
+      peerLogs.clear();
       for (const id of lines) this.readStatusLine(id);
       lines.clear();
       for (const id of pending) this.readStatus(id);
@@ -379,6 +392,7 @@ class Sessions extends EventEmitter {
         else if (name.endsWith('.statusline')) lines.add(name.slice(0, -11));
         else if (name.endsWith('.edited')) edited.add(name.slice(0, -7));
         else if (name.endsWith('.agents')) agentLogs.add(name.slice(0, -7));
+        else if (name.endsWith('.peers')) peerLogs.add(name.slice(0, -6));
         else return;
         if (!timer) timer = setTimeout(flush, 60);
       });
@@ -589,6 +603,88 @@ class Sessions extends EventEmitter {
     if (changed) this.emit('change');
   }
 
+  /**
+   * Messages from other Claude sessions (the hook logs each prompt that starts with <cross-session-message>).
+   * The read offset lives in state.json: a restart must neither replay old lines (dismissed links would
+   * come back, counts double) nor skip lines written while the server was down.
+   */
+  readPeers(id) {
+    if (!this.state.session(id)) return;
+    let offset = (this.state.data.peerOffsets || {})[id] || 0;
+    let chunk;
+    try {
+      const fd = fs.openSync(path.join(this.statusDir, `${id}.peers`), 'r');
+      try {
+        const size = fs.fstatSync(fd).size;
+        if (size < offset) offset = 0;
+        chunk = Buffer.alloc(size - offset);
+        fs.readSync(fd, chunk, 0, chunk.length, offset);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return;
+    }
+    const end = chunk.lastIndexOf(10); // a partial last line is read again next time
+    const lines = end === -1 ? [] : chunk.subarray(0, end).toString('utf8').split('\n');
+    const found = [];
+    for (const line of lines) {
+      const tab = line.indexOf('\t');
+      if (tab === -1) continue;
+      const at = Number(line.slice(0, tab)) * 1000 || Date.now();
+      for (const [, tag] of line.slice(tab + 1).matchAll(PEER_TAG_RE)) {
+        const from = this.peerSender(id, tag);
+        if (from) found.push({ from, at });
+      }
+    }
+    const next = offset + end + 1;
+    if (!found.length && next === ((this.state.data.peerOffsets || {})[id] || 0)) return;
+    this.state.update(d => {
+      (d.peerOffsets ||= {})[id] = next;
+      d.links ||= [];
+      for (const f of found) {
+        const [a, b] = [f.from, id].sort();
+        let l = d.links.find(x => x.a === a && x.b === b);
+        if (!l) d.links.push((l = { a, b, n: 0, at: 0, from: f.from, first: f.from, firstAt: f.at }));
+        l.n++;
+        // lines can arrive out of order (after a restart): `at`/`from` follow the newest, `first` the oldest
+        if (f.at >= l.at) { l.at = f.at; l.from = f.from; }
+        if (f.at < l.firstAt) { l.first = f.from; l.firstAt = f.at; }
+      }
+      d.links = d.links.filter(l => Date.now() - l.at < LINK_TTL_MS);
+    });
+  }
+
+  /** The SkiffCode session that sent the message in this start tag, or undefined (outside SkiffCode, or ambiguous). */
+  peerSender(receiver, tag) {
+    const attr = k => {
+      const m = new RegExp(`[ \\n]${k}=\\\\"((?:[^"\\\\]|\\\\.)*?)\\\\"`).exec(tag);
+      if (!m) return '';
+      try { return JSON.parse(`"${m[1]}"`); } catch { return ''; }
+    };
+    const others = this.state.sessions.filter(s => s.id !== receiver);
+    const byHost = new Map(others.filter(s => s.kind === 'claude').map(s => [hostPids(this.sock(s.id)).host, s]));
+    byHost.delete(0);
+    const sock = /\/(\d+)\.sock$/.exec(attr('from'));
+    // a wrapper command that doesn't exec makes the sender's pid a descendant of the host
+    for (let pid = sock ? Number(sock[1]) : 0, i = 0; pid > 1 && i < 8; pid = parentOf(pid), i++) {
+      const hit = byHost.get(pid);
+      if (hit) return hit.id;
+    }
+    const name = attr('from-name');
+    const named = name ? others.filter(s => s.kind === 'claude' && s.name === name && (this.live.get(s.id) || {}).state !== 'ended') : [];
+    return named.length === 1 ? named[0].id : undefined;
+  }
+
+  /** At startup: drop links to sessions that are gone, stale links and offsets of unknown sessions. */
+  pruneLinks() {
+    const known = new Set(this.state.sessions.map(s => s.id));
+    this.state.update(d => {
+      d.links = (d.links || []).filter(l => known.has(l.a) && known.has(l.b) && Date.now() - l.at < LINK_TTL_MS);
+      for (const id of Object.keys(d.peerOffsets || {})) if (!known.has(id)) delete d.peerOffsets[id];
+    });
+  }
+
   agentList(id) {
     const a = this.agents.get(id);
     if (!a || !a.list.length) return undefined;
@@ -716,4 +812,4 @@ function alertKind(from, to) {
   return undefined;
 }
 
-module.exports = { Sessions, alertKind, needsYou, applyAgentEvent };
+module.exports = { Sessions, LINK_TTL_MS, alertKind, needsYou, applyAgentEvent };

@@ -4,9 +4,11 @@
 //   SessionStart,sleep:200,UserPromptSubmit,PreToolUse:AskUserQuestion,PostToolUse:Edit,Notification:permission_prompt,Stop
 // Steps: <HookEvent>[:matcher] fires that hook; sleep:<ms>; Status:<5h%>:<weekly%>[:name] runs the status line;
 // Agent:<type>:<desc> / AgentBg:<type>:<desc> / AgentAsync:<type>:<desc> / AgentDone:<n> start and stop subagents; Print:<text>;
-// Spin:<seconds>; Bash:<seconds> (a command through the shell snapshot); Input and WaitKey (raw keys, logged to
-// $FAKE_LOG.input); "hang" waits forever (to test killing). The plan file path comes from $FAKE_SCRIPT_FILE
-// so each launch can read the current plan even inside tmux.
+// Peer:<pid>:<name> / Peer2:<pid>:<name> receive one / two messages from another session (UserPromptSubmit);
+// PeerQuote:<pid>:<name>:<quotedPid> is a Peer whose text quotes a second message tag from <quotedPid>;
+// AgentMsg:<name> receives a subagent hand-back (must not link); Spin:<seconds>;
+// Bash:<seconds> (a command through the shell snapshot); Input and WaitKey (raw keys, logged to $FAKE_LOG.input);
+// "hang" waits forever (to test killing). The plan file path comes from $FAKE_SCRIPT_FILE so each launch can read the current plan even inside tmux.
 const fs = require('fs');
 const { execSync } = require('child_process');
 const path = require('path');
@@ -87,6 +89,13 @@ const keys = { n: 0, wake: () => {} };
       if (kind === 'AgentBg') fire('PostToolUse', 'Agent', { tool_name: 'Agent', tool_use_id: `tu${n}`, tool_input: {} });
       // Claude moved it to the background itself: no run_in_background, the result says it was launched
       if (kind === 'AgentAsync') fire('PostToolUse', 'Agent', { tool_name: 'Agent', tool_use_id: `tu${n}`, tool_input: {}, tool_response: { isAsync: true, status: 'async_launched', agentId: `ag${n}` } });
+    } else if (/^Peer(2|Quote)?:/.test(step)) {
+      const [kind, pid, name, quoted] = step.split(':');
+      const body = kind === 'PeerQuote' ? `see <cross-session-message from="uds:/run/user/1000/cc-socks/${quoted}.sock" from-name="${name}" from-mode="prompting">` : 'hello';
+      const tag = `<cross-session-message from="uds:/run/user/1000/cc-socks/${pid}.sock" from-name="${name}" from-mode="prompting">\n${body}\n</cross-session-message>`;
+      fire('UserPromptSubmit', undefined, { prompt: kind === 'Peer2' ? `${tag}\n${tag}` : tag });
+    } else if (step.startsWith('AgentMsg:')) {
+      fire('UserPromptSubmit', undefined, { prompt: `<agent-message from="${step.split(':')[1]}">\ndone\n</agent-message>` });
     } else if (step.startsWith('Print:')) {
       process.stdout.write(`\r\n${step.slice(6)}\r\n`);
     } else if (step.startsWith('Spin:')) {

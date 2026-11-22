@@ -1,5 +1,5 @@
 // Left sidebar: groups → repos → worktrees → sessions, Orca style.
-import { h, icon, clear, isMac } from './util.js';
+import { h, icon, clear, isMac, relTime } from './util.js';
 import { store, subscribe, sessionsIn, needsYou } from './store.js';
 import { call } from './rpc.js';
 import { contextMenu } from './dialogs.js';
@@ -71,6 +71,8 @@ function render() {
   const oldPanel = root.querySelector('.active-panel .panel-body');
   const treeTop = oldTree ? oldTree.scrollTop : 0;
   const panelTop = oldPanel ? oldPanel.scrollTop : 0;
+  const oldTogether = root.querySelector('.together-panel .panel-body');
+  const togetherTop = oldTogether ? oldTogether.scrollTop : 0;
   clear(root,
     h('div.sidebar-header',
       h('span.sidebar-title', 'SkiffCode'),
@@ -80,10 +82,13 @@ function render() {
         h('button.icon-btn', { title: withKey('Jump to…', 'jump'), onclick: () => A.jump() }, icon('search')),
         h('button.icon-btn', { title: withKey('Claude sessions', 'sessions'), onclick: () => A.sessionManager() }, icon('list')))),
     activePanel(),
+    togetherPanel(),
     list);
   list.scrollTop = treeTop;
   const panel = root.querySelector('.active-panel .panel-body');
   if (panel) panel.scrollTop = panelTop;
+  const together = root.querySelector('.together-panel .panel-body');
+  if (together) together.scrollTop = togetherTop;
 }
 
 // ---- "Active" panel: sessions that need you, then the ones working, grouped by repo.
@@ -119,6 +124,84 @@ function activePanel() {
     sessionIcon(s, 'row-icon'),
     h('span.row-label', s.name),
     h('span.row-desc', [r ? r.name : '', wt && wt.branch && !wt.isMain ? wt.branch : ''].filter(Boolean).join(' · '))));
+  }
+  panel.append(body);
+  return panel;
+}
+
+// ---- "Working together" panel: sessions linked by messages to each other, across repos.
+
+// Mirrors the server's LINK_TTL_MS: the server sends only fresh links, this keeps an open page honest.
+const LINK_TTL = 12 * 3600e3;
+const ago = at => (relTime(at) === 'now' ? 'just now' : `${relTime(at)} ago`);
+
+/** Groups of linked sessions (connected components), each with its members hub first. */
+function togetherGroups() {
+  const byId = new Map(store.sessions.map(s => [s.id, s]));
+  const links = (store.links || []).filter(l => Date.now() - l.at < LINK_TTL && byId.has(l.a) && byId.has(l.b));
+  const seen = new Set();
+  const groups = [];
+  for (const start of new Set(links.flatMap(l => [l.a, l.b]))) {
+    if (seen.has(start)) continue;
+    const ids = new Set([start]);
+    for (const id of ids) {
+      seen.add(id);
+      for (const l of links) if (l.a === id || l.b === id) ids.add(l.a === id ? l.b : l.a);
+    }
+    const mine = links.filter(l => ids.has(l.a));
+    const stat = id => {
+      const own = mine.filter(l => l.a === id || l.b === id);
+      return { links: own.length, n: own.reduce((t, l) => t + l.n, 0), first: own.filter(l => l.first === id).length };
+    };
+    const last = id => Math.max(...mine.filter(l => l.a === id || l.b === id).map(l => l.at));
+    const members = [...ids].map(id => byId.get(id));
+    if (members.every(s => s.state === 'ended')) continue;
+    members.sort((x, y) => {
+      const sx = stat(x.id);
+      const sy = stat(y.id);
+      return sy.links - sx.links || sy.n - sx.n || sy.first - sx.first || (x.createdAt || 0) - (y.createdAt || 0);
+    });
+    const [hub, ...rest] = members;
+    rest.sort((x, y) => last(y.id) - last(x.id));
+    groups.push({ members: [hub, ...rest], mine, last, byId });
+  }
+  return groups;
+}
+
+function togetherPanel() {
+  const groups = togetherGroups();
+  if (!groups.length) return null;
+  const key = 'panel:together';
+  const head = h('div.panel-head', { onclick: () => toggle(key), title: 'Claude sessions that message each other' },
+    icon(collapsed(key) ? 'chevronRight' : 'chevronDown', 'twisty'),
+    h('span.panel-title', 'Working together'),
+    h('span.panel-count', `${groups.length} group${groups.length === 1 ? '' : 's'}`));
+  const panel = h('div.together-panel', head);
+  if (collapsed(key)) return panel;
+  const body = h('div.panel-body');
+  for (const g of groups) {
+    const ids = g.members.map(s => s.id);
+    const box = h('div.together-group',
+      h('div.together-group-head',
+        h('span.row-label', g.members[0].name),
+        h('span.row-desc', `${g.members.length} sessions`),
+        h('button.icon-btn', { title: 'Hide this group', onclick: () => call('links.dismiss', { ids }) }, icon('close'))));
+    for (const s of g.members) {
+      const r = store.repos.find(x => x.path === s.repoPath);
+      const wt = ((store.worktrees.get(s.repoPath) || {}).list || []).find(w => w.path === s.worktreePath);
+      const gone = s.state === 'ended' || !!(wt && wt.prunable);
+      const lines = g.mine.filter(l => l.a === s.id || l.b === s.id).sort((x, y) => y.at - x.at)
+        .map(l => `${l.from === s.id ? 'Sent to' : 'Heard from'} ${g.byId.get(l.a === s.id ? l.b : l.a).name} ${ago(l.at)}`);
+      box.append(h(`div.row.active-row.together-row${gone ? '.dim' : ''}${A.isSessionFocused(s.id) ? '.focused' : ''}`, {
+        title: `${lines.join('\n')}\nClick to open`,
+        onclick: () => A.focusSession(s.id),
+      },
+      sessionIcon(s, 'row-icon'),
+      h('span.row-label', s.name),
+      h('span.row-desc', [r ? r.name : '', wt && wt.branch && !wt.isMain ? wt.branch : ''].filter(Boolean).join(' · ')),
+      h('span.together-time', relTime(g.last(s.id)))));
+    }
+    body.append(box);
   }
   panel.append(body);
   return panel;

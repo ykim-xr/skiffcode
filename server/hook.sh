@@ -16,7 +16,19 @@ if [ "$1" = agent ]; then
   rm -f "$tmp"
   exit 0
 fi
-cat >/dev/null 2>&1
+if [ "$1" = working ] && [ "$2" = prompt ]; then
+  # A message from another Claude session starts the prompt with <cross-session-message: keep the
+  # start of the hook input (the prompt begins near byte 400) for SkiffCode's session links.
+  line=$(tr -d '\r\n' | { head -c 8192; cat >/dev/null; })
+  case "$line" in
+    *'"prompt":"<cross-session-message '*)
+      tmp="$d/.$id.peers.$$"
+      printf '%s\t%s\n' "$(date +%s)" "$line" >"$tmp" 2>/dev/null && cat "$tmp" >>"$d/$id.peers" 2>/dev/null
+      rm -f "$tmp" ;;
+  esac
+else
+  cat >/dev/null 2>&1
+fi
 # A name you gave the session in SkiffCode, not yet passed to Claude: hand it over as the
 # session title (UserPromptSubmit and SessionStart hooks may set it). $2 = prompt | start.
 t="$d/$id.title"

@@ -9,6 +9,7 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 - Name sessions when you start them; names stay in sync with Claude both ways (rename here, or `/rename` in Claude)
 - Drag sessions in the sidebar to reorder them within a worktree, and worktrees to reorder them under their repo
 - **Active panel**: every session waiting for you or working; one click opens it
+- **Working together** panel: Claude sessions that message each other, grouped across repos; one click opens one
 - At a glance: orange Claude icon while working, a zigzag while a command it started runs, ❓ / 🛡 when it needs you
 - **Alerts** for questions, permission prompts and finished work: a sound per alert (built-in or your own file, with volume) and desktop notifications
 - **Subagents** counted on their session; click to list them with their type

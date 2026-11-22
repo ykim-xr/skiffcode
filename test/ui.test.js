@@ -3219,6 +3219,62 @@ const G = {};
     await page.evaluate(i => import('/js/rpc.js').then(r => r.call('sessions.forget', { id: i })), id);
   });
 
+  await step('Working together panel: groups of sessions that message each other, hub first; dim, forget, dismiss, open', async () => {
+    await freshMain();
+    const rpc = (m, a) => page.evaluate(([m, a]) => import('/js/rpc.js').then(r => r.call(m, a)), [m, a]);
+    // A plan that receives a message ends 'working', so only a plain plan is waited on for 'idle'.
+    const mk = async (name, steps = '') => {
+      plan(`SessionStart,${steps}hang`);
+      const s = await rpc('sessions.create', { kind: 'claude', worktreePath: repo, name, cols: 80, rows: 24 });
+      // The fake reads the shared plan file when it starts, which can be late: wait for its launch before the next plan() overwrites it.
+      for (let i = 0; i < 300 && !(fs.existsSync(process.env.FAKE_LOG) && fs.readFileSync(process.env.FAKE_LOG, 'utf8').includes(`"--name","${name}"`)); i++) await sleep(100);
+      const want = steps ? 'x !== "starting"' : 'x === "idle"';
+      await page.waitForFunction(new Function('i', `return import('/js/store.js').then(m => { const x = (m.store.sessions.find(y => y.id === i) || {}).state; return ${want}; })`), s.id, { timeout: 15000 });
+      return s;
+    };
+    const pidOf = s => Number(fs.readFileSync(path.join(HOME, 'pty', `${s.id}.sock.pid`), 'utf8').trim().split(/\s+/)[1]);
+    const HUB = 'tg-hub-with-a-very-long-session-name-that-cannot-fit-in-the-sidebar';
+    const labels = group => page.locator(`.together-group:has-text("${group}") .together-row .row-label`).allTextContents();
+    await quiet();
+    assert.equal(await page.locator('.together-panel').count(), 0, 'no links, no panel');
+    // The hub is the youngest session: it comes first because it has the most links, not because it is oldest.
+    const b = await mk('tg-b');
+    const c = await mk('tg-c');
+    const hub = await mk(HUB, `Peer:${pidOf(b)}:x,Peer:${pidOf(c)}:x,`);
+    const d = await mk('tg-d');
+    const e = await mk('tg-e', `Peer:${pidOf(d)}:x,`);
+    await page.waitForFunction(() => document.querySelectorAll('.together-panel .together-row').length === 5, null, { timeout: 10000 });
+    await quiet();
+    assert.equal(await page.locator('.together-panel .together-group').count(), 2);
+    assert.match(await page.textContent('.together-panel .panel-head'), /2 groups/);
+    assert.equal((await labels('tg-b'))[0], HUB, 'the hub is first');
+    assert.deepEqual((await labels('tg-b')).sort(), ['tg-b', 'tg-c', HUB].sort());
+    assert.deepEqual((await labels('tg-d')).sort(), ['tg-d', 'tg-e']);
+    assert.match(await page.textContent('.together-group:has-text("tg-b") .together-group-head'), /3 sessions/);
+    const headH = await page.evaluate(() => document.querySelector('.together-group-head').getBoundingClientRect().height);
+    assert.ok(headH <= 26, `a long name keeps the head on one line (${headH}px)`);
+    assert.match(await page.getAttribute('.together-row:has-text("tg-b")', 'title'), /Sent to tg-hub-with[\s\S]*just now[\s\S]*Click to open/);
+    assert.match(await page.getAttribute(`.together-row:has-text("${HUB}")`, 'title'), /Heard from tg-[bc] just now/);
+    assert.equal(await page.locator('.active-panel').count(), 1, 'the Active panel stays single');
+    await shot('11-together-panel');
+    // an ended member stays, dimmed
+    await rpc('sessions.stop', { id: b.id });
+    await page.waitForSelector('.together-row.dim:has-text("tg-b")');
+    assert.equal(await page.locator('.together-row.dim').count(), 1);
+    // forgetting a session takes it out at once
+    await rpc('sessions.forget', { id: c.id });
+    await page.waitForFunction(() => document.querySelectorAll('.together-row').length === 4);
+    // click opens that session
+    await page.click(`.together-row:has-text("${HUB}")`);
+    await page.waitForFunction(i => window.skiffcode.active?.activeTab?.sessionId === i, hub.id);
+    // dismiss removes one group, then the panel
+    await page.click('.together-group:has-text("tg-b") button[title="Hide this group"]');
+    await page.waitForFunction(() => document.querySelectorAll('.together-group').length === 1);
+    await page.click('.together-group button[title="Hide this group"]');
+    await page.waitForSelector('.together-panel', { state: 'detached' });
+    for (const s of [hub, b, d, e]) await rpc('sessions.forget', { id: s.id });
+  });
+
   await step('the notification banner shows once, and stays away when the browser forgets its site data', async () => {
     // Headless Chromium reports 'denied', which hides the banner: a fresh context that reports 'default' stands in for a real browser.
     const ctx = await browser.newContext({ viewport: { width: 1500, height: 900 } });
