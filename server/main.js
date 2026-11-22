@@ -13,7 +13,7 @@ const fsops = require('./fsops');
 const search = require('./search');
 const { State } = require('./state');
 const { Sessions, LINK_TTL_MS } = require('./sessions');
-const { PtyClient, hostPids, procfs, psProcess } = require('./pty');
+const { PtyClient, knownHostPids, procfs, psProcess } = require('./pty');
 const notify = require('./notify');
 const { Accounts, claudeBin } = require('./accounts');
 const history = require('./history');
@@ -973,7 +973,7 @@ const api = {
     };
     const per = {};
     for (const s of state.sessions) {
-      const { host } = hostPids(sessions.sock(s.id));
+      const { host } = knownHostPids(sessions.sock(s.id));
       if (host && rss.has(host)) per[s.id] = tree(host);
     }
     return { server: process.memoryUsage().rss, sessions: per };

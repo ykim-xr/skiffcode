@@ -133,6 +133,12 @@ function hostPids(sock, { fresh = false } = {}) {
   return { host, child: c && c.ppid === host ? child : 0 };
 }
 
+/** hostPids for a lookup that needs the pid: a host started since the last snapshot is checked directly, not left unknown. */
+function knownHostPids(sock) {
+  const p = hostPids(sock);
+  return p.unknown ? hostPids(sock, { fresh: true }) : p;
+}
+
 /** Is a host serving this socket? An unknown host counts as alive: a relaunch would delete its socket. */
 function hostAlive(sock) {
   const p = hostPids(sock);
@@ -219,4 +225,4 @@ class PtyClient extends EventEmitter {
   }
 }
 
-module.exports = { spawnHost, hostAlive, hostPids, isHost, psProcess, psSnapshot, procfs, hostCommandMatches, parseEtime, parentOf, PtyClient };
+module.exports = { spawnHost, hostAlive, hostPids, knownHostPids, isHost, psProcess, psSnapshot, procfs, hostCommandMatches, parseEtime, parentOf, PtyClient };

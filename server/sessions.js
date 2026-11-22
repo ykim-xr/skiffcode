@@ -7,7 +7,7 @@ const { execFile } = require('child_process');
 const path = require('path');
 const crypto = require('crypto');
 const { EventEmitter } = require('events');
-const { spawnHost, hostAlive, hostPids, isHost, psSnapshot, procfs, parentOf, PtyClient } = require('./pty');
+const { spawnHost, hostAlive, hostPids, knownHostPids, isHost, psSnapshot, procfs, parentOf, PtyClient } = require('./pty');
 const { shq, userShell, TERM_SIZE } = require('./util');
 const { userStatusLine, quotedPath } = require('./accounts');
 const { UUID } = require('./history');
@@ -663,12 +663,7 @@ class Sessions extends EventEmitter {
       try { return JSON.parse(`"${m[1]}"`); } catch { return ''; }
     };
     const others = this.state.sessions.filter(s => s.id !== receiver);
-    const byHost = new Map(others.filter(s => s.kind === 'claude').map(s => {
-      let p = hostPids(this.sock(s.id));
-      // without /proc, a host started since the last ps snapshot is unknown: check that one directly
-      if (p.unknown) p = hostPids(this.sock(s.id), { fresh: true });
-      return [p.host, s];
-    }));
+    const byHost = new Map(others.filter(s => s.kind === 'claude').map(s => [knownHostPids(this.sock(s.id)).host, s]));
     byHost.delete(0);
     const sock = /\/(\d+)\.sock$/.exec(attr('from'));
     // a wrapper command that doesn't exec makes the sender's pid a descendant of the host
