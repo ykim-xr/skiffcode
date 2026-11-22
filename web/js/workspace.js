@@ -32,7 +32,7 @@ class Pane {
     this.active = null;
     this.bar = h('div.tabbar', {
       ondragover: e => { if (ws.dragTab) e.preventDefault(); },
-      ondrop: e => { e.preventDefault(); ws.dropTab(this, null, 'center'); },
+      ondrop: e => { e.preventDefault(); ws.dropTab(this, null, 'end'); },
       onwheel: e => {
         if (!e.deltaY || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
         e.preventDefault();
@@ -686,8 +686,9 @@ export class Workspace {
     this.dragTab = null;
     if (!t) return;
     if (zone === 'up' && pane.row === this.bottom) return this.moveToMain(t);
-    if (zone && zone !== 'center') return this.split(t, zone, pane);
-    if (t === before || (t.pane === pane && !before)) return;
+    if (zone && zone !== 'center' && zone !== 'end') return this.split(t, zone, pane);
+    // The empty end of the tab bar moves the tab last, even within its own pane; its own content keeps it where it is.
+    if (t === before || (t.pane === pane && !before && zone !== 'end')) return;
     let at = before ? pane.tabs.indexOf(before) : pane.tabs.length;
     if (t.pane === pane && pane.tabs.indexOf(t) < at) at--; // moveTab removes the tab first
     this.moveTab(t, pane, at);

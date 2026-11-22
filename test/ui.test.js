@@ -2276,6 +2276,19 @@ const G = {};
   }, { sel, types, data, at });
   const INTERNAL = 'application/x-skiffcode-path';
 
+  await step('tabs: a tab dropped on the empty end of its own tab bar moves last', async () => {
+    await freshMain();
+    await page.evaluate(async () => { const ws = window.skiffcode.active; for (const f of ['README.md', 'src/app.py', 'src/site.css']) await ws.openFile(f, { preview: false }); });
+    const titles = () => page.evaluate(() => window.skiffcode.active.top.panes[0].tabs.map(t => t.title()));
+    const [first, ...rest] = await titles();
+    await page.evaluate(() => {
+      const el = window.skiffcode.active.top.panes[0].tabs[0].tabEl;
+      el.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: new DataTransfer() }));
+    });
+    await dnd('.workspace:not(.hidden) .row-top .tabbar-fill', ['dragover', 'drop']);
+    assert.deepEqual(await titles(), [...rest, first]);
+  });
+
   await step('tabs: a drag that ends without a drop is forgotten, so a later file drop opens the file', async () => {
     const W = '.workspace:not(.hidden)';
     await freshMain();
