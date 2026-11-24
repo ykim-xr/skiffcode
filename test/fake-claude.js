@@ -118,7 +118,8 @@ const keys = { n: 0, wake: () => {} };
         keys.wake();
       });
     } else if (step.startsWith('WaitFile:')) {
-      while (!fs.existsSync(step.slice(9))) await new Promise(r => setTimeout(r, 50));
+      // with a spinner, as Claude draws while it works: a silent working session would count as stalled
+      while (!fs.existsSync(step.slice(9))) { process.stdout.write('\r✻ Working…'); await new Promise(r => setTimeout(r, 150)); }
     } else if (step === 'WaitKey') {
       // WaitKey — wait for the next key press (after Input), e.g. one answer of a question
       while (!keys.n) await new Promise(r => { keys.wake = r; });
