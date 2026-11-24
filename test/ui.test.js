@@ -1748,6 +1748,19 @@ const G = {};
     await page.evaluate(async () => { const ws = window.skiffcode.active; for (const t of ws.allTabs()) if (['view', 'web'].includes(t.kind) || (t.kind === 'file' && t.path.startsWith('docs/'))) await ws.closeTab(t); });
   });
 
+  await step('viewers: an image preview follows its file on disk while its folder is collapsed in the Files panel', async () => {
+    const wt = await page.evaluate(() => window.skiffcode.active.root);
+    fs.mkdirSync(path.join(wt, 'pics'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'pics', 'p.png'), png(40, 20));
+    await page.click('.workspace:not(.hidden) .right-tab >> text=Files');
+    await page.evaluate(() => window.skiffcode.active.openFile('pics/p.png', { preview: false }));
+    await page.waitForSelector('.workspace:not(.hidden) .viewer-info >> text=40 × 20');
+    assert.equal(await page.locator('.workspace:not(.hidden) .file-row[data-path="pics/p.png"]').count(), 0, 'the folder is collapsed');
+    fs.writeFileSync(path.join(wt, 'pics', 'p.png'), png(60, 30));
+    await page.waitForSelector('.workspace:not(.hidden) .viewer-info >> text=60 × 30', { timeout: 5000 });
+    await page.evaluate(async () => { const ws = window.skiffcode.active; for (const t of ws.allTabs()) if (t.kind === 'view') await ws.closeTab(t); });
+  });
+
   await step('paths in terminal output are links: click, Ctrl+click, right-click menu; a browser tab takes paths', async () => {
     const wt = await page.evaluate(() => window.skiffcode.active.root);
     // a report outside the worktree, with its own CSS next to it

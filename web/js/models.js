@@ -3,6 +3,7 @@
 import { call, on } from './rpc.js';
 import { languageOf } from './util.js';
 import { confirmDialog, toast } from './dialogs.js';
+import { watchFile } from './watches.js';
 
 const files = new Map(); // key root\0path -> entry
 const gitModels = new Map(); // key root\0ref\0path -> { model, refs }
@@ -46,7 +47,7 @@ export async function acquire(root, p) {
     e.savedVersion = e.model.getAlternativeVersionId();
     if (e.refs <= 0) return e.model.dispose(); // released while it loaded
     e.model.onDidChangeContent(() => fire(e));
-    void call('fs.watch', { root, path: p }).catch(() => {});
+    e.unwatch = watchFile(root, p);
   })();
   await e.ready;
   return e;
@@ -56,7 +57,7 @@ export function release(e) {
   if (--e.refs > 0) return;
   files.delete(key(e.root, e.path));
   if (!e.model) return; // still loading: acquire disposes it when it arrives
-  void call('fs.unwatch', { root: e.root, path: e.path }).catch(() => {});
+  e.unwatch();
   e.model.dispose();
 }
 
@@ -208,7 +209,7 @@ export function move(root, from, to) {
     const old = e.model;
     const dirty = isDirty(e);
     files.delete(key(root, e.path));
-    void call('fs.unwatch', { root, path: e.path }).catch(() => {});
+    e.unwatch();
     const uri = fileUri(root, p);
     const existing = monaco.editor.getModel(uri);
     e.model = existing || monaco.editor.createModel(old.getValue(), languageOf(p), uri);
@@ -218,7 +219,7 @@ export function move(root, from, to) {
     e.missing = false;
     files.set(key(root, p), e);
     e.model.onDidChangeContent(() => fire(e));
-    void call('fs.watch', { root, path: p }).catch(() => {});
+    e.unwatch = watchFile(root, p);
     fire(e); // views switch to the new model before the old one goes
     old.dispose();
   }
@@ -232,7 +233,3 @@ on('fs.changed', ({ root, path: p }) => {
   }
 });
 on('git.changed', ({ root }) => void refreshGit(root, ['HEAD', ':0']));
-// The server forgets a connection's watches when it drops.
-on('reconnect', () => {
-  for (const e of files.values()) if (e.model) void call('fs.watch', { root: e.root, path: e.path }).catch(() => {});
-});

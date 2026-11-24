@@ -4,6 +4,7 @@
 import { h, icon, basename, clear, debounce, isMac, platformHint } from './util.js';
 import { call, on } from './rpc.js';
 import { toast } from './dialogs.js';
+import { watchFile } from './watches.js';
 
 const IMAGE = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'bmp', 'ico', 'svg']);
 const HTML = new Set(['html', 'htm']);
@@ -90,10 +91,13 @@ export class FileViewTab extends ViewerBase {
     this.bar.append(h('button.icon-btn', { title: 'Open in your browser', onclick: () => this.openOutside() }, icon('external')));
     // Follow changes on disk: the file itself, or (for a page) anything it may load
     const reload = debounce(() => { if (!this.disposed) this.load(); }, 300);
-    this.off = on('fs.changed', e => {
+    const stop = on('fs.changed', e => {
       if (this.abs || e.root !== ws.root) return;
       if (mode === 'html' || e.path === null || e.path === path || (e.dir !== undefined && path.startsWith(`${e.dir}/`))) reload();
     });
+    // The server reports only watched paths, and the Files panel watches expanded folders only.
+    const unwatch = this.abs ? null : watchFile(ws.root, path);
+    this.off = () => { stop(); if (unwatch) unwatch(); };
     this.ready = this.load();
   }
   title() { return this.mode === 'html' ? `Preview ${basename(this.path)}` : basename(this.path); }
