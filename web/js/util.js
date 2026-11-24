@@ -243,3 +243,25 @@ export function readStored(key, fallback = null, parse = v => v) {
     return fallback;
   }
 }
+
+/**
+ * Wraps a render function for an element that is rebuilt often. Replacing a node between mouse down and mouse up
+ * makes Chrome drop the click, so a render that comes while a pointer is down inside `el` waits until it is released.
+ */
+export function deferWhilePressed(el, render) {
+  let pressed = false;
+  let waiting = false;
+  const wrapped = (...args) => {
+    if (pressed) { waiting = true; return; }
+    return render(...args);
+  };
+  const release = () => {
+    if (!pressed) return;
+    pressed = false;
+    if (waiting) { waiting = false; requestAnimationFrame(() => wrapped()); }
+  };
+  el.addEventListener('pointerdown', () => { pressed = true; }, true);
+  for (const t of ['pointerup', 'pointercancel']) document.addEventListener(t, release, true);
+  window.addEventListener('blur', release);
+  return wrapped;
+}

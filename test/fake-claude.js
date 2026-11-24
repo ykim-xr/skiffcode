@@ -8,7 +8,7 @@
 // PeerQuote:<pid>:<name>:<quotedPid> is a Peer whose text quotes a second message tag from <quotedPid>;
 // AgentMsg:<name> receives a subagent hand-back (must not link); Spin:<seconds>;
 // Bash:<seconds> (a command through the shell snapshot); Input and WaitKey (raw keys, logged to $FAKE_LOG.input);
-// "hang" waits forever (to test killing). The plan file path comes from $FAKE_SCRIPT_FILE so each launch can read the current plan even inside tmux.
+// WaitFile:<path> polls until that file exists (a test holds a turn open with it); "hang" waits forever (to test killing). The plan file path comes from $FAKE_SCRIPT_FILE so each launch can read the current plan even inside tmux.
 const fs = require('fs');
 const { execSync } = require('child_process');
 const path = require('path');
@@ -117,6 +117,8 @@ const keys = { n: 0, wake: () => {} };
         keys.n++;
         keys.wake();
       });
+    } else if (step.startsWith('WaitFile:')) {
+      while (!fs.existsSync(step.slice(9))) await new Promise(r => setTimeout(r, 50));
     } else if (step === 'WaitKey') {
       // WaitKey — wait for the next key press (after Input), e.g. one answer of a question
       while (!keys.n) await new Promise(r => { keys.wake = r; });

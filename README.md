@@ -16,7 +16,8 @@ A light, Orca-style workspace for **repos → git worktrees → Claude Code sess
 - **Resume past conversations**, including ones started elsewhere (a terminal, Orca): pick from the worktree's list or paste `claude --resume <id>`
 - **Delete a session for good**: its Claude conversation goes too, so it's gone from `/resume`; removing a worktree or folder can do the same for all of its conversations
 - **Claude sessions manager**: every saved conversation by repo, worktree and folder, with search, filters, suggested cleanups (missing folders, empty, idle) and bulk delete
-- **Claude usage** (5-hour / weekly, time to reset) in the status bar
+- **Claude usage** (5-hour / weekly, time to reset) in the status bar, with a refresh button
+- **Restart Claude** (session menu, or “Restart all Claude sessions…” in the palette) to pick up a Claude update: the conversation continues, and a session that is working or has a draft restarts when it is free
 - **Saved Claude logins**: switch every session to another login or org in one click, like `/login`; refresh each account's usage
 
 **Repos and git**

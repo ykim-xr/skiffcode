@@ -395,6 +395,8 @@ body.attention #statusbar { background: #5a3e0a; color: #fff; }
 
 /* usage + accounts */
 .sb-item.usage { gap: 6px; }
+.usage-refresh { width: 18px; height: 18px; }
+.usage-refresh:disabled { cursor: default; }
 .usage-acct { color: var(--fg); font-weight: 600; }
 .usage-meter { display: inline-flex; align-items: center; gap: 3px; font: 11px var(--mono); }
 .usage-bar { width: 34px; height: 5px; border-radius: 3px; background: #ffffff22; overflow: hidden; display: inline-block; }

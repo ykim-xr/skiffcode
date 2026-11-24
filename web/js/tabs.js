@@ -489,6 +489,7 @@ export class TerminalTab extends Tab {
       else if (type === 3) {
         this.ended = true;
         this.updateBanner();
+        if (this.relaunched()) void this.attach(); // a restart: the session is already running again
       }
     });
     this.ro = new ResizeObserver(() => this.layout());
@@ -496,6 +497,11 @@ export class TerminalTab extends Tab {
     this.attach();
   }
   get session() { return session(this.sessionId); }
+  /** The session was launched again since this tab attached (a restart that the state never showed as ended). */
+  relaunched() {
+    const s = this.session;
+    return !!s && s.state !== 'ended' && s.launchedAt !== this.launchedAt;
+  }
   async attach() {
     const s = this.session;
     if (!s || this.disposed) return;
@@ -505,6 +511,7 @@ export class TerminalTab extends Tab {
       if (!this.disposed) this.updateBanner();
       return;
     }
+    this.launchedAt = s.launchedAt;
     try {
       const { cols, rows } = this.size();
       await call('term.open', { id: this.sessionId, cols, rows });
@@ -518,6 +525,7 @@ export class TerminalTab extends Tab {
       setTimeout(() => this.layout(), 250);
     } catch {
       // A dropped connection fails term.open too: the reconnect attaches again.
+      this.launchedAt = undefined;
       if (this.disposed || (this.session || {}).state !== 'ended') return;
       this.ended = true;
       this.updateBanner();

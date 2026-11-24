@@ -1,5 +1,5 @@
 // Left sidebar: groups → repos → worktrees → sessions, Orca style.
-import { h, icon, clear, isMac, relTime } from './util.js';
+import { h, icon, clear, isMac, relTime, deferWhilePressed } from './util.js';
 import { store, subscribe, sessionsIn, needsYou } from './store.js';
 import { call } from './rpc.js';
 import { contextMenu } from './dialogs.js';
@@ -32,10 +32,12 @@ let A; // actions from app.js
 let root;
 let drag = null;
 let renderAfterDrag = false;
+let render = () => {}; // the guarded draw, set by initSidebar
 
 export function initSidebar(el, actions) {
   A = actions;
   root = el;
+  render = deferWhilePressed(root, draw);
   subscribe(render);
   render();
   setInterval(render, 30_000); // keeps times like "5m" current
@@ -49,7 +51,7 @@ function toggle(key) {
   call('prefs.collapse', { key, collapsed: now });
 }
 
-function render() {
+function draw() {
   // A rebuild would remove the dragged row: its drop and dragend would be lost.
   renderAfterDrag = !!drag;
   if (drag) return;
@@ -405,6 +407,7 @@ function sessionRow(s, depth, agentsKey) {
     oncontextmenu: e => contextMenu(e, [
       ended ? { label: 'Resume', icon: 'play', action: () => A.resumeSession(s.id) } : null,
       !ended ? { label: 'Stop', icon: 'stop', action: () => A.stopSession(s.id) } : null,
+      s.kind === 'claude' && !ended ? { label: 'Restart', icon: 'refresh', action: () => A.restartSession(s.id) } : null,
       { label: 'Rename…', icon: 'edit', action: () => A.renameSession(s) },
       s.kind === 'claude' && s.claudeId && s.prompted ? { label: 'Copy conversation ID', icon: 'link', action: () => navigator.clipboard.writeText(s.claudeId) } : null,
       s.unread ? { label: 'Mark as read', icon: 'circle', action: () => call('sessions.setUnread', { id: s.id, unread: false }) } : { label: 'Mark as unread', icon: 'dot', action: () => call('sessions.setUnread', { id: s.id, unread: true }) },

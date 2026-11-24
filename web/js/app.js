@@ -1,5 +1,5 @@
 // SkiffCode app: wires the sidebar, workspaces, palettes, shortcuts and alerts.
-import { h, icon, clear, isMac, basename, dirname, tildify, languageOf, readStored, TERM_SIZE } from './util.js';
+import { h, icon, clear, isMac, basename, dirname, tildify, languageOf, readStored, TERM_SIZE, deferWhilePressed } from './util.js';
 import { call, connect, on, connected } from './rpc.js';
 import { store, applySnapshot, loadAll, loadWorktrees, loadStatus, allWorktrees, worktree, sessionsIn, session, needsYou, subscribe, notify as sidebarRefresh } from './store.js';
 import { initSidebar, stateLabel, sessionIcon } from './sidebar.js';
@@ -303,6 +303,8 @@ async function forgetWorktree(r, w, wasActive) {
   }
 }
 
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
 const actions = {
   openWorktree,
   isSessionFocused: id => !!(app.active && app.active.activeTab && app.active.activeTab.kind === 'session' && app.active.activeTab.sessionId === id),
@@ -513,6 +515,36 @@ const actions = {
   async stopSession(id) {
     await call('sessions.stop', { id });
   },
+  /** Restart a running Claude session. A busy one waits until it is free. An open tab attaches again by itself. */
+  async restartSession(id) {
+    const s = session(id);
+    const name = s ? s.name : 'session';
+    try {
+      const r = await call('sessions.restart', { id, ...TERM_SIZE });
+      toast(r.queued ? `“${name}” will restart when it finishes.` : `Restarted “${name}”.`, { icon: 'claude', timeout: 3000 });
+      return true;
+    } catch (e) {
+      toast(e.message, { kind: 'error' });
+      return false;
+    }
+  },
+  /** Restart every running Claude session. Idle ones restart now; a busy one restarts when its turn ends. */
+  async restartAllClaude() {
+    const live = store.sessions.filter(s => s.kind === 'claude' && s.state !== 'ended');
+    if (!live.length) return toast('No running Claude sessions.');
+    const v = await confirmDialog({
+      title: `Restart ${plural(live.length, 'Claude session')}?`,
+      detail: `Each one comes back with its conversation, running the Claude that is installed now. A session that is still working restarts when it finishes.`,
+      buttons: [{ label: 'Restart all', value: 'yes', primary: true }],
+    });
+    if (v !== 'yes') return;
+    try {
+      const { restarted, waiting, failed } = await call('sessions.restartAll', TERM_SIZE);
+      toast(`Restarted ${restarted}${waiting ? `; ${waiting} will restart when they finish` : ''}${failed ? `; ${failed} failed` : ''}.`, { kind: failed ? 'error' : undefined, icon: 'claude', timeout: 4000 });
+    } catch (e) {
+      toast(e.message, { kind: 'error' });
+    }
+  },
   /** Ask before closing a running Claude session; shells and stopped sessions close right away. */
   async confirmCloseSession(s) {
     if (!s || s.kind !== 'claude' || s.state === 'ended') return true;
@@ -631,6 +663,7 @@ const actions = {
       ['Claude accounts & usage…', '', () => accountsDialog()],
       ['Resume a Claude conversation…', '', () => actions.resumeConversation()],
       ['Manage Claude sessions', keyHint('sessions'), () => actions.sessionManager()],
+      ['Restart all Claude sessions…', '', () => actions.restartAllClaude()],
       ['Open web page or file…', '', () => actions.openWebPage()],
       ['Panel colors…', '', () => colorsDialog()],
       ['Toggle sidebar', keyHint('toggleSidebar'), () => KEY_RUN.toggleSidebar()],
@@ -757,7 +790,14 @@ function maybeAskNotifications() {
 
 // ------------------------------------------------------------------ status bar & view reporting
 
+let guardedStatusBar;
+/** Rebuilds the status bar, unless a click is in progress on it (the rebuild would drop the click). */
 function updateStatusBar() {
+  if (!guardedStatusBar) guardedStatusBar = deferWhilePressed(document.getElementById('statusbar'), drawStatusBar);
+  guardedStatusBar();
+}
+
+function drawStatusBar() {
   const bar = document.getElementById('statusbar');
   const ws = app.active;
   const wt = ws && worktree(ws.root);

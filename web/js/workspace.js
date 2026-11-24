@@ -868,7 +868,7 @@ export class Workspace {
       } else if (s) {
         t.pane.renderBar();
         if (t.updateBanner) t.updateBanner();
-        if (t.ended && s.state !== 'ended' && !t.attached) t.attach();
+        if (t.ended && s.state !== 'ended' && (!t.attached || t.relaunched())) t.attach();
       }
     }
     if (!this.allTabs().length) this.renderEmpty();

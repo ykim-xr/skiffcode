@@ -286,6 +286,88 @@ function startServer() {
     await c.call('sessions.forget', { id: s.id });
   });
 
+  // Claude sessions for the restart steps. A turn lasts until the test creates its hold file.
+  const getSession = async id => (await c.call('hello')).sessions.find(x => x.id === id);
+  const claudeIn = async (name, steps) => {
+    const hold = path.join(tmp, `hold-${name}`);
+    plan(`SessionStart,UserPromptSubmit,${steps(hold)},hang`);
+    const s = await c.call('sessions.create', { kind: 'claude', worktreePath: wt, name, cols: 80, rows: 24 });
+    await until(async () => (await getSession(s.id)).state !== 'starting', 'started'); // Claude has read the plan: the next one may change it
+    return { ...s, hold };
+  };
+  /** Idle long enough for restartable() (3 s on the server's clock, which is this machine's). */
+  const idleLongEnough = x => until(async () => { const s = await getSession(x.id); return s.state === 'idle' && s.prompted && Date.now() - s.changedAt > 3300; }, 'idle for a while');
+  const resumeLaunches = () => calls().filter(x => x.args[0] === '--resume').map(x => x.args[1]);
+  const pendingRestart = () => JSON.parse(fs.readFileSync(path.join(HOME, 'state.json'), 'utf8')).pendingRestart;
+
+  await step('sessions.restart: a free Claude comes back with its conversation; a busy one waits; ended sessions and shells are refused', async () => {
+    const s = await claudeIn('r-free', () => 'Stop');
+    await idleLongEnough(s);
+    const n = calls().length;
+    assert.deepEqual(await c.call('sessions.restart', { id: s.id, cols: 80, rows: 24 }), { restarted: true });
+    await until(() => calls().length === n + 1, 'second launch');
+    assert.deepEqual(calls()[n].args.slice(0, 2), ['--resume', s.claudeId], 'continues the same conversation');
+    const after = await getSession(s.id);
+    assert.notEqual(after.state, 'ended');
+    assert.equal(after.stoppedByUser, undefined, 'not marked as stopped');
+    assert.equal(after.interrupted, undefined);
+    assert.ok(after.launchedAt, 'the launch time is sent, so an open tab notices the restart');
+    await c.call('sessions.stop', { id: s.id });
+    await assert.rejects(c.call('sessions.restart', { id: s.id }), /running Claude session/);
+    await c.call('sessions.forget', { id: s.id });
+    // a turn under way is not cut off: the restart is queued and runs when the turn is over and the session has been idle a while
+    const busy = await claudeIn('r-busy', hold => `WaitFile:${hold},Stop`);
+    await until(async () => (await getSession(busy.id)).state === 'working', 'working');
+    const before = resumeLaunches().length;
+    assert.deepEqual(await c.call('sessions.restart', { id: busy.id }), { queued: true });
+    assert.equal((await getSession(busy.id)).state, 'working');
+    assert.ok(pendingRestart().includes(busy.id));
+    plan('SessionStart,Stop,hang'); // what the restarted Claude runs
+    fs.writeFileSync(busy.hold, '');
+    await until(() => resumeLaunches().slice(before).includes(busy.claudeId), 'restarted once free', 20_000);
+    assert.ok(!pendingRestart().includes(busy.id));
+    await c.call('sessions.forget', { id: busy.id });
+    const sh = await c.call('sessions.create', { kind: 'shell', worktreePath: wt, cols: 80, rows: 24 });
+    await assert.rejects(c.call('sessions.restart', { id: sh.id }), /running Claude session/);
+    await c.call('sessions.forget', { id: sh.id });
+  });
+
+  await step('sessions.restartAll: only free Claudes restart now; a working one, one with a subagent running and one with a draft wait', async () => {
+    const free = await claudeIn('ra-free', () => 'Stop');
+    const typed = await claudeIn('ra-typed', () => 'Stop');
+    const busy = await claudeIn('ra-busy', hold => `WaitFile:${hold},Stop`);
+    const bg = await claudeIn('ra-bg', hold => `AgentBg:general-purpose:bg,Stop,WaitFile:${hold},AgentDone:1`);
+    await until(async () => (await getSession(busy.id)).state === 'working', 'working');
+    await until(async () => { const x = await getSession(bg.id); return x.state === 'idle' && (x.agents || []).some(a => a.state === 'running'); }, 'idle with a running subagent');
+    await idleLongEnough(free);
+    await idleLongEnough(typed);
+    await c.call('term.open', { id: typed.id, cols: 80, rows: 24 });
+    c.input(typed.id, 'half a sentence'); // a draft, no Enter
+    await c.call('hello'); // the server handles messages in order: the input is in by now
+    const sh = await c.call('sessions.create', { kind: 'shell', worktreePath: wt, cols: 80, rows: 24 });
+    plan('SessionStart,Stop,hang'); // what restarted Claudes run
+    // earlier steps may leave other live Claudes: only these four are checked
+    const before = resumeLaunches().length;
+    const r = await c.call('sessions.restartAll', { cols: 80, rows: 24 });
+    assert.equal(r.failed, 0);
+    assert.ok(r.waiting >= 3 && r.restarted >= 1, JSON.stringify(r));
+    await until(() => resumeLaunches().slice(before).includes(free.claudeId), 'the free session restarted with --resume');
+    const wait = pendingRestart();
+    for (const x of [typed, busy, bg]) assert.ok(wait.includes(x.id), `${x.id} waits`);
+    assert.ok(!wait.includes(free.id));
+    assert.equal((await getSession(busy.id)).state, 'working', 'the turn was not cut off');
+    for (const x of [typed, busy, bg]) assert.ok(!resumeLaunches().slice(before).includes(x.claudeId), 'not restarted yet');
+    // the turn ends and the subagent finishes: both restart once they have been free a while
+    fs.writeFileSync(busy.hold, '');
+    fs.writeFileSync(bg.hold, '');
+    await until(() => resumeLaunches().slice(before).includes(busy.claudeId), 'the working session restarted once free', 20_000);
+    await until(() => resumeLaunches().slice(before).includes(bg.claudeId), 'restarted after its subagent finished', 20_000);
+    assert.ok(!pendingRestart().includes(busy.id) && !pendingRestart().includes(bg.id), 'no longer waiting');
+    assert.ok(!resumeLaunches().slice(before).includes(typed.claudeId), 'a session with a draft is never restarted under it');
+    assert.notEqual((await getSession(sh.id)).state, 'ended', 'shells are left alone');
+    for (const x of [free, typed, busy, bg, sh]) await c.call('sessions.forget', { id: x.id });
+  });
+
   await step('sessions.move: reorders within a worktree, ignores another worktree', async () => {
     plan('SessionStart,hang');
     const mk = (name, worktreePath = wt) => c.call('sessions.create', { kind: 'claude', worktreePath, name, cols: 80, rows: 24 });

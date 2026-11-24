@@ -6,7 +6,7 @@ const path = require('path');
 const { EventEmitter } = require('events');
 const { writeFileAtomic } = require('./util');
 
-const EMPTY = () => ({ version: 3, groups: [], repos: [], sessions: [], worktrees: {}, layouts: {}, prefs: {}, links: [], peerOffsets: {} });
+const EMPTY = () => ({ version: 3, groups: [], repos: [], sessions: [], worktrees: {}, layouts: {}, prefs: {}, links: [], peerOffsets: {}, pendingRestart: [] });
 
 class State extends EventEmitter {
   constructor(home) {

@@ -69,6 +69,24 @@ function meter(label, w) {
   return h(`span.usage-meter.${level(pct)}`, label, ' ', h('span.usage-bar', h('span.usage-fill', { style: { width: `${Math.min(100, pct)}%` } })), ` ${pct}%`);
 }
 
+/** Accounts whose usage is being read from the status bar. Module state: the bar re-renders every 30 s. */
+const refreshing = new Set();
+
+async function refreshInUse() {
+  const a = inUseAccount();
+  if (!a || refreshing.has(a.id)) return;
+  refreshing.add(a.id);
+  notify();
+  try {
+    await call('accounts.refreshUsage', { id: a.id });
+  } catch (e) {
+    toast(e.message, { kind: 'error' });
+  } finally {
+    refreshing.delete(a.id);
+    notify();
+  }
+}
+
 /** The status bar item. */
 export function usageItem() {
   const a = inUseAccount();
@@ -90,7 +108,12 @@ export function usageItem() {
     noFiveHour(u) ? null : meter('5h', five),
     five && five.resetsAt ? h('span.usage-reset', `↻ ${untilText(five.resetsAt)}`) : null,
     meter('wk', week),
-    week && week.resetsAt ? h('span.usage-reset', `↻ ${untilText(week.resetsAt)}`) : null);
+    week && week.resetsAt ? h('span.usage-reset', `↻ ${untilText(week.resetsAt)}`) : null,
+    a && !noSwitching() ? h('button.icon-btn.usage-refresh', {
+      title: 'Refresh usage',
+      disabled: refreshing.has(a.id),
+      onclick: e => { e.stopPropagation(); void refreshInUse(); },
+    }, icon('refresh', refreshing.has(a.id) ? 'spin' : '')) : null);
 }
 
 /** The account panel. */

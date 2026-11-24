@@ -1371,6 +1371,16 @@ const G = {};
     assert.deepEqual(st.prefs.accounts.map(a => a.name), ['Work', 'Home']);
   });
 
+  await step('status bar: the refresh button reads usage for the login in use, without opening the account panel', async () => {
+    if (process.platform === 'darwin') return console.log('  - skipped on macOS (no saved logins to refresh)');
+    await page.waitForSelector('.sb-item.usage .usage-acct >> text=Home');
+    assert.equal(await page.locator('.sb-item.usage .usage-meter.unknown').count(), 2, 'no usage for Home yet');
+    await page.click('.sb-item.usage .usage-refresh');
+    await page.waitForSelector('.sb-item.usage .usage-meter.ok:has-text("37%")');
+    assert.equal(await page.locator('.accounts-modal').count(), 0, 'the click did not open the panel');
+    assert.equal(await page.locator('.sb-item.usage .usage-refresh:disabled').count(), 0, 'busy state cleared');
+  });
+
   await step('account panel on macOS: no Add, Use or Save as account; a note says why', async () => {
     // Set and opened in one go: a state push in between would bring the server's platform back
     const tip = await page.evaluate(async () => {
@@ -2206,6 +2216,20 @@ const G = {};
     const after = await page.evaluate(() => document.querySelector('.tree').scrollTop);
     assert.ok(Math.abs(after - before) < 30, `scroll kept (${before} → ${after})`);
     await page.setViewportSize({ width: 1500, height: 900 });
+  });
+
+  await step('sidebar: a click survives a rebuild between mouse down and up', async () => {
+    await quiet();
+    const row = page.locator('.tree .session-row:not(.focused)').first();
+    const label = await row.locator('.row-label').textContent();
+    const b = await row.boundingBox();
+    await page.mouse.move(b.x + 40, b.y + b.height / 2);
+    await page.mouse.down();
+    // a store change while the button is down, e.g. a status push from a working session
+    await page.evaluate(() => import('/js/store.js').then(m => new Promise(r => { m.notify(); requestAnimationFrame(() => requestAnimationFrame(r)); })));
+    await page.mouse.up();
+    await page.waitForFunction(l => { const s = window.skiffcode.active?.activeTab?.session; return s && s.name === l; }, label, { timeout: 3000 });
+    await page.waitForSelector(`.tree .session-row.focused:has-text("${label}")`);
   });
 
   await step('sounds: a sound per alert, your own file, volume; alerts play your choice', async () => {
@@ -3359,6 +3383,41 @@ const G = {};
     } finally {
       await ctx.close();
     }
+  });
+
+  await step('Restart in the session menu: an open tab attaches to the new Claude, with no “isn’t running” banner', async () => {
+    plan('SessionStart,UserPromptSubmit,sleep:800,Print:first-run,Stop,hang'); // printed once the tab is attached
+    const wt = await page.evaluate(() => window.skiffcode.active.root);
+    const s = await page.evaluate(w => import('/js/rpc.js').then(r => r.call('sessions.create', { kind: 'claude', worktreePath: w, name: 'tab-restart', cols: 80, rows: 24 })), wt);
+    await page.evaluate(id => window.skiffcode.actions.focusSession(id), s.id); // waits until the state push has brought the session
+    const tab = id => `window.skiffcode.active.allTabs().find(t => t.kind === 'session' && t.sessionId === '${id}')`;
+    await page.waitForFunction(`(() => { const t = ${tab(s.id)}; return t && t.attached && /first-run/.test(t.term.text || ''); })()`, null, { timeout: 15000 });
+    await page.waitForFunction(id => import('/js/store.js').then(m => { const x = m.store.sessions.find(y => y.id === id); return !!x && x.state === 'idle' && !!x.prompted && Date.now() - x.changedAt > 3300; }), s.id);
+    plan('SessionStart,Stop,sleep:800,Print:second-run,hang');
+    await page.click('.session-row:has-text("tab-restart")', { button: 'right' });
+    await page.click('.menu-item >> text=Restart');
+    await page.waitForFunction(`(() => { const t = ${tab(s.id)}; return t.attached && /second-run/.test(t.term.text || '') && t.banner.classList.contains('hidden'); })()`, null, { timeout: 15000 });
+    assert.equal(await page.evaluate(`${tab(s.id)}.ended`), false);
+  });
+
+  await step('palette: Restart all Claude sessions asks first, then restarts an idle session with its conversation', async () => {
+    plan('SessionStart,UserPromptSubmit,Stop,hang');
+    const wt = await page.evaluate(() => window.skiffcode.active.root);
+    const s = await page.evaluate(w => import('/js/rpc.js').then(r => r.call('sessions.create', { kind: 'claude', worktreePath: w, name: 'restart-me', cols: 80, rows: 24 })), wt);
+    // idle for a while: a session that only just went idle waits a few seconds before a restart
+    await page.waitForFunction(id => import('/js/store.js').then(m => { const x = m.store.sessions.find(y => y.id === id); return !!x && x.state === 'idle' && !!x.prompted && Date.now() - x.changedAt > 3300; }), s.id);
+    const resumes = () => fs.readFileSync(process.env.FAKE_LOG, 'utf8').trim().split('\n').map(JSON.parse).filter(l => l.args[l.args.indexOf('--resume') + 1] === s.claudeId).length;
+    assert.equal(resumes(), 0);
+    await page.keyboard.press('Control+Shift+P');
+    await page.fill('.qp-input', 'Restart all Claude');
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('.modal >> text=Each one comes back with its conversation');
+    await sleep(300);
+    assert.equal(resumes(), 0, 'nothing restarts before you confirm');
+    await page.click('.modal .btn >> text=Restart all');
+    await page.waitForSelector('.toast >> text=/^Restarted \\d+/');
+    for (let i = 0; i < 50 && resumes() < 1; i++) await sleep(100);
+    assert.equal(resumes(), 1, 'restarted once, with --resume');
   });
 
   await step('no JavaScript errors', async () => {

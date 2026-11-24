@@ -136,6 +136,7 @@ function pushState() {
 }
 state.on('change', pushState);
 sessions.on('change', pushState);
+sessions.on('restartFailed', ({ message }) => broadcast('toast', { kind: 'error', text: `Restart failed: ${message}` }));
 sessions.on('alert', a => {
   broadcast('alert', a);
   if (clients.size === 0) {
@@ -928,6 +929,10 @@ const api = {
   },
   async 'sessions.resume'({ id, cols, rows }) { return sessions.resume(sessionId(id), cols, rows); },
   async 'sessions.stop'({ id }) { await sessions.stop(sessionId(id)); },
+  /** Restart a Claude session so the conversation continues in a fresh Claude (after an update, say). A busy one waits until it is free: { queued: true }. */
+  async 'sessions.restart'({ id, cols, rows }) { return sessions.restartWhenFree(sessionId(id), cols, rows); },
+  /** Restart every running Claude session that is free now; the others restart when they are. Returns { restarted, waiting, failed }. */
+  async 'sessions.restartAll'({ cols, rows } = {}) { return sessions.restartAll(cols, rows); },
   async 'sessions.forget'({ id }) { await sessions.forget(sessionId(id)); },
   /** Dismiss the links among these sessions (the Working together panel's group). */
   async 'links.dismiss'({ ids }) {

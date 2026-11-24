@@ -17,6 +17,7 @@ const STALL_MS = Number(process.env.SKIFFCODE_STALL_MS) || 8000; // "working" bu
 const LINK_TTL_MS = 12 * 3600e3;
 // a start tag counts only at the start of the prompt or right after a closing tag: one quoted in a message does not
 const PEER_TAG_RE = /(?:"prompt":"|<\\?\/cross-session-message>(?:\\[nrt]|\s)*)(<cross-session-message\b[^>]*>)/g;
+const RESTART_IDLE_MS = 3000; // idle this long before a restart: see restartable()
 const HOOK_STATES = new Set(['working', 'question', 'permission', 'idle']);
 const UUID_RE = new RegExp(`^${UUID.source}$`, 'i');
 const needsYou = s => s === 'question' || s === 'permission';
@@ -28,6 +29,7 @@ let statusSeq = 0;
 class Sessions extends EventEmitter {
   constructor(state, home, config, accounts) {
     super();
+    this.starting = true; // until the constructor has read the states left from before
     this.state = state;
     this.accounts = accounts;
     this.info = new Map(); // id -> { contextPct, model, cost } from Claude's status line
@@ -55,7 +57,6 @@ class Sessions extends EventEmitter {
       this.readStatusLine(s.id, { initial: true });
     }
     // Picking up states from before the restart: nothing new happened, so nothing turns unread.
-    this.starting = true;
     this.poll();
     for (const s of state.sessions) this.readStatus(s.id, true);
     this.starting = false;
@@ -63,7 +64,11 @@ class Sessions extends EventEmitter {
     this.pruneLinks();
     for (const s of state.sessions) this.readPeers(s.id);
     this.watch();
-    this.timer = setInterval(() => { this.poll(); void this.scanCommands(); }, 2000);
+    // Also settles restarts that were waiting before a server restart, once a scan has shown what is running.
+    this.timer = setInterval(() => {
+      this.poll();
+      void this.scanCommands().then(() => { for (const id of [...(state.data.pendingRestart || [])]) this.settleRestart(id); });
+    }, 2000);
   }
 
   sock(id) {
@@ -89,7 +94,7 @@ class Sessions extends EventEmitter {
 
   /** Sessions with their live state, for the UI. */
   list() {
-    return this.state.sessions.map(s => ({ ...s, ...(this.info.get(s.id) || {}), agents: this.agentList(s.id), command: this.busy.has(s.id) || undefined, state: this.stateOf(s.id), changedAt: (this.live.get(s.id) || {}).changedAt || s.createdAt }));
+    return this.state.sessions.map(s => ({ ...s, ...(this.info.get(s.id) || {}), agents: this.agentList(s.id), launchedAt: (this.live.get(s.id) || {}).launchedAt, command: this.busy.has(s.id) || undefined, state: this.stateOf(s.id), changedAt: (this.live.get(s.id) || {}).changedAt || s.createdAt }));
   }
 
   // ---------------------------------------------------------------- actions
@@ -152,6 +157,70 @@ class Sessions extends EventEmitter {
       await this.killHost(id);
       this.setState(id, 'ended', true);
     });
+  }
+
+  /**
+   * Idle with nothing running: no turn, no background subagent, no command Claude started, nothing typed.
+   * Restarting anything else would abort work or drop a draft. The idle time covers `busy`, which is up to
+   * 2 s old: a turn that ends at once after starting a command must not look free.
+   */
+  restartable(id) {
+    const l = this.live.get(id);
+    return !!l && l.state === 'idle' && Date.now() - l.changedAt >= RESTART_IDLE_MS && !l.typedSinceIdle
+      && !this.busy.has(id) && !(this.agentList(id) || []).some(a => a.state === 'running');
+  }
+
+  /** Stop a live Claude session and resume it with its conversation. Cuts off anything it is doing: check restartable() first. */
+  async restart(id, cols, rows) {
+    const s = this.state.session(id);
+    if (!s) throw new Error('No such session');
+    if (s.kind !== 'claude' || this.stateOf(id) === 'ended') throw new Error('Only a running Claude session can restart');
+    await this.stop(id);
+    return this.resume(id, cols, rows);
+  }
+
+  queueRestart(id) {
+    this.state.update(d => { d.pendingRestart = [...new Set([...(d.pendingRestart || []), id])]; });
+  }
+
+  /** Restarts one session now, or queues it if it is busy. Returns { restarted } or { queued }. */
+  async restartWhenFree(id, cols, rows) {
+    const s = this.state.session(id);
+    if (!s || s.kind !== 'claude' || this.stateOf(id) === 'ended') throw new Error('Only a running Claude session can restart');
+    if (!this.restartable(id)) {
+      this.queueRestart(id);
+      return { queued: true };
+    }
+    await this.restart(id, cols, rows);
+    return { restarted: true };
+  }
+
+  /** Restarts the free Claude sessions now. A busy one is never cut off: it restarts when it is free (see settleRestart). */
+  async restartAll(cols, rows) {
+    let restarted = 0;
+    let waiting = 0;
+    let failed = 0;
+    for (const s of [...this.state.sessions]) {
+      if (s.kind !== 'claude' || this.stateOf(s.id) === 'ended') continue;
+      try {
+        if ((await this.restartWhenFree(s.id, cols, rows)).queued) waiting++;
+        else restarted++;
+      } catch (e) {
+        failed++;
+        console.error(`skiffcode: restart of ${s.id} failed: ${e.message}`);
+      }
+    }
+    return { restarted, waiting, failed };
+  }
+
+  /** Runs on the timer, after a scan of running commands. Restarts waiting sessions that are free now; drops ones that ended. */
+  settleRestart(id) {
+    if (!(this.state.data.pendingRestart || []).includes(id)) return;
+    if (this.starting) return; // the first states are guesses
+    const ended = this.stateOf(id) === 'ended';
+    if (!ended && !this.restartable(id)) return;
+    this.state.update(d => { d.pendingRestart = d.pendingRestart.filter(x => x !== id); });
+    if (!ended) this.restart(id).catch(e => this.emit('restartFailed', { id, message: e.message }));
   }
 
   async forget(id) {
@@ -225,6 +294,8 @@ class Sessions extends EventEmitter {
 
   async launch(s, cols = TERM_SIZE.cols, rows = TERM_SIZE.rows, { preload = false } = {}) {
     this.removeStatus(s.id);
+    const l = this.live.get(s.id);
+    if (l) l.launchedAt = Date.now(); // lets an open tab see a restart that the state alone does not show
     this.state.update(d => { const x = d.sessions.find(y => y.id === s.id); if (x) { x.stoppedByUser = undefined; x.interrupted = undefined; } });
     const shell = userShell();
     // An interactive login shell gives Claude the same PATH as your terminals (nvm, ~/.local/bin…).
@@ -286,6 +357,7 @@ class Sessions extends EventEmitter {
       d.sessions = d.sessions.filter(s => s.id !== id);
       d.links = (d.links || []).filter(l => l.a !== id && l.b !== id);
       delete (d.peerOffsets || {})[id];
+      d.pendingRestart = (d.pendingRestart || []).filter(x => x !== id);
     });
   }
 
@@ -320,6 +392,7 @@ class Sessions extends EventEmitter {
       this.emit('transition', { session: s, from, to: state });
     }
     this.emit('change');
+    if (state === 'ended') this.settleRestart(id); // drops it from the waiting list
   }
 
   poll() {
