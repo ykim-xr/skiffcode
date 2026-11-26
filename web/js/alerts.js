@@ -99,5 +99,5 @@ export function updateTitle(activeName) {
   const n = Math.max(need, unread);
   document.title = `${n ? `(${n}) ` : ''}${activeName ? `${activeName} — ` : ''}SkiffCode`;
   const link = document.querySelector('link[rel=icon]');
-  if (link) link.href = n ? '/icons/icon-alert.svg' : '/icons/icon.svg';
+  if (link) link.href = n ? '/icons/favicon-alert.svg' : '/icons/favicon.svg';
 }

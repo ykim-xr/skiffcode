@@ -4,7 +4,7 @@
   "description": "Repos, worktrees and Claude Code sessions",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#0d1622",
+  "background_color": "#0c1622",
   "theme_color": "#181818",
   "icons": [
     { "src": "/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
